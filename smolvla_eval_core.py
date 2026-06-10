@@ -242,6 +242,7 @@ def _pnp_refine_at_step(x_t, s, vfield, cfg):
     # Per-action-dim vectors: mean over batch and chunk → shape (adim,)
     u_vec     = u_consecutive.mean(dim=(0, 1)).detach().float().cpu().numpy()
     a_std_vec = a_std.mean(dim=(0, 1)).detach().float().cpu().numpy()
+    a_mean_vec = A[..., :adim].mean(dim=(0, 1, 2)).detach().float().cpu().numpy()
 
     rec = {
         "s":             float(s),
@@ -250,8 +251,9 @@ def _pnp_refine_at_step(x_t, s, vfield, cfg):
         "u_mean":        float(u_consecutive.mean()),
         "u_max":         float(u_consecutive.max()),
         "a_std_mean":    float(a_std.mean()),
-        "u_vec":         u_vec,      # np (adim,) — per-dim mean uncertainty
-        "a_std_vec":     a_std_vec,  # np (adim,) — per-dim std of predictions
+        "u_vec":         u_vec,       # np (adim,) — per-dim mean uncertainty
+        "a_std_vec":     a_std_vec,   # np (adim,) — per-dim std of predictions
+        "a_mean_vec":    a_mean_vec,  # np (adim,) — mean P&P clean-action prediction
     }
     if cfg.record_per_iteration:
         rec["a_hats"] = A.detach().float().cpu().numpy()
@@ -536,6 +538,15 @@ class RolloutDB:
         a_std_d4 REAL, a_std_d5 REAL, a_std_d6 REAL
     );
     CREATE INDEX IF NOT EXISTS idx_pes_rollout ON pnp_euler_steps(rollout_id);
+    CREATE TABLE IF NOT EXISTS pnp_action_vectors (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        rollout_id   TEXT    NOT NULL REFERENCES rollouts(rollout_id),
+        chunk_idx    INTEGER NOT NULL,
+        euler_step   INTEGER NOT NULL,
+        u_vec        TEXT    NOT NULL,
+        a_mean_vec   TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_pav_rollout ON pnp_action_vectors(rollout_id);
     """
 
     def __init__(self, db_path):
@@ -617,8 +628,15 @@ class RolloutDB:
             return [float(v) if v is not None else None for v in list(u_vec)[:_ADIM]] + \
                    [float(v) if v is not None else None for v in list(a_std_vec)[:_ADIM]]
 
+        def _vec_json(st, key):
+            vec = st.get(key)
+            if vec is None:
+                return _json.dumps([None] * _ADIM)
+            return _json.dumps([float(v) for v in np.asarray(vec).flatten()[:_ADIM]])
+
         with self._con:
             self._con.execute('DELETE FROM pnp_euler_steps WHERE rollout_id = ?', (rollout_id,))
+            self._con.execute('DELETE FROM pnp_action_vectors WHERE rollout_id = ?', (rollout_id,))
             self._con.execute(
                 'INSERT OR REPLACE INTO rollouts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (rollout_id, suite, task_idx, task_desc, episode_idx,
@@ -643,6 +661,12 @@ class RolloutDB:
                 [(rollout_id, ci, st['step'], st['s'],
                   st['u_mean'], st['u_max'], st['a_std_mean'],
                   *_dim_vals(st))
+                 for ci, st in all_step_recs])
+            self._con.executemany(
+                'INSERT INTO pnp_action_vectors '
+                '(rollout_id, chunk_idx, euler_step, u_vec, a_mean_vec) '
+                'VALUES (?,?,?,?,?)',
+                [(rollout_id, ci, st['step'], _vec_json(st, 'u_vec'), _vec_json(st, 'a_mean_vec'))
                  for ci, st in all_step_recs])
         self._con.commit()
 
@@ -1048,6 +1072,18 @@ def run_episode_backfill(env, init_state, policy, task_desc, max_steps, device,
 
 
 
+def load_pi05_session(video_dir=None):
+    """Load π0.5 policy + processors and patch P&P. Sets module globals."""
+    global preprocess, postprocess, VIDEO_DIR, CURRENT_POLICY_MODEL
+    init_libero_benchmark()
+    if video_dir:
+        VIDEO_DIR = video_dir
+        os.makedirs(VIDEO_DIR, exist_ok=True)
+    policy, preprocess, postprocess = load_pi05()
+    CURRENT_POLICY_MODEL = 'pi05'
+    return policy, preprocess, postprocess
+
+
 def load_smolvla_session(model_id='HuggingFaceVLA/smolvla_libero', video_dir=None):
     """Load SmolVLA policy + processors and patch P&P. Sets module globals."""
     global preprocess, postprocess, VIDEO_DIR, CURRENT_POLICY_MODEL
@@ -1155,4 +1191,118 @@ def flush_db_to_drive(db, drive_path, label='smolvla'):
     dst.close()
     shutil.copy2(local_tmp, drive_path)
     print(f'[{label}] flushed -> {drive_path}')
+
+
+# ── LIBERO-PRO failure-classifier rollout helpers ────────────────────────────
+
+LIBERO_PRO_SUITES = [
+    'libero_object_temp_x0.1', 'libero_object_temp_y0.1',
+    'libero_object_temp_x0.2', 'libero_object_temp_y0.2',
+    'libero_spatial_with_milk', 'libero_goal_with_yellow_book',
+]
+LIBERO_PRO_MAX_STEPS = 280
+
+
+def restore_libero_pro_inits(init_src, libero_site, suites=None):
+    """Copy curated .pruned_init files into the installed libero package."""
+    import shutil
+    import glob as _glob
+
+    suites = suites or LIBERO_PRO_SUITES
+    init_dst_root = os.path.join(libero_site, 'init_files')
+    restored = []
+    for suite in suites:
+        src = os.path.join(init_src, suite)
+        dst = os.path.join(init_dst_root, suite)
+        if not os.path.isdir(src):
+            print(f'  SKIP init restore (missing): {suite}')
+            continue
+        if os.path.exists(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        n = len(_glob.glob(os.path.join(dst, '*.pruned_init')))
+        print(f'  Restored {n} init files: {suite}')
+        restored.append(suite)
+    return restored
+
+
+def _bddl_path_for_suite(libero_site, suite_name, task_idx):
+    import glob as _glob
+    bddl_dir = os.path.join(libero_site, 'bddl_files', suite_name)
+    files = sorted(_glob.glob(os.path.join(bddl_dir, '*.bddl')))
+    if task_idx < len(files):
+        return files[task_idx]
+    return None
+
+
+def _bddl_language(bddl_path):
+    with open(bddl_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.lower().startswith('(task_name') or line.lower().startswith('(:task'):
+                return line.split(None, 1)[-1].rstrip(')').strip().strip('"')
+    return os.path.splitext(os.path.basename(bddl_path))[0].replace('_', ' ')
+
+
+def _load_init_states(libero_site, suite_name, task_idx):
+    bddl = _bddl_path_for_suite(libero_site, suite_name, task_idx)
+    if bddl is None:
+        return None, None
+    stem = os.path.splitext(os.path.basename(bddl))[0]
+    init_dir = os.path.join(libero_site, 'init_files', suite_name)
+    for ext in ('.pruned_init', '.init'):
+        fp = os.path.join(init_dir, stem + ext)
+        if os.path.exists(fp):
+            states = torch.load(fp, weights_only=False)
+            return states, bddl
+    return None, bddl
+
+
+def build_libero_pro_episodes(libero_site, suites=None, episode_idxs=None, benchmark_dict_=None):
+    """Episode list for failure-classifier DB collection (default 6×10×10 = 600)."""
+    from libero.libero import get_libero_path
+
+    suites = suites or LIBERO_PRO_SUITES
+    episode_idxs = episode_idxs or list(range(10))
+    episodes = []
+    for suite in suites:
+        for task_idx in range(10):
+            init_states, bddl = _load_init_states(libero_site, suite, task_idx)
+            task_desc = _bddl_language(bddl) if bddl else None
+            if init_states is None and benchmark_dict_ and suite in benchmark_dict_:
+                task_suite = benchmark_dict_[suite]()
+                task = task_suite.get_task(task_idx)
+                init_states = task_suite.get_task_init_states(task_idx)
+                bddl = os.path.join(
+                    get_libero_path('bddl_files'), task.problem_folder, task.bddl_file)
+                task_desc = task.language
+            if bddl is None:
+                print(f'  SKIP {suite} task {task_idx}: no BDDL')
+                continue
+            if init_states is None:
+                print(f'  SKIP {suite} task {task_idx}: no init states')
+                continue
+            if task_desc is None:
+                task_desc = _bddl_language(bddl)
+            n_states = 1 if np.ndim(init_states) == 1 else len(init_states)
+            for ep_idx in episode_idxs:
+                if ep_idx >= n_states:
+                    continue
+                init_state = init_states if np.ndim(init_states) == 1 else init_states[ep_idx]
+                episodes.append(dict(
+                    suite=suite, task_idx=task_idx, task_desc=task_desc,
+                    ep_idx=ep_idx, init_state=init_state, bddl_path=bddl,
+                    max_steps=LIBERO_PRO_MAX_STEPS,
+                    init_state_hash=RolloutDB.init_state_hash(init_state),
+                ))
+    print(f'LIBERO-PRO episodes: {len(episodes)}')
+    return episodes
+
+
+def libero_pro_completed_keys(db):
+    rows = db.query(
+        "SELECT suite, task_idx, episode_idx, init_state_hash "
+        "FROM rollouts WHERE pnp_enabled=1 AND pnp_mode='uncertainty'"
+    )
+    return {(r['suite'], r['task_idx'], r['episode_idx'], r['init_state_hash']) for r in rows}
 
