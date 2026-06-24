@@ -238,18 +238,44 @@ def _fix_torch_quant_compat():
     # Colab's base torch can be older than the restored snapshot expects, which
     # surfaces as: ImportError: cannot import name 'CUSTOM_KEY'. Repair before
     # any lerobot import (which transitively pulls torch.ao.quantization.fx).
-    try:
+    #
+    # Probe the *installed metadata* first so we don't import torch (and lock its
+    # C extension) unless the version is already adequate. torch is backed by a C
+    # extension (torch._C) that CANNOT be re-initialised within a live process:
+    # deleting torch from sys.modules and re-importing re-runs torch/overrides.py,
+    # whose _add_docstr() calls then fail on already-documented C functions with
+    #   RuntimeError: function '_has_torch_function' already has a docstring.
+    import importlib.metadata as _md
+
+    def _torch_ge_26():
+        try:
+            major, minor = (int(x) for x in _md.version('torch').split('.')[:2])
+            return (major, minor) >= (2, 6)
+        except Exception:
+            return False
+
+    if _torch_ge_26():
         import torch
         from torch.ao.quantization import CUSTOM_KEY  # noqa: F401
         print(f'torch {torch.__version__} — quantization compat OK')
         return
-    except ImportError:
-        print('torch/quantization mismatch — upgrading torch (CUDA wheels)...')
+
+    print('torch/quantization mismatch — upgrading torch (CUDA wheels)...')
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', '-U',
                            'torch', 'torchvision', 'torchaudio'])
     importlib.invalidate_caches()
-    for _m in [m for m in sys.modules if m == 'torch' or m.startswith('torch.')]:
-        del sys.modules[_m]
+
+    # If torch was already imported in this process (e.g. transitively by an
+    # earlier import), the C extension is locked and the new build cannot be
+    # hot-swapped. The only safe repair is to restart the runtime; Colab
+    # auto-restarts, then you re-run this cell with the upgraded torch in place.
+    if any(m == 'torch' or m.startswith('torch.') for m in sys.modules):
+        print('torch upgraded — restarting runtime to load the new build. '
+              'Re-run this cell after the restart.')
+        sys.stdout.flush()
+        os.kill(os.getpid(), 9)
+
+    # torch was never imported in this process, so a fresh import is safe.
     import torch
     from torch.ao.quantization import CUSTOM_KEY  # noqa: F401
     print(f'torch upgraded to {torch.__version__} — quantization compat OK')
