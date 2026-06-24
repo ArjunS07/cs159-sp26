@@ -93,30 +93,85 @@ def _save_ahats_npz(rollout_id, all_step_recs):
         np.savez_compressed(os.path.join(AHATS_DIR, f'{rollout_id}.npz'), **arrs)
 
 
-def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0):
-    """Real no-op check (NON-empty step_indices): uncertainty mode must equal vanilla.
+def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=True):
+    """No-op verification for mode="uncertainty" (NON-empty step_indices).
 
-    Replaces the old vacuous smoke test that used step_indices=() so the
-    perturbation never fired and could not detect RNG contamination.
+    Checks two INDEPENDENT properties, because the old `== 0.0` output check both
+    (a) spuriously failed and (b) could not detect the bug it targeted:
+
+      1. RNG ISOLATION (checked EXACTLY). After an uncertainty-mode chunk the
+         global RNG must be in the SAME state as after a vanilla chunk. This is
+         the property the dedicated perturbation Generator actually guarantees:
+         the old `eps = torch.randn_like(x_acc)` advanced the GLOBAL RNG by K
+         draws per P&P step, so this state would diverge. (The returned action
+         alone cannot catch this — `measure_only_output` is computed from `noise`
+         BEFORE the perturbation draws, so a leak does not change it for the
+         current chunk, only desynchronises SUBSEQUENT chunks.)
+
+      2. OUTPUT EQUALITY (checked within a TOLERANCE). uncertainty mode returns
+         the saved original sampler's action, so it must match vanilla — but only
+         up to the GPU/bf16 nondeterminism floor. pi0.5/SmolVLA run the VLM
+         backbone in bf16; flow-matching inference is not bit-exact across calls,
+         so two identical vanilla runs already differ by ~1e-2. We measure that
+         floor by running vanilla twice and require the uncertainty gap to sit at
+         (not above) it. `assert d == 0.0` was therefore never satisfiable on GPU.
     """
     saved = (PNP_CONFIG.enabled, PNP_CONFIG.mode, PNP_CONFIG.step_indices,
              PNP_CONFIG.num_iterations)
-    PNP_CONFIG.enabled = False
-    torch.manual_seed(seed); torch.cuda.manual_seed(seed); _pnp_seed_perturb(seed)
-    with torch.no_grad():
-        a1 = policy.predict_action_chunk(batch, noise=None).clone()
-    PNP_CONFIG.enabled = True
-    PNP_CONFIG.mode = 'uncertainty'
-    PNP_CONFIG.step_indices = tuple(step_indices)
-    PNP_CONFIG.num_iterations = 3
-    torch.manual_seed(seed); torch.cuda.manual_seed(seed); _pnp_seed_perturb(seed)
-    with torch.no_grad():
-        a2 = policy.predict_action_chunk(batch, noise=None).clone()
-    (PNP_CONFIG.enabled, PNP_CONFIG.mode, PNP_CONFIG.step_indices,
-     PNP_CONFIG.num_iterations) = saved
-    d = float((a1 - a2).abs().max().item())
-    verdict = 'PASS (true no-op)' if d == 0.0 else 'FAIL (RNG contamination!)'
-    print(f'P&P no-op check: max|baseline - uncertainty| = {d:.3e}  ->  {verdict}')
+
+    def _rng_state():
+        st = [torch.get_rng_state()]
+        if torch.cuda.is_available():
+            st += list(torch.cuda.get_rng_state_all())
+        return st
+
+    def _rng_equal(a, b):
+        return len(a) == len(b) and all(torch.equal(x, y) for x, y in zip(a, b))
+
+    def _seed():
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        _pnp_seed_perturb(seed)
+
+    try:
+        # vanilla x2 -> reference action, nondeterminism floor, RNG reference.
+        PNP_CONFIG.enabled = False
+        _seed()
+        with torch.no_grad():
+            a0 = policy.predict_action_chunk(batch, noise=None).clone()
+        rng_after_vanilla = _rng_state()
+        _seed()
+        with torch.no_grad():
+            a0b = policy.predict_action_chunk(batch, noise=None).clone()
+        floor = float((a0 - a0b).abs().max().item())
+
+        # uncertainty mode -> perturbation actually fires at step_indices.
+        PNP_CONFIG.enabled = True
+        PNP_CONFIG.mode = 'uncertainty'
+        PNP_CONFIG.step_indices = tuple(step_indices)
+        PNP_CONFIG.num_iterations = 3
+        _seed()
+        with torch.no_grad():
+            a1 = policy.predict_action_chunk(batch, noise=None).clone()
+        rng_after_unc = _rng_state()
+    finally:
+        (PNP_CONFIG.enabled, PNP_CONFIG.mode, PNP_CONFIG.step_indices,
+         PNP_CONFIG.num_iterations) = saved
+
+    d = float((a0 - a1).abs().max().item())
+    tol = max(4.0 * floor, 1e-5)
+    rng_ok = _rng_equal(rng_after_vanilla, rng_after_unc)
+    out_ok = d <= tol
+    ok = rng_ok and out_ok
+    verdict = 'PASS (true no-op)' if ok else 'FAIL (RNG contamination!)'
+    print(f'P&P no-op check: max|baseline - uncertainty| = {d:.3e} '
+          f'(nondeterminism floor = {floor:.3e}, tol = {tol:.3e}; '
+          f'rng_isolated={rng_ok})  ->  {verdict}')
+    if raise_on_fail and not ok:
+        raise AssertionError(
+            'P&P no-op failed -- do not trust downstream numbers '
+            f'(rng_isolated={rng_ok}, d={d:.3e} > tol={tol:.3e}).')
     return d
 # === end RNG-ISOLATION FIX ===================================================
 '''
@@ -336,8 +391,9 @@ try:
     for _ in range(NUM_STEPS_WAIT):
         _obs, _, _, _ = _env.step(LIBERO_DUMMY_ACTION)
     _batch = preprocess(obs_to_policy(_obs, _ep['task_desc'], device))
-    d = assert_pnp_noop(policy, _batch, step_indices=(2, 3), seed=0)
-    assert d == 0.0, 'RNG isolation failed -- do not trust downstream numbers.'
+    # Raises AssertionError if the global RNG is not isolated, or if the action
+    # gap exceeds the measured bf16 nondeterminism floor (see assert_pnp_noop).
+    assert_pnp_noop(policy, _batch, step_indices=(2, 3), seed=0)
 finally:
     _env.close()
 '''
