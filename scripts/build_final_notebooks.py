@@ -233,8 +233,30 @@ def _ensure(mod, pip_spec):
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', *pip_spec.split()])
         importlib.invalidate_caches()
 
+def _fix_torch_quant_compat():
+    # lerobot/diffusers expect torch.ao.quantization.CUSTOM_KEY (torch >= 2.6).
+    # Colab's base torch can be older than the restored snapshot expects, which
+    # surfaces as: ImportError: cannot import name 'CUSTOM_KEY'. Repair before
+    # any lerobot import (which transitively pulls torch.ao.quantization.fx).
+    try:
+        import torch
+        from torch.ao.quantization import CUSTOM_KEY  # noqa: F401
+        print(f'torch {torch.__version__} — quantization compat OK')
+        return
+    except ImportError:
+        print('torch/quantization mismatch — upgrading torch (CUDA wheels)...')
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', '-U',
+                           'torch', 'torchvision', 'torchaudio'])
+    importlib.invalidate_caches()
+    for _m in [m for m in sys.modules if m == 'torch' or m.startswith('torch.')]:
+        del sys.modules[_m]
+    import torch
+    from torch.ao.quantization import CUSTOM_KEY  # noqa: F401
+    print(f'torch upgraded to {torch.__version__} — quantization compat OK')
+
 _ensure('mujoco', 'mujoco')
 _ensure('libero', 'libero')
+_fix_torch_quant_compat()
 try:
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy  # noqa: F401
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy  # noqa: F401
