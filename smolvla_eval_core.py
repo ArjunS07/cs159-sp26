@@ -452,8 +452,40 @@ def apply_pnp_patch(policy, flavor='pi05'):
     print(f'Patched {flavor} sample_actions (action_dim={PNP_CONFIG.action_dim})')
 
 
+def _ensure_hf_weights(repo_id):
+    """Fully download repo_id and validate every safetensors shard.
+
+    lerobot's from_pretrained silently falls back to RANDOM weights when a cached
+    .safetensors is truncated ("incomplete metadata, file not fully covered"),
+    which happens when the HF cache lives on the Drive FUSE mount. Force a clean
+    re-download on integrity failure, and raise loudly if valid weights still
+    cannot be obtained (rather than evaluating an untrained model).
+    """
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+    import glob as _glob
+    tok = os.getenv('HF_TOKEN')
+    last_err = None
+    for force in (False, True):
+        path = snapshot_download(repo_id, token=tok, force_download=force)
+        sts = _glob.glob(os.path.join(path, '**', '*.safetensors'), recursive=True)
+        if not sts:
+            return path
+        try:
+            for f in sts:
+                with safe_open(f, framework='pt'):
+                    pass
+            return path
+        except Exception as e:               # truncated/corrupt -> force re-download
+            last_err = e
+            print(f'[weights] integrity check failed: {e}; re-downloading {repo_id}...')
+    raise RuntimeError(f'Invalid/incomplete weights for {repo_id}: {last_err}. '
+                       'Set HF_TOKEN (gated repo) and check disk space.')
+
+
 def load_pi05():
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+    _ensure_hf_weights('lerobot/pi05_libero_finetuned')
     policy = PI05Policy.from_pretrained('lerobot/pi05_libero_finetuned').to(device).eval()
     preprocess, postprocess = make_pre_post_processors(
         policy.config, 'lerobot/pi05_libero_finetuned',
@@ -466,6 +498,7 @@ def load_pi05():
 def load_smolvla():
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
     model_id = 'HuggingFaceVLA/smolvla_libero'
+    _ensure_hf_weights(model_id)
     policy = SmolVLAPolicy.from_pretrained(model_id).to(device).eval()
     preprocess, postprocess = make_pre_post_processors(
         policy.config, model_id,

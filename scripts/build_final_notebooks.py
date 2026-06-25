@@ -255,6 +255,12 @@ for _d in (RESULTS_DIR, VIDEO_DIR, AHATS_DIR, FIGURES_DIR, TABLES_DIR):
     os.makedirs(_d, exist_ok=True)
 
 MODELS = ['pi05', 'smolvla']
+
+# Run-control flags: skip the pre-flight no-op check and the 600-ep PRO run so
+# only the 80-episode slice executes. Flip to True to re-enable.
+RUN_NOOP_CHECK = False
+RUN_PRO_600 = False
+
 print('FINAL_ROOT =', FINAL_ROOT)
 '''
 
@@ -279,7 +285,11 @@ if os.path.exists(SNAPSHOT):
 
 os.environ.setdefault('MUJOCO_GL', 'egl')
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
-os.environ.setdefault('HF_HOME', os.path.join(CACHE_DIR, 'hf_models'))
+# Keep the HF model cache on fast LOCAL disk: writing multi-GB safetensors onto
+# the Drive FUSE mount truncates them ("incomplete metadata, file not fully
+# covered") and yields silently-random model weights. Re-downloads per session,
+# but the files are valid.
+os.environ['HF_HOME'] = '/content/hf_home'
 
 def _ensure(mod, pip_spec):
     try:
@@ -294,50 +304,41 @@ def _fix_torch_quant_compat():
     # surfaces as: ImportError: cannot import name 'CUSTOM_KEY'. Repair before
     # any lerobot import (which transitively pulls torch.ao.quantization.fx).
     #
-    # Probe the *installed metadata* first so we don't import torch (and lock its
-    # C extension) unless the version is already adequate. torch is backed by a C
-    # extension (torch._C) that CANNOT be re-initialised within a live process:
-    # deleting torch from sys.modules and re-importing re-runs torch/overrides.py,
-    # whose _add_docstr() calls then fail on already-documented C functions with
-    #   RuntimeError: function '_has_torch_function' already has a docstring.
-    import importlib.metadata as _md
-
-    def _torch_ge_26():
-        try:
-            major, minor = (int(x) for x in _md.version('torch').split('.')[:2])
-            return (major, minor) >= (2, 6)
-        except Exception:
-            return False
-
-    if _torch_ge_26():
-        import torch
-        from torch.ao.quantization import CUSTOM_KEY  # noqa: F401
-        print(f'torch {torch.__version__} — quantization compat OK')
-        return
-
-    print('torch/quantization mismatch — upgrading torch (CUDA wheels)...')
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', '-U',
-                           'torch', 'torchvision', 'torchaudio'])
-    importlib.invalidate_caches()
-
-    # If torch was already imported in this process (e.g. transitively by an
-    # earlier import), the C extension is locked and the new build cannot be
-    # hot-swapped. The only safe repair is to restart the runtime; Colab
-    # auto-restarts, then you re-run this cell with the upgraded torch in place.
-    if any(m == 'torch' or m.startswith('torch.') for m in sys.modules):
-        print('torch upgraded — restarting runtime to load the new build. '
-              'Re-run this cell after the restart.')
-        sys.stdout.flush()
-        os.kill(os.getpid(), 9)
-
-    # torch was never imported in this process, so a fresh import is safe.
+    # Probe FUNCTIONALLY in a child process so the parent never imports torch
+    # (and never locks torch._C). A version-number check is NOT a reliable proxy:
+    # a build can report >= 2.6 yet still not expose CUSTOM_KEY at that import
+    # path, which then escapes as ImportError. torch is backed by a C extension
+    # (torch._C) that CANNOT be re-initialised within a live process, so we must
+    # never delete it from sys.modules and re-import (that re-runs
+    # torch/overrides.py, whose _add_docstr() then fails on already-documented C
+    # functions: RuntimeError: function '_has_torch_function' already has a
+    # docstring). Keeping the probe in a subprocess lets the parent import the
+    # (correct) torch exactly once.
+    probe = 'from torch.ao.quantization import CUSTOM_KEY'
+    ok = subprocess.run([sys.executable, '-c', probe],
+                        capture_output=True).returncode == 0
+    if not ok:
+        print('torch/quantization mismatch — upgrading torch (CUDA wheels)...')
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', '-U',
+                               'torch', 'torchvision', 'torchaudio'])
+        importlib.invalidate_caches()
+        # If torch was already imported in THIS process (e.g. transitively by an
+        # earlier import), the C extension is locked and cannot be hot-swapped.
+        # Restart the runtime; Colab auto-restarts, then you re-run this cell.
+        if any(m == 'torch' or m.startswith('torch.') for m in sys.modules):
+            print('torch upgraded — restarting runtime to load the new build. '
+                  'Re-run this cell after the restart.')
+            sys.stdout.flush()
+            os.kill(os.getpid(), 9)
     import torch
     from torch.ao.quantization import CUSTOM_KEY  # noqa: F401
-    print(f'torch upgraded to {torch.__version__} — quantization compat OK')
+    print(f'torch {torch.__version__} — quantization compat OK')
 
+# Repair torch BEFORE the ensures: importing libero can transitively load torch
+# and lock its C extension, which would otherwise force a runtime restart.
+_fix_torch_quant_compat()
 _ensure('mujoco', 'mujoco')
 _ensure('libero', 'libero')
-_fix_torch_quant_compat()
 try:
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy  # noqa: F401
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy  # noqa: F401
@@ -376,26 +377,29 @@ The controlled 80-episode slice (Section 6) uses only stock `libero_goal` /
 # Notebook 01: run_experiments
 # ─────────────────────────────────────────────────────────────────────────────
 NOOP_SRC = r'''# === Verify the RNG-isolation fix is a TRUE no-op before spending GPU time ====
-policy, preprocess, postprocess = load_pi05_session(video_dir=VIDEO_DIR)
-globals()['CURRENT_POLICY_MODEL'] = 'pi05'
+if not RUN_NOOP_CHECK:
+    print('Skipping no-op verification (RUN_NOOP_CHECK=False).')
+else:
+    policy, preprocess, postprocess = load_pi05_session(video_dir=VIDEO_DIR)
+    globals()['CURRENT_POLICY_MODEL'] = 'pi05'
 
-eps = build_final_episodes(None)[:1]
-_ep = eps[0]
-_env = OffScreenRenderEnv(bddl_file_name=_ep['bddl_path'], camera_names=CAMERAS,
-                          camera_heights=IMG_SIZE, camera_widths=IMG_SIZE,
-                          has_offscreen_renderer=True, use_camera_obs=True,
-                          has_renderer=False, reward_shaping=False)
-try:
-    _env.reset(); policy.reset()
-    _obs = _env.set_init_state(_ep['init_state'])
-    for _ in range(NUM_STEPS_WAIT):
-        _obs, _, _, _ = _env.step(LIBERO_DUMMY_ACTION)
-    _batch = preprocess(obs_to_policy(_obs, _ep['task_desc'], device))
-    # Raises AssertionError if the global RNG is not isolated, or if the action
-    # gap exceeds the measured bf16 nondeterminism floor (see assert_pnp_noop).
-    assert_pnp_noop(policy, _batch, step_indices=(2, 3), seed=0)
-finally:
-    _env.close()
+    eps = build_final_episodes(None)[:1]
+    _ep = eps[0]
+    _env = OffScreenRenderEnv(bddl_file_name=_ep['bddl_path'], camera_names=CAMERAS,
+                              camera_heights=IMG_SIZE, camera_widths=IMG_SIZE,
+                              has_offscreen_renderer=True, use_camera_obs=True,
+                              has_renderer=False, reward_shaping=False)
+    try:
+        _env.reset(); policy.reset()
+        _obs = _env.set_init_state(_ep['init_state'])
+        for _ in range(NUM_STEPS_WAIT):
+            _obs, _, _, _ = _env.step(LIBERO_DUMMY_ACTION)
+        _batch = preprocess(obs_to_policy(_obs, _ep['task_desc'], device))
+        # Raises AssertionError if the global RNG is not isolated, or if the action
+        # gap exceeds the measured bf16 nondeterminism floor (see assert_pnp_noop).
+        assert_pnp_noop(policy, _batch, step_indices=(2, 3), seed=0)
+    finally:
+        _env.close()
 '''
 
 SLICE_DRIVER_SRC = r'''# === Controlled 80-episode slice: 4 methods, paired, RNG-isolated ============
@@ -403,8 +407,21 @@ SLICE_DRIVER_SRC = r'''# === Controlled 80-episode slice: 4 methods, paired, RNG
 # RNG. uncertainty_only is now a TRUE no-op of vanilla (expected SR ~= vanilla);
 # refinement (mode="both") is the genuine intervention.
 import json as _json
+import shutil as _shutil
 from itertools import groupby
 from tqdm.auto import tqdm
+
+# The embedded core cell resets VIDEO_DIR to None; re-assert it so failure-video
+# saving in run_episode_pnp doesn't hit os.makedirs(None).
+VIDEO_DIR = os.path.join(RESULTS_DIR, 'videos')
+os.makedirs(VIDEO_DIR, exist_ok=True)
+
+# Work on a LOCAL DB (SQLite on the Drive FUSE mount is fragile) and sync to
+# Drive at checkpoints. Resume-copy the canonical Drive DB back first so
+# existing_keys(...) can skip already-completed episodes.
+LOCAL_SLICE_DB = '/content/rollouts_final.db'
+if os.path.exists(SLICE_DB):
+    _shutil.copy(SLICE_DB, LOCAL_SLICE_DB)
 
 SLICE_STEP_CONFIGS = [(2, 3), (3, 4), (4, 5)]
 SLICE_K = 3
@@ -462,16 +479,33 @@ def run_controlled_slice(model_name, db):
     db.sync_to_path(SLICE_DB)
 
 
-SLICE_DB_HANDLE = RolloutDB(SLICE_DB)
+SLICE_DB_HANDLE = RolloutDB(LOCAL_SLICE_DB)
 for _m in MODELS:
     print(f'\n===== controlled slice: {_m} =====')
     run_controlled_slice(_m, SLICE_DB_HANDLE)
 SLICE_DB_HANDLE.summary()
+
+# Explicit checkpoint to Drive after the 80-episode slice.
+SLICE_DB_HANDLE.sync_to_path(SLICE_DB)
+SLICE_DB_HANDLE.verify_disk(SLICE_DB)
+print('80-slice results saved to Drive ->', SLICE_DB)
 '''
 
 PRO_DRIVER_SRC = r'''# === LIBERO-PRO 600-ep: baseline / uncertainty(+a_hats) / both ==============
+import shutil as _shutil
 from itertools import groupby
 from tqdm.auto import tqdm
+
+# The embedded core cell resets VIDEO_DIR to None; re-assert it so failure-video
+# saving in run_episode_pnp doesn't hit os.makedirs(None).
+VIDEO_DIR = os.path.join(RESULTS_DIR, 'videos')
+os.makedirs(VIDEO_DIR, exist_ok=True)
+
+# Work on a LOCAL DB and sync to Drive at checkpoints (see slice cell). Resume-
+# copy the canonical Drive DB back first so completed episodes are skipped.
+LOCAL_PRO_DB = '/content/rollouts_pro.db'
+if os.path.exists(PRO_DB):
+    _shutil.copy(PRO_DB, LOCAL_PRO_DB)
 
 PRO_STEP_INDICES = (1, 2)
 PRO_K = 3
@@ -522,11 +556,19 @@ def run_pro(model_name, db):
     db.sync_to_path(PRO_DB)
 
 
-PRO_DB_HANDLE = RolloutDB(PRO_DB)
-for _m in MODELS:
-    print(f'\n===== LIBERO-PRO: {_m} =====')
-    run_pro(_m, PRO_DB_HANDLE)
-PRO_DB_HANDLE.summary()
+if not RUN_PRO_600:
+    print('Skipping LIBERO-PRO 600-episode run (RUN_PRO_600=False).')
+else:
+    PRO_DB_HANDLE = RolloutDB(LOCAL_PRO_DB)
+    for _m in MODELS:
+        print(f'\n===== LIBERO-PRO: {_m} =====')
+        run_pro(_m, PRO_DB_HANDLE)
+    PRO_DB_HANDLE.summary()
+
+    # Explicit checkpoint to Drive after the 600-episode PRO run.
+    PRO_DB_HANDLE.sync_to_path(PRO_DB)
+    PRO_DB_HANDLE.verify_disk(PRO_DB)
+    print('600-PRO results saved to Drive ->', PRO_DB)
 '''
 
 
