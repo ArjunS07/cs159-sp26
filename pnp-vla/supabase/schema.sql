@@ -192,33 +192,11 @@ CREATE TABLE IF NOT EXISTS baseline_uncertainty (
     suite            TEXT
 );
 
--- ── qc_rollouts: PCP collection (heavy data in Storage) ─────────────────────
-CREATE TABLE IF NOT EXISTS qc_rollouts (
-    rollout_id       TEXT PRIMARY KEY,
-    run_id           UUID REFERENCES experiment_runs(run_id),
-    experiment       TEXT,
-    suite            TEXT,
-    task_idx         INTEGER,
-    episode_idx      INTEGER,
-    init_state_hash  TEXT,
-    success          BOOLEAN,
-    n_chunks         INTEGER,
-    chunks_path      TEXT,      -- Storage pointer to per-chunk obs_enc + z_hat parquet
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ── qc_eval: PCP 3-way eval (lambda: -1 vanilla / 0 pnp-only / 3.0 pcp) ──────
-CREATE TABLE IF NOT EXISTS qc_eval (
-    rollout_id   TEXT NOT NULL,
-    lambda       REAL NOT NULL,
-    run_id       UUID REFERENCES experiment_runs(run_id),
-    experiment   TEXT,
-    suite        TEXT,
-    task_idx     INTEGER,
-    episode_idx  INTEGER,
-    success      BOOLEAN,
-    PRIMARY KEY (rollout_id, lambda)
-);
+-- NOTE: no qc_rollouts / qc_eval tables. With the action/probe/sinks decomposition, PCP
+-- collection is just a rollout carrying a pcp_chunks blob (rollouts.pcp_chunks_path; label =
+-- rollouts.success), and the PCP 3-way eval is three ordinary rollouts rows
+-- (method IN ('vanilla','pnp_only','pcp')). Corrector training data =
+-- SELECT ... FROM rollouts WHERE pcp_chunks_path IS NOT NULL.
 
 -- ── q_correctors: trained-corrector registry ────────────────────────────────
 CREATE TABLE IF NOT EXISTS q_correctors (

@@ -246,17 +246,19 @@ class SupabaseStore:
     @staticmethod
     def _denorm(method: str, config) -> dict:
         """Denormalized config columns for filtering + the logical-config hash key."""
-        pnp = config.pnp
-        on = bool(pnp and pnp.enabled)
+        from .config import Refine, MultiSample
+        pr = config.probe
+        on = pr is not None
+        a = config.action
         return {
             "method": method,
             "pnp_enabled": on,
-            "pnp_step_indices": list(pnp.step_indices) if (on and pnp.step_indices) else None,
-            "pnp_k": pnp.num_iterations if on else None,
-            "refine_average": pnp.refine_average if on else None,
-            "pnp_time_min": pnp.time_min if on else None,
+            "pnp_step_indices": list(pr.steps) if (on and pr.steps) else None,
+            "pnp_k": pr.k if on else None,
+            "refine_average": (a.average if isinstance(a, Refine) else None),
+            "pnp_time_min": pr.time_min if on else None,
             "num_inference_steps": config.num_inference_steps,
-            "num_samples": config.num_samples,
+            "num_samples": (a.n if isinstance(a, MultiSample) else None),
         }
 
     def rollout_id(self, experiment: str, ep: dict, method: str, config) -> str:
@@ -324,70 +326,61 @@ class SupabaseStore:
             "nan_action_count": result["nan_action_count"], "n_vf_evals": result["n_vf_evals"],
             **denorm, **summary, **result["instability"],
         }
-        if config.pcp is not None and config.pcp.mode == "correct":
-            row.update(correction_lambda=config.pcp.lambda_pcp, q_gate=config.pcp.q_gate,
-                       correction_steps=list(config.pcp.correction_steps),
-                       q_ckpt_id=config.pcp.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
+        from .config import Correct
+        if isinstance(config.action, Correct):
+            a = config.action
+            row.update(correction_lambda=a.lam, q_gate=a.gate,
+                       correction_steps=list(config.probe.steps),
+                       q_ckpt_id=a.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
+        if result.get("ms_selections"):
+            sels = result["ms_selections"]
+            row["ms_chosen_idx"] = sels[0]["chosen"]
+            row["ms_candidate_u"] = {"chosen": [s["chosen"] for s in sels],
+                                     "u": [s["cand_u"] for s in sels]}
         blobs = {}
         if result.get("trajectory"):
             blobs["trajectory"] = result["trajectory"]
         if result.get("obs_frames"):
             blobs["obs_frames"] = result["obs_frames"]
-        if config.record_per_iteration and result.get("recorder_episode"):
+        if config.save_ahats and result.get("recorder_episode"):
             ah = {f"c{c['chunk_idx']}_s{st['step']}": st["a_hats"]
                   for c in result["recorder_episode"].get("chunks", [])
                   for st in c.get("steps", []) if "a_hats" in st}
             if ah:
                 blobs["ahats"] = ah
+        if config.save_pcp_features and result.get("pcp_chunks"):
+            blobs["pcp_chunks"] = self._pcp_chunks_df(result["pcp_chunks"])
         return self.log_episode(row, euler_steps=euler, action_vectors=vecs, blobs=blobs or None)
 
-    def log_collect(self, rid: str, ep: dict, result: dict) -> str:
-        """Persist a PCP-collection episode: qc_rollouts row + per-chunk parquet blob."""
+    @staticmethod
+    def _pcp_chunks_df(pcp_chunks: list):
+        """Flatten tap pcp_chunks into a per-(chunk,step) DataFrame for the parquet blob."""
         import pandas as pd
         rows = []
-        for c in result.get("collected_chunks", []):
+        for c in pcp_chunks:
             for st in c["steps"]:
                 rows.append({"chunk_idx": c["chunk_idx"], "chunk_pos": c["chunk_pos"],
                              "obs_enc": np.asarray(c["obs_enc"]).tolist(),
                              "step_idx": st["step_idx"], "s": st["s"],
                              "z_hat": np.asarray(st["z_hat"]).reshape(-1).tolist()})
-        return self.log_qc_rollout(
-            {"rollout_id": rid, "suite": ep["suite"], "task_idx": ep["task_idx"],
-             "episode_idx": ep.get("ep_idx"), "init_state_hash": ep["init_state_hash"],
-             "success": result["success"], "n_chunks": len(result.get("collected_chunks", []))},
-            chunks_df=pd.DataFrame(rows) if rows else None)
+        return pd.DataFrame(rows) if rows else None
 
-    def log_eval(self, rid: str, ep: dict, lam: float, result: dict) -> None:
-        """Persist a PCP 3-way eval outcome to qc_eval (lam: -1 vanilla / 0 pnp / 3 pcp)."""
-        self.log_qc_eval({"rollout_id": rid, "lambda": lam, "suite": ep["suite"],
-                          "task_idx": ep["task_idx"], "episode_idx": ep.get("ep_idx"),
-                          "success": result["success"]})
-
-    # ── PCP ────────────────────────────────────────────────────────────────
-    def log_qc_rollout(self, row: dict, chunks_df=None) -> str:
-        rid = row["rollout_id"]
-        row.setdefault("run_id", self.run_id)
-        row.setdefault("experiment", self.experiment)
-        if chunks_df is not None:
-            key = f"pcp_chunks/{rid}.parquet"
-            self._upload(key, _parquet_bytes(chunks_df))
-            row["chunks_path"] = key
-        self.client.table("qc_rollouts").upsert(self._json(row), on_conflict="rollout_id").execute()
-        return rid
-
+    # ── PCP training data (read straight from rollouts; no separate qc table) ──
     def load_qc_rows(self, experiment: str | None = None) -> list[dict]:
-        """Read qc_rollouts back into training-ready dicts {..., chunks:[{obs_enc, chunk_pos,
-        steps:[{step_idx, s, z_hat}]}]} by downloading each rollout's per-chunk parquet blob."""
+        """Read every rollout carrying a pcp_chunks blob (the save_pcp_features sink) back into
+        training-ready dicts {rollout_id, suite, task_idx, success, chunks:[{obs_enc, chunk_pos,
+        steps:[{step_idx, s, z_hat}]}]}. The label is rollouts.success — no qc_rollouts table."""
         import pandas as pd
-        q = self.client.table("qc_rollouts").select("*")
+        q = self.client.table("rollouts").select(
+            "rollout_id,suite,task_idx,success,pcp_chunks_path").not_.is_("pcp_chunks_path", "null")
         if experiment:
             q = q.eq("experiment", experiment)
         rows = q.execute().data or []
         out = []
         for r in rows:
             chunks = []
-            if r.get("chunks_path"):
-                df = pd.read_parquet(io.BytesIO(self._download(r["chunks_path"])))
+            if r.get("pcp_chunks_path"):
+                df = pd.read_parquet(io.BytesIO(self._download(r["pcp_chunks_path"])))
                 for ci, g in df.groupby("chunk_idx"):
                     g0 = g.iloc[0]
                     chunks.append({
@@ -400,12 +393,7 @@ class SupabaseStore:
                         "task_idx": r["task_idx"], "success": r["success"], "chunks": chunks})
         return out
 
-    def log_qc_eval(self, row: dict) -> None:
-        row.setdefault("run_id", self.run_id)
-        row.setdefault("experiment", self.experiment)
-        self.client.table("qc_eval").upsert(self._json(row),
-                                            on_conflict="rollout_id,lambda").execute()
-
+    # ── Q-corrector registry ─────────────────────────────────────────────────
     def register_q_corrector(self, q_ckpt_id: str, ckpt_bytes: bytes, meta: dict,
                              split_ids: dict | None = None) -> str:
         ckpt_key = f"q_correctors/{q_ckpt_id}.pt"

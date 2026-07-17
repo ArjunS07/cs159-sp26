@@ -40,8 +40,12 @@ def euler_steps(store, experiment=None) -> pd.DataFrame:
     return steps
 
 
-def qc_eval(store, experiment=None) -> pd.DataFrame:
-    return pd.DataFrame(_all_rows(store.client, "qc_eval", experiment))
+def pcp_three_way(store, experiment=None) -> pd.DataFrame:
+    """PCP 3-way eval SR — just the three method rows in `rollouts` (no qc_eval table)."""
+    df = rollouts(store, experiment)
+    if df.empty:
+        return df
+    return df[df["method"].isin(["vanilla", "pnp_only", "pcp"])]
 
 
 def action_vectors(store) -> pd.DataFrame:
