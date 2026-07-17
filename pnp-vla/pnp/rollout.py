@@ -112,7 +112,7 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
     Store/DB writes are the notebook's job (via store.log_result)."""
     config = config or RolloutConfig()
     model = policy.model
-    adim = getattr(model, "_pnp_action_dim", ADIM)
+    adim = model._pnp.action_dim
     task_desc = ep["task_desc"]
     max_steps = ep["max_steps"]
     chunk_size = policy.config.chunk_size
@@ -120,7 +120,7 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
 
     recorder = PnPRecorder()
     tap = build_tap(config, recorder, device, adim)
-    model._pnp_num_steps = config.num_inference_steps   # extra_steps override (None = default)
+    model._pnp.num_steps = config.num_inference_steps   # extra_steps override (None = default)
 
     ep_seed = episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
     torch.manual_seed(ep_seed)
@@ -129,7 +129,7 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
     _pnp_seed_perturb(ep_seed)                           # isolated perturbation stream
 
     _sampler.set_strategy(model, tap)
-    model._pnp_vf_evals = 0
+    model._pnp.vf_evals = 0
     recorder.new_episode(meta={k: ep.get(k) for k in ("suite", "task_idx", "ep_idx")})
 
     est_chunks = max(1, round(max_steps / chunk_size))
@@ -152,7 +152,7 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
 
         for step in range(max_steps):
             if not queue:
-                model._pnp_chunk_pos = min(ci / est_chunks, 1.0)
+                model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
                 cns = chunk_noise_seed(ep_seed, ci)
                 chunk_noise_seeds.append(cns)
                 noise = _draw_chunk_noise(policy, device, cns)
@@ -195,7 +195,7 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
     recorder.close_episode(success, n_steps)
     inst = compute_instability(executed_actions, chunk_boundary_actions)
 
-    vf_evals = int(getattr(model, "_pnp_vf_evals", 0))
+    vf_evals = int(model._pnp.vf_evals)
     if vf_evals == 0:                                   # vanilla path (orig sampler doesn't count)
         vf_evals = (config.num_inference_steps or policy.config.num_inference_steps) * max(ci, 1)
 

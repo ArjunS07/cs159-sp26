@@ -178,6 +178,10 @@ class PnPRecorder:
         self._cur = {"meta": dict(meta or {}), "chunks": [], "success": None, "n_steps": None}
         self._chunk_idx = 0
 
+    def current_chunks(self) -> list:
+        """Chunks logged in the in-progress episode (before close_episode)."""
+        return (self._cur or {}).get("chunks", [])
+
     def log_chunk(self, chunk_rec: dict):
         if self._cur is None:
             return
@@ -232,7 +236,7 @@ def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=Tr
     from .config import RolloutConfig
     from .tap import RolloutTap
     model = policy.model
-    prev = getattr(model, "_pnp_strategy", None)
+    prev = model._pnp.strategy
 
     def _seeded_chunk():
         torch.manual_seed(seed)
@@ -242,15 +246,15 @@ def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=Tr
         return policy.predict_action_chunk(batch, noise=None).detach().float().cpu().numpy()
 
     try:
-        model._pnp_strategy = None                       # vanilla (delegates to orig sampler)
+        model._pnp.strategy = None                       # vanilla (delegates to orig sampler)
         a_van1 = _seeded_chunk()
         rng_after_vanilla = torch.random.get_rng_state()
         a_van2 = _seeded_chunk()
         floor = float(np.abs(a_van1 - a_van2).max())
 
         cfg = RolloutConfig(pnp_steps=tuple(step_indices), pnp_k=3, save_trajectory=False)
-        model._pnp_strategy = RolloutTap(cfg, PnPRecorder(), device=None,
-                                         adim=getattr(model, "_pnp_action_dim", ADIM))
+        model._pnp.strategy = RolloutTap(cfg, PnPRecorder(), device=None,
+                                         adim=model._pnp.action_dim)
         a_unc = _seeded_chunk()
         rng_after_unc = torch.random.get_rng_state()
 
@@ -265,4 +269,4 @@ def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=Tr
         print(msg)
         return ok
     finally:
-        model._pnp_strategy = prev
+        model._pnp.strategy = prev
