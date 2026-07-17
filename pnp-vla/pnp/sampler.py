@@ -12,10 +12,58 @@ so the per-(episode,chunk) noise contract holds. Every velocity-field evaluation
 """
 from __future__ import annotations
 
+import hashlib
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+
+
+class _EncodingCache:
+    """In-session LRU of pi0.5 prefix encodings, keyed by a content hash of the prefix inputs.
+
+    Holds on-device tensors, so a cache hit skips `embed_prefix` (the SigLIP image tower) entirely.
+    The win is the first chunk, which is identical across the paired methods at one `init_state`.
+    Opt-in (OFF by default). The store's Storage-backed get/put_encoding is a separate, optional
+    persistent tier — not used here (bf16 prefixes don't round-trip through numpy cheaply).
+    """
+
+    def __init__(self, size: int = 8, model_revision: str = ""):
+        self.size = size
+        self.model_revision = model_revision
+        self._lru: "OrderedDict[str, tuple]" = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    def key(self, *tensors) -> str:
+        h = hashlib.sha1(self.model_revision.encode())
+        for t in tensors:
+            a = (t.detach().to("cpu", torch.float32) if t.is_floating_point()
+                 else t.detach().cpu()).numpy()
+            h.update(repr(a.shape).encode())
+            h.update(a.tobytes())
+        return h.hexdigest()
+
+    def get(self, key: str):
+        v = self._lru.get(key)
+        if v is None:
+            self.misses += 1
+            return None
+        self._lru.move_to_end(key)
+        self.hits += 1
+        return v
+
+    def put(self, key: str, value) -> None:
+        self._lru[key] = value
+        self._lru.move_to_end(key)
+        while len(self._lru) > self.size:
+            self._lru.popitem(last=False)
+
+
+def enable_encoding_cache(model, size: int = 8, model_revision: str = "") -> None:
+    """Turn on the in-session prefix-encoding LRU on a patched model (opt-in; OFF by default)."""
+    model._pnp_enc_cache = _EncodingCache(size, model_revision)
 
 
 @dataclass
@@ -37,6 +85,7 @@ def install_patch(model) -> None:
     model._pnp_chunk_pos = 0.0
     model._pnp_vf_evals = 0
     model._pnp_num_steps = None       # per-call num_inference_steps override (set by run_episode)
+    model._pnp_enc_cache = None       # opt-in prefix-encoding LRU (see enable_encoding_cache)
     import types
     model.sample_actions = types.MethodType(_sample_actions_hooked, model)
 
@@ -72,8 +121,17 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
         ).clone()
 
     # ---- prefix / KV cache: replicated verbatim from the original sample_actions ----
-    prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-        images, img_masks, tokens, masks)
+    # (opt-in) reuse the prefix encoding across paired methods at the same obs — skips embed_prefix.
+    cache = getattr(self, "_pnp_enc_cache", None)
+    ckey = cache.key(images, img_masks, tokens, masks) if cache is not None else None
+    prefix = cache.get(ckey) if cache is not None else None
+    if prefix is None:
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks)
+        if cache is not None:
+            cache.put(ckey, (prefix_embs, prefix_pad_masks, prefix_att_masks))
+    else:
+        prefix_embs, prefix_pad_masks, prefix_att_masks = prefix
     prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
     prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
     prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
