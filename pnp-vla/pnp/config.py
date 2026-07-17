@@ -7,7 +7,7 @@ is safe to import locally without a GPU stack.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Versioning levers (see the plan's provenance design)
@@ -52,81 +52,43 @@ PERTURB_SEED_MASK = 0x9E3779B9
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rollout decomposition: three ORTHOGONAL axes on RolloutConfig.
-#   (A) action  — how the executed action is produced (None / Refine / Correct / MultiSample)
-#   (B) probe   — the P&P predict-and-perturb MEASUREMENT (where + how hard)
-#   (C) sinks   — independent save_* booleans (what gets persisted)
-# A "method" is no longer a class; it's a point in this switch space.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ── (B) Probe — the predict-and-perturb measurement ──────────────────────────
-@dataclass
-class Probe:
-    """The P&P measurement at selected Euler steps. `steps` is the single source of truth for
-    WHERE anything happens — the uncertainty read AND any Refine/Correct feedback act there.
-
-    LeRobot flow time runs s=1.0 (noise) -> s=0.0 (clean), so early/high-noise steps are the
-    FIRST Euler steps (large s). Select them with steps=(1,)/(1,2) or the time_min selector.
-    """
-    steps: Optional[Sequence[int]] = (1,)   # Euler steps to probe (unless time_min set)
-    k: int = 3                              # K predict-and-perturb iterations
-    time_min: Optional[float] = None        # alt selector: probe when s >= time_min
-    compute_multimodal: bool = False        # per-dim Sarle BC + PC1 stats (needs k>=4)
-    action_dim: int = ADIM                  # real (un-padded) dims used for uncertainty
-
-    def selected(self, step: int, s: float) -> bool:
-        if self.time_min is not None:
-            return s >= self.time_min
-        return self.steps is not None and step in tuple(self.steps)
-
-
-# ── (A) Action sources — at most one per rollout ─────────────────────────────
-@dataclass
-class Refine:
-    """Re-noise inference from the probe's clean estimate (self-refinement)."""
-    average: bool = False    # re-noise from mean of K a_hats (True) vs the last a_hat (False)
-
-
-@dataclass
-class Correct:
-    """PCP: gated Q-gradient nudge on the probe's z_hat. q_model/q_scaler are RUNTIME handles
-    the notebook attaches after load_q_corrector — they are NOT serialized into config_json."""
-    lam: float = 3.0                        # correction step size
-    gate: float = 0.5                       # only correct chunks with predicted P(success) < gate
-    q_ckpt_id: Optional[str] = None
-    q_model: object = field(default=None, repr=False, compare=False)
-    q_scaler: object = field(default=None, repr=False, compare=False)
-
-
-@dataclass
-class MultiSample:
-    """Sample n chunks and keep the lowest-uncertainty one. Applied at the CHUNK level in
-    run_episode (not inside the Euler loop), so it carries its own probe_steps."""
-    n: int = 5
-    probe_steps: Sequence[int] = (1, 2)
-
-
-Action = Union[Refine, Correct, MultiSample]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# (C) Per-rollout config — action + probe + independent save_* sinks.
-# The notebook composes these; nothing about the experiment lives in the package.
+# Rollout config: three ORTHOGONAL axes, FLAT on one dataclass.
+#   (A) action  — how the executed action is produced. At most one of: refine /
+#                 correction_lambda (PCP) / num_samples (multi-sample); None => vanilla.
+#   (B) probe   — the P&P predict-and-perturb MEASUREMENT: pnp_steps (where) + pnp_k (how hard).
+#   (C) sinks   — independent save_* booleans (what gets persisted).
+# A "method" is not a class; it's a point in this flat switch space. The fields map 1:1 to the
+# `rollouts` columns, so store._denorm is near-identity (no build-then-flatten round-trip).
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class RolloutConfig:
-    """Everything that defines ONE rollout's behavior + what to record.
+    """Everything that defines ONE rollout's behavior + what to record, as flat fields.
 
-    Three orthogonal axes: `action` (how the executed action is produced), `probe` (the P&P
-    measurement), and the `save_*` sinks (what to persist). e.g. training data for the
-    corrector is just `RolloutConfig(probe=Probe((7,8), k=3), save_pcp_features=True)` — a
-    vanilla action source with the pcp-features sink on.
+    e.g. training data for the corrector is just
+    `RolloutConfig(pnp_steps=(7,8), pnp_k=3, save_pcp_features=True)` — a vanilla action source
+    (no refine/correction/num_samples) with the pcp-features sink on.
+
+    LeRobot flow time runs s=1.0 (noise) -> s=0.0 (clean), so early/high-noise steps are the
+    FIRST Euler steps (large s). Select them with pnp_steps=(1,)/(1,2) or the pnp_time_min selector.
     """
-    action: Optional[Action] = None             # None (vanilla) | Refine | Correct | MultiSample
-    probe: Optional[Probe] = None               # the P&P measurement; None = no probe
+    # ── (B) probe — the P&P measurement (pnp_steps is None => no probe) ──
+    pnp_steps: Optional[Sequence[int]] = None   # Euler steps to probe (unless pnp_time_min set)
+    pnp_k: int = 3                              # K predict-and-perturb iterations
+    pnp_time_min: Optional[float] = None        # alt selector: probe when s >= pnp_time_min
+    compute_multimodal: bool = False            # per-dim Sarle BC + PC1 stats (needs pnp_k>=4)
+    action_dim: int = ADIM                      # real (un-padded) dims used for uncertainty
+    # ── (A) action — at most one of refine / correction_lambda / num_samples ──
+    refine: bool = False                        # re-noise from the probe's clean estimate
+    refine_average: bool = False                # refine from mean of K a_hats (True) vs last (False)
+    correction_lambda: Optional[float] = None   # set => PCP correction action (0.0 == P&P, no grad)
+    q_gate: float = 0.5                         # only correct chunks with predicted P(success) < gate
+    q_ckpt_id: Optional[str] = None
+    q_model: object = field(default=None, repr=False, compare=False)   # runtime handle, not serialized
+    q_scaler: object = field(default=None, repr=False, compare=False)  # runtime handle, not serialized
+    num_samples: Optional[int] = None           # set => multi-sample-select (chunk level)
+    ms_probe_steps: Sequence[int] = (1, 2)      # probe steps for multi-sample uncertainty
+    # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
-    # sinks (each persists one thing independently)
     save_uncertainty: Optional[bool] = None     # default: on iff a probe is set
     save_pcp_features: bool = False             # per-chunk obs_enc + z_hat -> Storage (training)
     save_ahats: bool = False                    # full K a_hats stacks -> Storage (geometry)
@@ -135,26 +97,39 @@ class RolloutConfig:
     video: str = "off"                          # "off" | "failures_only" | "all"
 
     def __post_init__(self):
-        a = self.action
-        if a is not None and not isinstance(a, (Refine, Correct, MultiSample)):
-            raise TypeError(f"action must be None/Refine/Correct/MultiSample, got {type(a).__name__}")
-        # Refine/Correct feed off the probe, so a probe is mandatory for them.
-        if isinstance(a, (Refine, Correct)) and self.probe is None:
-            raise ValueError(f"{type(a).__name__} action requires a probe (it acts at probe.steps)")
-        # MultiSample carries its own probe_steps and runs at the chunk level.
-        if isinstance(a, MultiSample) and self.probe is not None:
-            raise ValueError("MultiSample carries its own probe_steps; leave RolloutConfig.probe=None")
+        n_actions = int(self.refine) + int(self.correction_lambda is not None) \
+            + int(self.num_samples is not None)
+        if n_actions > 1:
+            raise ValueError("at most one action: refine / correction_lambda / num_samples")
+        # Refine/correction feed off the probe, so a probe is mandatory for them.
+        if (self.refine or self.correction_lambda is not None) and not self.has_probe:
+            raise ValueError("refine/correction requires a probe (set pnp_steps or pnp_time_min)")
+        # MultiSample carries its own ms_probe_steps and runs at the chunk level.
+        if self.num_samples is not None and self.has_probe:
+            raise ValueError("num_samples carries ms_probe_steps; leave pnp_steps/pnp_time_min unset")
+        if self.refine_average and not self.refine:
+            raise ValueError("refine_average=True requires refine=True")
         # Probe-derived sinks need a probe.
         for sink in ("save_pcp_features", "save_ahats"):
-            if getattr(self, sink) and self.probe is None:
+            if getattr(self, sink) and not self.has_probe:
                 raise ValueError(f"{sink} requires a probe (its data comes from the probe)")
-        if self.save_uncertainty and self.probe is None:
+        if self.save_uncertainty and not self.has_probe:
             raise ValueError("save_uncertainty=True requires a probe")
+
+    @property
+    def has_probe(self) -> bool:
+        """Whether a P&P probe is active (drives measurement + any refine/correct feedback)."""
+        return self.pnp_steps is not None or self.pnp_time_min is not None
+
+    def probe_selected(self, step: int, s: float) -> bool:
+        if self.pnp_time_min is not None:
+            return s >= self.pnp_time_min
+        return self.pnp_steps is not None and step in tuple(self.pnp_steps)
 
     @property
     def records_uncertainty(self) -> bool:
         """Whether to persist per-step uncertainty rows (default: on iff a probe is set)."""
-        return self.save_uncertainty if self.save_uncertainty is not None else (self.probe is not None)
+        return self.save_uncertainty if self.save_uncertainty is not None else self.has_probe
 
 
 # ─────────────────────────────────────────────────────────────────────────────

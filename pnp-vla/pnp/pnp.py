@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .config import Probe, PERTURB_SEED_MASK, ADIM
+from .config import PERTURB_SEED_MASK, ADIM
 
 # No module-level config/recorder globals: config travels with the strategy, and the
 # recorder is created per run_episode call. Only the mechanical perturbation-generator state
@@ -106,7 +106,8 @@ class ProbeResult:
     rec: dict                 # uncertainty record (u_mean/u_max/u_vec/a_std_vec/... + multimodal)
 
 
-def run_probe(x_t, s, vfield, probe: Probe) -> ProbeResult:
+def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
+              compute_multimodal: bool = False) -> ProbeResult:
     """Run K predict-and-perturb iterations at fixed noise level s and measure uncertainty.
 
         predict:  a_hat = x - s * v(x, s)
@@ -114,12 +115,11 @@ def run_probe(x_t, s, vfield, probe: Probe) -> ProbeResult:
 
     Pure: no global state touched (perturbation noise comes from the dedicated generator).
     """
-    adim = probe.action_dim
     x_acc = x_t
     a_hats, a_hats_full = [], []
     last_eps = None
     gen = _pnp_gen(x_acc.device)
-    for _ in range(probe.k):
+    for _ in range(k):
         v = vfield(x_acc)
         a_hat = x_acc - s * v
         a_hats.append(a_hat[..., :adim])
@@ -144,7 +144,7 @@ def run_probe(x_t, s, vfield, probe: Probe) -> ProbeResult:
         "a_std_vec": a_std.mean(dim=(0, 1)).detach().float().cpu().numpy(),
         "a_mean_vec": A.mean(dim=(0, 1, 2)).detach().float().cpu().numpy(),
     }
-    if probe.compute_multimodal and A.shape[0] >= 4:
+    if compute_multimodal and A.shape[0] >= 4:
         bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(A.detach().float().cpu().numpy()[:, 0])
         rec["bc_vec"] = bc_vec
         rec["mm_pc1_frac"] = float(pc1_frac)
@@ -252,7 +252,7 @@ def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=Tr
         a_van2 = _seeded_chunk()
         floor = float(np.abs(a_van1 - a_van2).max())
 
-        cfg = RolloutConfig(probe=Probe(steps=tuple(step_indices), k=3), save_trajectory=False)
+        cfg = RolloutConfig(pnp_steps=tuple(step_indices), pnp_k=3, save_trajectory=False)
         model._pnp_strategy = RolloutTap(cfg, PnPRecorder(), device=None,
                                          adim=getattr(model, "_pnp_action_dim", ADIM))
         a_unc = _seeded_chunk()

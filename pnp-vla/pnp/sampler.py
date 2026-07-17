@@ -110,13 +110,13 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
 
 def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3):
     """Run one measurement-only probe pass; return (action_chunk, u_mean_scalar)."""
-    from .config import RolloutConfig, Probe, ADIM
+    from .config import RolloutConfig, ADIM
     from .pnp import PnPRecorder
     from .tap import RolloutTap
     model = policy.model
     prev_strat = getattr(model, "_pnp_strategy", None)
     try:
-        cfg = RolloutConfig(probe=Probe(steps=tuple(probe_steps), k=num_iterations),
+        cfg = RolloutConfig(pnp_steps=tuple(probe_steps), pnp_k=num_iterations,
                             save_trajectory=False)
         rec = PnPRecorder(); rec.new_episode()
         model._pnp_strategy = RolloutTap(cfg, rec, device=None,

@@ -245,20 +245,19 @@ class SupabaseStore:
     # ── notebook-ergonomic helpers (the driver-loop moved into notebooks) ──
     @staticmethod
     def _denorm(method: str, config) -> dict:
-        """Denormalized config columns for filtering + the logical-config hash key."""
-        from .config import Refine, MultiSample
-        pr = config.probe
-        on = pr is not None
-        a = config.action
+        """Denormalized config columns for filtering + the logical-config hash key.
+
+        The flat RolloutConfig fields map 1:1 to these columns, so this is near-identity."""
+        on = config.has_probe
         return {
             "method": method,
             "pnp_enabled": on,
-            "pnp_step_indices": list(pr.steps) if (on and pr.steps) else None,
-            "pnp_k": pr.k if on else None,
-            "refine_average": (a.average if isinstance(a, Refine) else None),
-            "pnp_time_min": pr.time_min if on else None,
+            "pnp_step_indices": list(config.pnp_steps) if (on and config.pnp_steps) else None,
+            "pnp_k": config.pnp_k if on else None,
+            "refine_average": (config.refine_average if config.refine else None),
+            "pnp_time_min": config.pnp_time_min if on else None,
             "num_inference_steps": config.num_inference_steps,
-            "num_samples": (a.n if isinstance(a, MultiSample) else None),
+            "num_samples": config.num_samples,
         }
 
     def rollout_id(self, experiment: str, ep: dict, method: str, config) -> str:
@@ -326,12 +325,10 @@ class SupabaseStore:
             "nan_action_count": result["nan_action_count"], "n_vf_evals": result["n_vf_evals"],
             **denorm, **summary, **result["instability"],
         }
-        from .config import Correct
-        if isinstance(config.action, Correct):
-            a = config.action
-            row.update(correction_lambda=a.lam, q_gate=a.gate,
-                       correction_steps=list(config.probe.steps),
-                       q_ckpt_id=a.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
+        if config.correction_lambda is not None:
+            row.update(correction_lambda=config.correction_lambda, q_gate=config.q_gate,
+                       correction_steps=list(config.pnp_steps),
+                       q_ckpt_id=config.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
         if result.get("ms_selections"):
             sels = result["ms_selections"]
             row["ms_chosen_idx"] = sels[0]["chosen"]

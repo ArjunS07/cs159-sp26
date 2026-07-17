@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .config import Correct, TrainConfig
+from .config import TrainConfig
 from .pnp import _pnp_gen, ProbeResult
 
 
@@ -78,29 +78,30 @@ class CorrectTelemetry:
         )
 
 
-def apply_correct(pr: ProbeResult, ctx, cfg: Correct, adim: int, tel: CorrectTelemetry):
+def apply_correct(pr: ProbeResult, ctx, lam, gate, q_model, q_scaler, adim: int,
+                  tel: CorrectTelemetry):
     """Correction action given a probe result. Returns the (possibly corrected) re-noised state.
 
-    Gated: only chunks the corrector scores below `cfg.gate` get nudged; otherwise the plain
+    Gated: only chunks the corrector scores below `gate` get nudged; otherwise the plain
     re-noised last estimate (pr.x_acc) passes through unchanged.
     """
     s = pr.s
     z_hat = pr.z_hat_full[0, :, :adim]                       # (chunk, adim) mean clean estimate
     tel.n_steps += 1
-    if cfg.lam and cfg.lam > 0 and cfg.q_model is not None:
+    if lam and lam > 0 and q_model is not None:
         zc = z_hat.reshape(1, -1).detach().clone().requires_grad_(True)
         cp = torch.tensor([[float(ctx.chunk_pos), float(s)]], dtype=torch.float32, device=zc.device)
         ob = ctx.obs_enc.reshape(1, -1).float()
         with torch.enable_grad():
-            score = torch.sigmoid(cfg.q_scaler(cfg.q_model(zc, cp, ob)))
+            score = torch.sigmoid(q_scaler(q_model(zc, cp, ob)))
         tel.q_scores.append(float(score.item()))
-        if score.item() < cfg.gate:
+        if score.item() < gate:
             tel.n_gate_fire += 1
             score.backward()
             g = zc.grad.detach().reshape(z_hat.shape)
-            a_star = z_hat + cfg.lam * g
+            a_star = z_hat + lam * g
             tel.n_applied += 1
-            tel.corr_norms.append(float((cfg.lam * g).norm().item()))
+            tel.corr_norms.append(float((lam * g).norm().item()))
             gen = _pnp_gen(pr.x_acc.device)
             # re-noise the corrected estimate (correction lives in the first adim dims)
             z_full = pr.x_acc.clone()

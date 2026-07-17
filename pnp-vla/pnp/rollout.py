@@ -16,7 +16,7 @@ from itertools import groupby
 import numpy as np
 import torch
 
-from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, RolloutConfig, MultiSample
+from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, RolloutConfig
 from .libero_env import make_env, obs_to_policy
 from .pnp import PnPRecorder, _pnp_seed_perturb, multi_sample_select
 from .tap import RolloutTap
@@ -79,9 +79,9 @@ def compute_instability(executed_actions, chunk_boundary_actions=None, gripper_d
 # Config -> tap (the notebook never constructs the tap directly)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int):
-    """A tap exists iff the rollout has a probe. Vanilla / extra_steps / MultiSample (which
+    """A tap exists iff the rollout has a probe. Vanilla / extra_steps / multi-sample (which
     probes at the chunk level) run with no tap installed."""
-    if config.probe is None:
+    if not config.has_probe:
         return None
     return RolloutTap(config, recorder, device, adim)
 
@@ -100,7 +100,7 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
     task_desc = ep["task_desc"]
     max_steps = ep["max_steps"]
     chunk_size = policy.config.chunk_size
-    multisample = config.action if isinstance(config.action, MultiSample) else None
+    multisample = config.num_samples is not None
 
     recorder = PnPRecorder()
     tap = build_tap(config, recorder, device, adim)
@@ -140,13 +140,13 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
                 chunk_noise_seeds.append(cns)
                 noise = _draw_chunk_noise(policy, device, cns)
                 batch = preprocess(obs_to_policy(obs, task_desc))
-                if multisample is not None:
+                if multisample:
                     def _noise_of(si, _ci=ci):
                         return _draw_chunk_noise(policy, device,
                                                  chunk_noise_seed(ep_seed, _ci * 1000 + si))
                     chunk, chosen, cand_u = multi_sample_select(
-                        policy, batch, ep_seed, ci, multisample.n,
-                        tuple(multisample.probe_steps), _noise_of)
+                        policy, batch, ep_seed, ci, config.num_samples,
+                        tuple(config.ms_probe_steps), _noise_of)
                     ms_selections.append({"chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u})
                 else:
                     with torch.no_grad():
