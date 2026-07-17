@@ -189,6 +189,23 @@ class SupabaseStore:
         rows = q.execute().data or []
         return {r["rollout_id"] for r in rows}
 
+    def iter_todo(self, experiment: str, episodes, methods, done: set | None = None):
+        """Yield (ep, method, config, rid) for each (episode x method) not already logged.
+
+        Collapses the existing_keys + rollout_id + skip boilerplate so a notebook loop is just
+        `for ep, name, cfg, rid in store.iter_todo(...): run + log_result`. `methods` is an iterable
+        of (name, config) — a dict is accepted too. Pass a precomputed `done` (from existing_keys)
+        once outside the env loop to avoid re-querying per task group. Yields ep-outer so an
+        episode's paired methods run back-to-back (friendly to the prefix-encoding cache)."""
+        methods = list(methods.items()) if isinstance(methods, dict) else list(methods)
+        if done is None:
+            done = self.existing_keys(experiment)
+        for ep in episodes:
+            for name, config in methods:
+                rid = self.rollout_id(experiment, ep, name, config)
+                if rid not in done:
+                    yield ep, name, config, rid
+
     # ── episode logging ────────────────────────────────────────────────────
     def log_episode(self, rollout_row: dict, euler_steps: list[dict] | None = None,
                     action_vectors: list[dict] | None = None,
