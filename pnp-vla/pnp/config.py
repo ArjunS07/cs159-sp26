@@ -7,7 +7,7 @@ is safe to import locally without a GPU stack.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Versioning levers (see the plan's provenance design)
@@ -52,80 +52,125 @@ PERTURB_SEED_MASK = 0x9E3779B9
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# P&P (Predict-and-Perturb) sampling config
+# Rollout decomposition: three ORTHOGONAL axes on RolloutConfig.
+#   (A) action  — how the executed action is produced (None / Refine / Correct / MultiSample)
+#   (B) probe   — the P&P predict-and-perturb MEASUREMENT (where + how hard)
+#   (C) sinks   — independent save_* booleans (what gets persisted)
+# A "method" is no longer a class; it's a point in this switch space.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── (B) Probe — the predict-and-perturb measurement ──────────────────────────
 @dataclass
-class PnPConfig:
-    """Self-refining (Predict-and-Perturb) sampling config for pi0.5 flow matching.
+class Probe:
+    """The P&P measurement at selected Euler steps. `steps` is the single source of truth for
+    WHERE anything happens — the uncertainty read AND any Refine/Correct feedback act there.
 
-    LeRobot time runs s=1.0 (noise) -> s=0.0 (clean), so the early/high-noise steps are
-    the FIRST Euler steps (large s). Select them with step_indices=(1,)/(1,2) or time_min.
+    LeRobot flow time runs s=1.0 (noise) -> s=0.0 (clean), so early/high-noise steps are the
+    FIRST Euler steps (large s). Select them with steps=(1,)/(1,2) or the time_min selector.
     """
-    enabled: bool = False
-    step_indices: Optional[Sequence[int]] = (1,)   # which Euler steps run P&P (unless time_min)
-    time_min: Optional[float] = None               # alt selector: run P&P when s >= time_min
-    num_iterations: int = 3                         # K predict-and-perturb iterations
-    mode: str = "both"                              # "uncertainty" | "refine" | "both"
-    refine_average: bool = False                    # re-noise from mean(z_hat) (True) vs last a_hat
-    action_dim: int = ADIM                          # real (un-padded) dims used for uncertainty
-    record_per_iteration: bool = False              # also persist the full (K,B,chunk,adim) stack
-    compute_multimodal: bool = False                # per-dim Sarle BC + PC1 stats (needs K>=4)
+    steps: Optional[Sequence[int]] = (1,)   # Euler steps to probe (unless time_min set)
+    k: int = 3                              # K predict-and-perturb iterations
+    time_min: Optional[float] = None        # alt selector: probe when s >= time_min
+    compute_multimodal: bool = False        # per-dim Sarle BC + PC1 stats (needs k>=4)
+    action_dim: int = ADIM                  # real (un-padded) dims used for uncertainty
 
-    def step_selected(self, step: int, s: float) -> bool:
-        if not self.enabled:
-            return False
+    def selected(self, step: int, s: float) -> bool:
         if self.time_min is not None:
             return s >= self.time_min
-        return self.step_indices is not None and step in tuple(self.step_indices)
-
-    @property
-    def do_refine(self) -> bool:
-        return self.mode in ("refine", "both")
+        return self.steps is not None and step in tuple(self.steps)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PCP (Predict-Correct-Perturb) config
-# ─────────────────────────────────────────────────────────────────────────────
+# ── (A) Action sources — at most one per rollout ─────────────────────────────
 @dataclass
-class PCPConfig:
-    """Predict-Correct-Perturb config.
+class Refine:
+    """Re-noise inference from the probe's clean estimate (self-refinement)."""
+    average: bool = False    # re-noise from mean of K a_hats (True) vs the last a_hat (False)
 
-    `mode` selects the sampler strategy: 'collect' (measurement-only, stash z_hat/obs_enc for
-    training) or 'correct' (gated Q-gradient nudge at deploy time). None = not a PCP pass.
-    For 'correct', the notebook loads the trained corrector and attaches it via the runtime
-    handles (q_model/q_scaler/q_ckpt_id) — these are NOT serialized into config_json.
-    """
-    mode: Optional[str] = None                  # 'collect' | 'correct' | None
-    correction_steps: Sequence[int] = (7, 8)   # Euler steps where the gradient nudge applies
-    pnp_k: int = 3                              # predict/perturb iterations before correcting
-    lambda_pcp: float = 3.0                     # correction step size
-    q_gate: float = 0.5                         # only correct chunks with predicted P(success) < gate
-    # data collection / hard-task filter
-    collect_steps: Sequence[int] = tuple(range(10))
-    hard_lo: float = 0.10
-    hard_hi: float = 0.90
-    # runtime handles for mode='correct' (set by the notebook after load_q_corrector; not serialized)
+
+@dataclass
+class Correct:
+    """PCP: gated Q-gradient nudge on the probe's z_hat. q_model/q_scaler are RUNTIME handles
+    the notebook attaches after load_q_corrector — they are NOT serialized into config_json."""
+    lam: float = 3.0                        # correction step size
+    gate: float = 0.5                       # only correct chunks with predicted P(success) < gate
+    q_ckpt_id: Optional[str] = None
     q_model: object = field(default=None, repr=False, compare=False)
     q_scaler: object = field(default=None, repr=False, compare=False)
-    q_ckpt_id: Optional[str] = None
+
+
+@dataclass
+class MultiSample:
+    """Sample n chunks and keep the lowest-uncertainty one. Applied at the CHUNK level in
+    run_episode (not inside the Euler loop), so it carries its own probe_steps."""
+    n: int = 5
+    probe_steps: Sequence[int] = (1, 2)
+
+
+Action = Union[Refine, Correct, MultiSample]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-rollout config — the flag bundle the notebook composes and passes to run_episode
+# (C) Per-rollout config — action + probe + independent save_* sinks.
+# The notebook composes these; nothing about the experiment lives in the package.
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class RolloutConfig:
     """Everything that defines ONE rollout's behavior + what to record.
 
-    The notebook builds a dict of these (one per method) and drives run_episode with them;
-    nothing about the experiment (which methods, the sweep, the loop) lives in the package.
+    Three orthogonal axes: `action` (how the executed action is produced), `probe` (the P&P
+    measurement), and the `save_*` sinks (what to persist). e.g. training data for the
+    corrector is just `RolloutConfig(probe=Probe((7,8), k=3), save_pcp_features=True)` — a
+    vanilla action source with the pcp-features sink on.
     """
-    pnp: Optional[PnPConfig] = None             # P&P record/refine; None = vanilla
-    pcp: Optional[PCPConfig] = None             # PCP collect/correct; None = not PCP
-    num_inference_steps: Optional[int] = None   # override (e.g. matched-compute extra_steps)
-    num_samples: Optional[int] = None           # multi-sample-select candidate count
-    # recording toggles (see the plan's Storage bucket section)
-    record_trajectory: bool = True              # executed actions + robot state -> Storage (cheap)
-    record_obs_frames: bool = False             # low-res decision-point frames (largest cost)
+    action: Optional[Action] = None             # None (vanilla) | Refine | Correct | MultiSample
+    probe: Optional[Probe] = None               # the P&P measurement; None = no probe
+    num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
+    # sinks (each persists one thing independently)
+    save_uncertainty: Optional[bool] = None     # default: on iff a probe is set
+    save_pcp_features: bool = False             # per-chunk obs_enc + z_hat -> Storage (training)
+    save_ahats: bool = False                    # full K a_hats stacks -> Storage (geometry)
+    save_observations: bool = False             # low-res decision-point frames -> Storage
+    save_trajectory: bool = True                # executed actions + robot state -> Storage (cheap)
     video: str = "off"                          # "off" | "failures_only" | "all"
-    record_per_iteration: bool = False          # full a_hats stacks -> Storage (geometry)
+
+    def __post_init__(self):
+        a = self.action
+        if a is not None and not isinstance(a, (Refine, Correct, MultiSample)):
+            raise TypeError(f"action must be None/Refine/Correct/MultiSample, got {type(a).__name__}")
+        # Refine/Correct feed off the probe, so a probe is mandatory for them.
+        if isinstance(a, (Refine, Correct)) and self.probe is None:
+            raise ValueError(f"{type(a).__name__} action requires a probe (it acts at probe.steps)")
+        # MultiSample carries its own probe_steps and runs at the chunk level.
+        if isinstance(a, MultiSample) and self.probe is not None:
+            raise ValueError("MultiSample carries its own probe_steps; leave RolloutConfig.probe=None")
+        # Probe-derived sinks need a probe.
+        for sink in ("save_pcp_features", "save_ahats"):
+            if getattr(self, sink) and self.probe is None:
+                raise ValueError(f"{sink} requires a probe (its data comes from the probe)")
+        if self.save_uncertainty and self.probe is None:
+            raise ValueError("save_uncertainty=True requires a probe")
+
+    @property
+    def records_uncertainty(self) -> bool:
+        """Whether to persist per-step uncertainty rows (default: on iff a probe is set)."""
+        return self.save_uncertainty if self.save_uncertainty is not None else (self.probe is not None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Q-corrector training hyperparameters (training-time, not a rollout concern).
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class TrainConfig:
+    """Hyperparameters for train_q_corrector + the hard-task/step filter for its dataset."""
+    correction_steps: Sequence[int] = (7, 8)    # deploy steps to train on (subset of collected)
+    hard_lo: float = 0.10                        # keep tasks with SR in (hard_lo, hard_hi)
+    hard_hi: float = 0.90
+    seed: int = 42
+    train_frac: float = 0.80
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    label_smooth: float = 0.05
+    epochs: int = 100
+    patience: int = 20
+    batch: int = 256

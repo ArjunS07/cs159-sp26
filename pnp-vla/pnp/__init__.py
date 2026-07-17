@@ -5,6 +5,7 @@ rollout, libero_env, libero_pro) pull torch/lerobot/libero lazily so this packag
 imports without a GPU stack (e.g. for local analysis or store round-trips).
 """
 from . import config  # noqa: F401
-from .config import PnPConfig, PCPConfig, RolloutConfig  # noqa: F401
+from .config import (  # noqa: F401
+    Probe, Refine, Correct, MultiSample, RolloutConfig, TrainConfig)
 
 __version__ = "0.1.0"
