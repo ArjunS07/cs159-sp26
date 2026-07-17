@@ -254,6 +254,31 @@ class SupabaseStore:
         self.client.table("qc_rollouts").upsert(self._json(row), on_conflict="rollout_id").execute()
         return rid
 
+    def load_qc_rows(self, experiment: str | None = None) -> list[dict]:
+        """Read qc_rollouts back into training-ready dicts {..., chunks:[{obs_enc, chunk_pos,
+        steps:[{step_idx, s, z_hat}]}]} by downloading each rollout's per-chunk parquet blob."""
+        import pandas as pd
+        q = self.client.table("qc_rollouts").select("*")
+        if experiment:
+            q = q.eq("experiment", experiment)
+        rows = q.execute().data or []
+        out = []
+        for r in rows:
+            chunks = []
+            if r.get("chunks_path"):
+                df = pd.read_parquet(io.BytesIO(self._download(r["chunks_path"])))
+                for ci, g in df.groupby("chunk_idx"):
+                    g0 = g.iloc[0]
+                    chunks.append({
+                        "chunk_idx": int(ci), "chunk_pos": float(g0["chunk_pos"]),
+                        "obs_enc": list(g0["obs_enc"]),
+                        "steps": [{"step_idx": int(s["step_idx"]), "s": float(s["s"]),
+                                   "z_hat": list(s["z_hat"])} for _, s in g.iterrows()],
+                    })
+            out.append({"rollout_id": r["rollout_id"], "suite": r["suite"],
+                        "task_idx": r["task_idx"], "success": r["success"], "chunks": chunks})
+        return out
+
     def log_qc_eval(self, row: dict) -> None:
         row.setdefault("run_id", self.run_id)
         row.setdefault("experiment", self.experiment)
