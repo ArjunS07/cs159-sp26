@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+
+# Secrets / local env
+.env
+*.env
+
+# Local artifacts (everything durable lives in Supabase)
+figures/
+tables/
+*.db
+*.sqlite
+*.pt
+*.npz
+*.mp4
+wandb/
+
+.DS_Store
