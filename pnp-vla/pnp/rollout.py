@@ -1,9 +1,9 @@
 """Rollout PRIMITIVES (Dedup #2). No experiment/driver loops — those live in the notebooks.
 
 `run_episode(env, ep, policy, preprocess, device, config)` runs ONE episode: it builds the
-sampler strategy from `config` (vanilla / RecordStrategy / Collect / Correct), owns the
-per-(episode,chunk) noise generator so chunk i's initial noise is byte-identical across every
-method, and returns a plain result dict. `iter_task_envs(episodes)` yields `(env, task_eps)`
+`RolloutTap` from `config`, owns the per-(episode,chunk) noise generator so chunk i's initial
+noise is byte-identical across every method, and returns a plain result dict whose contents
+depend on which sinks were enabled. `iter_task_envs(episodes)` yields `(env, task_eps)`
 handling the OffScreenRenderEnv lifecycle. Nothing here writes to the store — the notebook
 loop calls `store.log_result(...)` with the result.
 """
@@ -16,10 +16,10 @@ from itertools import groupby
 import numpy as np
 import torch
 
-from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, RolloutConfig
+from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, RolloutConfig, MultiSample
 from .libero_env import make_env, obs_to_policy
-from .pnp import PnPRecorder, RecordStrategy, _pnp_seed_perturb
-from .pcp import CollectStrategy, CorrectStrategy
+from .pnp import PnPRecorder, _pnp_seed_perturb, multi_sample_select
+from .tap import RolloutTap
 from . import sampler as _sampler
 
 
@@ -76,17 +76,14 @@ def compute_instability(executed_actions, chunk_boundary_actions=None, gripper_d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config -> strategy (the notebook never constructs strategies directly)
+# Config -> tap (the notebook never constructs the tap directly)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_strategy(config: RolloutConfig, recorder: PnPRecorder, device, adim: int):
-    if config.pnp is not None and config.pnp.enabled:
-        return RecordStrategy(config.pnp, recorder)
-    if config.pcp is not None and config.pcp.mode == "collect":
-        return CollectStrategy(config.pcp, adim=adim)
-    if config.pcp is not None and config.pcp.mode == "correct":
-        c = config.pcp
-        return CorrectStrategy(c, c.q_model, c.q_scaler, c.lambda_pcp, device, adim=adim)
-    return None                                         # vanilla / extra_steps
+def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int):
+    """A tap exists iff the rollout has a probe. Vanilla / extra_steps / MultiSample (which
+    probes at the chunk level) run with no tap installed."""
+    if config.probe is None:
+        return None
+    return RolloutTap(config, recorder, device, adim)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,18 +91,19 @@ def build_strategy(config: RolloutConfig, recorder: PnPRecorder, device, adim: i
 # ─────────────────────────────────────────────────────────────────────────────
 def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | None = None):
     """Run one episode under `config`. Returns a result dict (outcome, metrics, trajectory,
-    recorder episode, and strategy-specific outputs collected_chunks / pcp_telemetry).
+    recorder episode, and sink outputs — pcp_chunks / pcp_telemetry / ms_selections).
 
-    Store/DB writes are the notebook's job (via store.log_result / log_collect / log_eval)."""
+    Store/DB writes are the notebook's job (via store.log_result)."""
     config = config or RolloutConfig()
     model = policy.model
     adim = getattr(model, "_pnp_action_dim", ADIM)
     task_desc = ep["task_desc"]
     max_steps = ep["max_steps"]
     chunk_size = policy.config.chunk_size
+    multisample = config.action if isinstance(config.action, MultiSample) else None
 
     recorder = PnPRecorder()
-    strat = build_strategy(config, recorder, device, adim)
+    tap = build_tap(config, recorder, device, adim)
     model._pnp_num_steps = config.num_inference_steps   # extra_steps override (None = default)
 
     ep_seed = episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
@@ -114,14 +112,15 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
         torch.cuda.manual_seed(ep_seed)
     _pnp_seed_perturb(ep_seed)                           # isolated perturbation stream
 
-    _sampler.set_strategy(model, strat)
+    _sampler.set_strategy(model, tap)
     model._pnp_vf_evals = 0
     recorder.new_episode(meta={k: ep.get(k) for k in ("suite", "task_idx", "ep_idx")})
 
     est_chunks = max(1, round(max_steps / chunk_size))
     queue, ci = [], 0
     executed_actions, robot_states, chunk_boundary_actions, chunk_noise_seeds = [], [], [], []
-    frames = [] if config.record_obs_frames else None
+    ms_selections = [] if multisample else None
+    frames = [] if config.save_observations else None
     nan_count = 0
     success = False
     status, error_msg = "completed", None
@@ -141,8 +140,17 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
                 chunk_noise_seeds.append(cns)
                 noise = _draw_chunk_noise(policy, device, cns)
                 batch = preprocess(obs_to_policy(obs, task_desc))
-                with torch.no_grad():
-                    chunk = policy.predict_action_chunk(batch, noise=noise)
+                if multisample is not None:
+                    def _noise_of(si, _ci=ci):
+                        return _draw_chunk_noise(policy, device,
+                                                 chunk_noise_seed(ep_seed, _ci * 1000 + si))
+                    chunk, chosen, cand_u = multi_sample_select(
+                        policy, batch, ep_seed, ci, multisample.n,
+                        tuple(multisample.probe_steps), _noise_of)
+                    ms_selections.append({"chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u})
+                else:
+                    with torch.no_grad():
+                        chunk = policy.predict_action_chunk(batch, noise=noise)
                 arr = chunk.squeeze(0).detach().cpu().numpy()
                 queue = [arr[i].copy() for i in range(arr.shape[0])]
                 chunk_boundary_actions.append(np.asarray(queue[0]).flatten()[:ADIM].copy())
@@ -182,13 +190,16 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
         trajectory=dict(
             actions=np.asarray(executed_actions, dtype=np.float32),
             robot_state=np.asarray(robot_states, dtype=np.float32),
-        ) if config.record_trajectory else None,
+        ) if config.save_trajectory else None,
         obs_frames=frames,
     )
-    if isinstance(strat, CollectStrategy):
-        result["collected_chunks"] = strat.chunks
-    if isinstance(strat, CorrectStrategy):
-        result["pcp_telemetry"] = strat.telemetry()
+    if tap is not None:
+        if tap.save_pcp:
+            result["pcp_chunks"] = tap.pcp_chunks
+        if tap.pcp_telemetry is not None:
+            result["pcp_telemetry"] = tap.pcp_telemetry
+    if ms_selections is not None:
+        result["ms_selections"] = ms_selections
     return result
 
 
