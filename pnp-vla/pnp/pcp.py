@@ -1,15 +1,13 @@
 """PCP: Q-corrector model, training (wandb), and the correction action.
 
-Ported from build_final_notebooks.py PCP sections. The Q-corrector is a small calibrated
-MLP success-predictor; PCP nudges actions along its input-gradient at deploy time. Collection
-and 3-way eval are no longer strategy classes — collection is just a rollout with the
-`save_pcp_features` sink, and the correction feedback is `apply_correct` (driven by the tap).
+The Q-corrector is a small calibrated MLP success-predictor; PCP nudges actions along its
+input-gradient at deploy time. Collection is just a rollout with the `save_pcp_features` sink;
+the correction feedback is `apply_correct` (driven by the tap).
 """
 from __future__ import annotations
 
 import hashlib
 import io
-import json
 import uuid
 from dataclasses import dataclass, field
 from collections import defaultdict

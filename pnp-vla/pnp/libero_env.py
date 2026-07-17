@@ -1,8 +1,7 @@
 """LIBERO benchmark + observation plumbing (controlled slice).
 
-Ported from smolvla_eval_core.py: _quat2axisangle, obs_to_policy, init_libero_benchmark,
-build_final_episodes, and the OffScreenRenderEnv factory. LIBERO-PRO suite/episode building
-lives in libero_pro.py.
+obs_to_policy, init_libero_benchmark, build_final_episodes, and the OffScreenRenderEnv
+factory. LIBERO-PRO suite/episode building lives in libero_pro.py.
 """
 from __future__ import annotations
 

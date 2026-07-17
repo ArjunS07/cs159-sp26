@@ -9,8 +9,8 @@ unit-test off-Colab.
 
 Typical setup order (see the LIBERO-PRO setup notebook):
     clone_libero_pro()                       # git clone Zxy-MLlab/LIBERO-PRO
-    apply_env_patches(libero_site())         # copy files + rewrite task map (cell 17)
-    patch_torch_load()                        # weights_only=False + quant/dynamo (cell 19)
+    apply_env_patches(libero_site())         # copy files + rewrite task map
+    patch_torch_load()                        # weights_only=False + quant/dynamo
     # (one-time) generate/restore .pruned_init init states into <libero_site>/init_files
     bd = reload_benchmark()                    # importlib.reload benchmark, get_benchmark_dict()
     eps = build_libero_pro_episodes(bd)        # 600-episode list w/ descriptors
@@ -66,7 +66,7 @@ def clone_libero_pro(dest: str = "/content/LIBERO-PRO") -> str:
 
 
 def apply_env_patches(site: str | None = None, pro_dir: str = "/content/LIBERO-PRO") -> None:
-    """Copy patched libero files + rewrite the task map (ports averages cell 17)."""
+    """Copy patched libero files + rewrite the task map."""
     site = site or libero_site()
     bddl_dir = os.path.join(site, "bddl_files")
 
@@ -134,7 +134,7 @@ def apply_env_patches(site: str | None = None, pro_dir: str = "/content/LIBERO-P
 
 
 def patch_torch_load() -> None:
-    """Make torch.load default weights_only=False so LIBERO .pruned_init files load (cell 19)."""
+    """Make torch.load default weights_only=False so LIBERO .pruned_init files load."""
     import numpy as np
     import torch
     os.environ["TORCHDYNAMO_DISABLE"] = "1"

@@ -1,8 +1,5 @@
 """P&P core: recorder, isolated perturbation RNG, the probe, refinement, no-op contract test.
 
-Ported and unified from smolvla_eval_core.py + the GENERATOR_INFRA block and the newer
-`refine_average` / multimodality additions in pnp_pro_experiment_averages.ipynb.
-
 Design invariants (the whole point):
 - The perturbation noise draws use a DEDICATED per-device torch.Generator (`_pnp_gen`) seeded
   via `_pnp_seed_perturb`. It NEVER touches the global RNG or the initial-noise stream that
@@ -14,8 +11,7 @@ Design invariants (the whole point):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 import torch

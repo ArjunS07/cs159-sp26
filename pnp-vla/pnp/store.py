@@ -428,13 +428,14 @@ class SupabaseStore:
 
     def put_encoding(self, cache_key: str, arrays: dict, model_revision: str = "",
                      obs_hash: str = "", lang_hash: str = "") -> None:
+        blob = _npz_bytes(arrays)
         key = f"encodings/{cache_key}.npz"
-        self._upload(key, _npz_bytes(arrays))
+        self._upload(key, blob)
         dims = int(next(iter(arrays.values())).shape[-1]) if arrays else None
         self.client.table("encoding_cache").upsert({
             "cache_key": cache_key, "model_revision": model_revision, "obs_hash": obs_hash,
             "lang_hash": lang_hash, "dims": dims, "blob_path": key}, on_conflict="cache_key").execute()
-        self._enc_put_lru(cache_key, np.load(io.BytesIO(_npz_bytes(arrays))))
+        self._enc_put_lru(cache_key, np.load(io.BytesIO(blob)))
 
     def _enc_put_lru(self, key, val):
         self._enc_lru[key] = val

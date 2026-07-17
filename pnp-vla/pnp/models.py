@@ -1,7 +1,7 @@
 """pi0.5 model loading + P&P patch application (pi0.5 only).
 
-Ported from smolvla_eval_core.py (_ensure_hf_weights, load_pi05, apply_pnp_patch). The
-SmolVLA loader, RTC, and torch.compile dual-model branches are dropped.
+The SmolVLA loader, RTC, and torch.compile dual-model branches (from the original core) are
+deliberately dropped — this is pi0.5 only.
 """
 from __future__ import annotations
 

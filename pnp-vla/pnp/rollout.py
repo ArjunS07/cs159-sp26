@@ -61,7 +61,7 @@ def _encode_mp4(frames, fps: int = VIDEO_FPS) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Instability metrics (ported from smolvla_eval_core.py)
+# Instability metrics
 # ─────────────────────────────────────────────────────────────────────────────
 def _chunk_disagreement(chunk_boundary_actions):
     if len(chunk_boundary_actions) < 2:
