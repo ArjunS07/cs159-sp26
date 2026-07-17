@@ -1,4 +1,4 @@
-"""P&P core: recorder, isolated perturbation RNG, refine step, no-op contract test.
+"""P&P core: recorder, isolated perturbation RNG, the probe, refinement, no-op contract test.
 
 Ported and unified from smolvla_eval_core.py + the GENERATOR_INFRA block and the newer
 `refine_average` / multimodality additions in pnp_pro_experiment_averages.ipynb.
@@ -6,16 +6,21 @@ Ported and unified from smolvla_eval_core.py + the GENERATOR_INFRA block and the
 Design invariants (the whole point):
 - The perturbation noise draws use a DEDICATED per-device torch.Generator (`_pnp_gen`) seeded
   via `_pnp_seed_perturb`. It NEVER touches the global RNG or the initial-noise stream that
-  `rollout.py` owns. So uncertainty mode is a true no-op of vanilla, and refinement/PCP
+  `rollout.py` owns. So a measure-only probe is a true no-op of vanilla, and refinement/PCP
   perturbations are reproducible and paired across methods.
-- `PNP_CONFIG` is the single mutable config the patched sampler reads; drivers set it per pass.
+- `run_probe` runs the K predict-and-perturb block ONCE and returns a structured `ProbeResult`;
+  `apply_refine` / `pcp.apply_correct` derive the next state from it. The tap (tap.py) decides
+  which sinks consume the result and which action feeds back — the probe itself is pure.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
 
-from .config import PnPConfig, PERTURB_SEED_MASK, ADIM
+from .config import Probe, PERTURB_SEED_MASK, ADIM
 
 # No module-level config/recorder globals: config travels with the strategy, and the
 # recorder is created per run_episode call. Only the mechanical perturbation-generator state
@@ -84,70 +89,79 @@ def _multimodal_stats(A0: np.ndarray):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The shared K predict-and-perturb block.
+# The shared K predict-and-perturb block — the PROBE (pure measurement).
 # ─────────────────────────────────────────────────────────────────────────────
-def pnp_refine_at_step(x_t, s, vfield, cfg: PnPConfig):
-    """Run K predict-and-perturb iterations at fixed noise level s.
+@dataclass
+class ProbeResult:
+    """Structured output of one K predict-and-perturb block at noise level s.
+
+    Everything downstream (the uncertainty sink, apply_refine, pcp.apply_correct) is derived
+    from this — the probe itself changes no state and makes no feedback decision.
+    """
+    a_hats: torch.Tensor      # (K, B, chunk, adim) — clean estimates, action-dim sliced
+    z_hat_full: torch.Tensor  # (B, chunk, max_adim) — mean of the K FULL-width clean estimates
+    x_acc: torch.Tensor       # re-noised state after the LAST iteration (full width)
+    last_eps: torch.Tensor    # the last iteration's perturbation noise (for refine-average)
+    s: float
+    rec: dict                 # uncertainty record (u_mean/u_max/u_vec/a_std_vec/... + multimodal)
+
+
+def run_probe(x_t, s, vfield, probe: Probe) -> ProbeResult:
+    """Run K predict-and-perturb iterations at fixed noise level s and measure uncertainty.
 
         predict:  a_hat = x - s * v(x, s)
         perturb:  x'    = (1 - s) * a_hat + s * eps,   eps ~ N(0, I)  (isolated generator)
 
-    Returns (x_out, rec). x_out is the refined re-noised state if cfg.do_refine, else the
-    original x_t (uncertainty/collect are non-invasive). Honors cfg.refine_average (re-noise
-    the MEAN of the K clean estimates vs the LAST) and cfg.compute_multimodal.
-    `rec` always carries the uncertainty measured across iterations.
+    Pure: no global state touched (perturbation noise comes from the dedicated generator).
     """
-    adim = cfg.action_dim
+    adim = probe.action_dim
     x_acc = x_t
     a_hats, a_hats_full = [], []
     last_eps = None
     gen = _pnp_gen(x_acc.device)
-    for _ in range(cfg.num_iterations):
+    for _ in range(probe.k):
         v = vfield(x_acc)
         a_hat = x_acc - s * v
         a_hats.append(a_hat[..., :adim])
         a_hats_full.append(a_hat)
-        eps = torch.empty_like(x_acc).normal_(generator=gen)   # dedicated stream, not global
-        last_eps = eps
-        x_acc = (1.0 - s) * a_hat + s * eps
+        last_eps = torch.empty_like(x_acc).normal_(generator=gen)   # dedicated stream, not global
+        x_acc = (1.0 - s) * a_hat + s * last_eps
 
     A = torch.stack(a_hats, dim=0)                     # (K, B, chunk, adim)
+    z_hat_full = torch.stack(a_hats_full, dim=0).mean(dim=0)   # (B, chunk, max_adim)
     if A.shape[0] >= 2:
         u_consecutive = (A[1:] - A[:-1]).abs().mean(dim=0)     # (B, chunk, adim)
         a_std = A.std(dim=0)
     else:
         u_consecutive = torch.zeros_like(A[0]); a_std = torch.zeros_like(A[0])
 
-    u_vec = u_consecutive.mean(dim=(0, 1)).detach().float().cpu().numpy()
-    a_std_vec = a_std.mean(dim=(0, 1)).detach().float().cpu().numpy()
-    a_mean_vec = A.mean(dim=(0, 1, 2)).detach().float().cpu().numpy()
-
     rec = {
         "s": float(s),
         "u_mean": float(u_consecutive.mean()),
         "u_max": float(u_consecutive.max()),
         "a_std_mean": float(a_std.mean()),
-        "u_vec": u_vec,                                # np (adim,)
-        "a_std_vec": a_std_vec,
-        "a_mean_vec": a_mean_vec,
-        "u_consecutive": u_consecutive.detach().float().cpu().numpy(),
-        "a_std": a_std.detach().float().cpu().numpy(),
+        "u_vec": u_consecutive.mean(dim=(0, 1)).detach().float().cpu().numpy(),
+        "a_std_vec": a_std.mean(dim=(0, 1)).detach().float().cpu().numpy(),
+        "a_mean_vec": A.mean(dim=(0, 1, 2)).detach().float().cpu().numpy(),
     }
-    if cfg.compute_multimodal and A.shape[0] >= 4:
-        A0 = A.detach().float().cpu().numpy()[:, 0]    # (K, chunk, adim)
-        bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(A0)
+    if probe.compute_multimodal and A.shape[0] >= 4:
+        bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(A.detach().float().cpu().numpy()[:, 0])
         rec["bc_vec"] = bc_vec
         rec["mm_pc1_frac"] = float(pc1_frac)
         rec["mm_bc_pc1"] = float(bc_pc1)
-    if cfg.record_per_iteration:
-        rec["a_hats"] = A.detach().float().cpu().numpy()
+    return ProbeResult(a_hats=A, z_hat_full=z_hat_full, x_acc=x_acc,
+                       last_eps=last_eps, s=float(s), rec=rec)
 
-    if cfg.do_refine and cfg.refine_average and len(a_hats_full) >= 1:
-        a_bar = torch.stack(a_hats_full, dim=0).mean(dim=0)    # full-width mean estimate
-        x_out = (1.0 - s) * a_bar + s * last_eps              # re-noise the MEAN (same eps)
-    else:
-        x_out = x_acc                                         # re-noise the LAST prediction
-    return (x_out if cfg.do_refine else x_t), rec
+
+def apply_refine(pr: ProbeResult, average: bool) -> torch.Tensor:
+    """Refinement action: re-noise from the probe's clean estimate.
+
+    average=True  -> re-noise the MEAN of the K clean estimates (same last eps);
+    average=False -> re-noise the LAST prediction (== pr.x_acc).
+    """
+    if average:
+        return (1.0 - pr.s) * pr.z_hat_full + pr.s * pr.last_eps
+    return pr.x_acc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,36 +200,6 @@ class PnPRecorder:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy (duck-typed; the sampler calls .selected / .step / .invasive / .finish).
-# ─────────────────────────────────────────────────────────────────────────────
-class RecordStrategy:
-    """P&P uncertainty/refinement. Non-invasive when do_refine is False (pure measurement).
-
-    Holds its config and the per-episode recorder explicitly — no module globals.
-    """
-
-    def __init__(self, cfg: PnPConfig, recorder: PnPRecorder):
-        self.cfg = cfg
-        self.recorder = recorder
-
-    @property
-    def invasive(self) -> bool:
-        return self.cfg.do_refine
-
-    def selected(self, step: int, s: float) -> bool:
-        return self.cfg.step_selected(step, s)
-
-    def step(self, x_t, s, vf, ctx):
-        x_out, rec = pnp_refine_at_step(x_t, s, vf, self.cfg)
-        rec["step"] = ctx.step
-        ctx.records.append(rec)
-        return x_out
-
-    def finish(self, ctx):
-        self.recorder.log_chunk({"num_steps": ctx.num_steps, "steps": ctx.records})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Multi-sample selection: sample N chunks, keep the lowest-uncertainty one.
 # ─────────────────────────────────────────────────────────────────────────────
 def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_steps,
@@ -244,11 +228,13 @@ def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=Tr
     """Verify the two contract properties on real weights, via predict_action_chunk(noise=None):
 
       1. RNG ISOLATION (exact): with the global RNG re-seeded identically before each call,
-         the global RNG state AFTER an uncertainty-mode chunk equals the state after a vanilla
+         the global RNG state AFTER a measure-only probe chunk equals the state after a vanilla
          chunk — the dedicated perturbation generator never advanced it.
-      2. OUTPUT EQUALITY (within a tolerance): uncertainty mode matches vanilla up to the
+      2. OUTPUT EQUALITY (within a tolerance): a measure-only probe matches vanilla up to the
          bf16/flow-matching nondeterminism floor, measured by running vanilla twice.
     """
+    from .config import RolloutConfig
+    from .tap import RolloutTap
     model = policy.model
     prev = getattr(model, "_pnp_strategy", None)
 
@@ -266,9 +252,9 @@ def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=Tr
         a_van2 = _seeded_chunk()
         floor = float(np.abs(a_van1 - a_van2).max())
 
-        cfg = PnPConfig(enabled=True, mode="uncertainty", step_indices=tuple(step_indices),
-                        num_iterations=3)
-        model._pnp_strategy = RecordStrategy(cfg, PnPRecorder())
+        cfg = RolloutConfig(probe=Probe(steps=tuple(step_indices), k=3), save_trajectory=False)
+        model._pnp_strategy = RolloutTap(cfg, PnPRecorder(), device=None,
+                                         adim=getattr(model, "_pnp_action_dim", ADIM))
         a_unc = _seeded_chunk()
         rng_after_unc = torch.random.get_rng_state()
 

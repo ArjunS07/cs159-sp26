@@ -2,10 +2,9 @@
 
 Replaces the three near-identical `sample_actions` monkeypatches
 (_sample_actions_pnp / _sample_actions_collect / _sample_actions_eval) with a single patched
-method that replicates the pi0.5 flow-matching Euler loop and yields to a *strategy* at each
-selected step. Strategies (RecordStrategy in pnp.py; Collect/CorrectStrategy in pcp.py) are
-duck-typed: `.invasive: bool`, `.selected(step, s)`, `.step(x_t, s, vf, ctx) -> x_t`,
-`.finish(ctx)`.
+method that replicates the pi0.5 flow-matching Euler loop and yields to the ONE spec-driven
+`RolloutTap` (tap.py) at each selected step. The tap is duck-typed:
+`.invasive: bool`, `.selected(step, s)`, `.step(x_t, s, vf, ctx) -> x_t`, `.finish(ctx)`.
 
 The initial noise is NOT drawn here — the rollout engine passes it explicitly via `noise=`
 so the per-(episode,chunk) noise contract holds. Every velocity-field evaluation increments
@@ -110,16 +109,18 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
 
 
 def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3):
-    """Run one measurement-only uncertainty pass; return (action_chunk, u_mean_scalar)."""
-    from .config import PnPConfig
-    from .pnp import RecordStrategy, PnPRecorder
+    """Run one measurement-only probe pass; return (action_chunk, u_mean_scalar)."""
+    from .config import RolloutConfig, Probe, ADIM
+    from .pnp import PnPRecorder
+    from .tap import RolloutTap
     model = policy.model
     prev_strat = getattr(model, "_pnp_strategy", None)
     try:
-        cfg = PnPConfig(enabled=True, mode="uncertainty", step_indices=tuple(probe_steps),
-                        num_iterations=num_iterations)
+        cfg = RolloutConfig(probe=Probe(steps=tuple(probe_steps), k=num_iterations),
+                            save_trajectory=False)
         rec = PnPRecorder(); rec.new_episode()
-        model._pnp_strategy = RecordStrategy(cfg, rec)
+        model._pnp_strategy = RolloutTap(cfg, rec, device=None,
+                                         adim=getattr(model, "_pnp_action_dim", ADIM))
         action = policy.predict_action_chunk(batch, noise=noise)
         us = [st["u_mean"] for c in (rec._cur or {}).get("chunks", []) for st in c["steps"]]
         return action, (float(sum(us) / len(us)) if us else 0.0)
