@@ -88,7 +88,14 @@ class PnPConfig:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class PCPConfig:
-    """Predict-Correct-Perturb deploy-time correction config."""
+    """Predict-Correct-Perturb config.
+
+    `mode` selects the sampler strategy: 'collect' (measurement-only, stash z_hat/obs_enc for
+    training) or 'correct' (gated Q-gradient nudge at deploy time). None = not a PCP pass.
+    For 'correct', the notebook loads the trained corrector and attaches it via the runtime
+    handles (q_model/q_scaler/q_ckpt_id) — these are NOT serialized into config_json.
+    """
+    mode: Optional[str] = None                  # 'collect' | 'correct' | None
     correction_steps: Sequence[int] = (7, 8)   # Euler steps where the gradient nudge applies
     pnp_k: int = 3                              # predict/perturb iterations before correcting
     lambda_pcp: float = 3.0                     # correction step size
@@ -97,20 +104,28 @@ class PCPConfig:
     collect_steps: Sequence[int] = tuple(range(10))
     hard_lo: float = 0.10
     hard_hi: float = 0.90
+    # runtime handles for mode='correct' (set by the notebook after load_q_corrector; not serialized)
+    q_model: object = field(default=None, repr=False, compare=False)
+    q_scaler: object = field(default=None, repr=False, compare=False)
+    q_ckpt_id: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Run-level config (recording toggles + experiment identity)
+# Per-rollout config — the flag bundle the notebook composes and passes to run_episode
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
-class RunConfig:
-    """Per-driver-invocation options: what to record and how to name the experiment."""
-    experiment: Optional[str] = None            # None -> auto-generate {driver}-{date}-{summary}
-    notes: str = ""
+class RolloutConfig:
+    """Everything that defines ONE rollout's behavior + what to record.
+
+    The notebook builds a dict of these (one per method) and drives run_episode with them;
+    nothing about the experiment (which methods, the sweep, the loop) lives in the package.
+    """
+    pnp: Optional[PnPConfig] = None             # P&P record/refine; None = vanilla
+    pcp: Optional[PCPConfig] = None             # PCP collect/correct; None = not PCP
+    num_inference_steps: Optional[int] = None   # override (e.g. matched-compute extra_steps)
+    num_samples: Optional[int] = None           # multi-sample-select candidate count
     # recording toggles (see the plan's Storage bucket section)
     record_trajectory: bool = True              # executed actions + robot state -> Storage (cheap)
     record_obs_frames: bool = False             # low-res decision-point frames (largest cost)
     video: str = "off"                          # "off" | "failures_only" | "all"
     record_per_iteration: bool = False          # full a_hats stacks -> Storage (geometry)
-    # determinism knobs recorded into experiment_runs.provenance
-    global_seed: int = 0

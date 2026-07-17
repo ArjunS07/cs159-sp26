@@ -12,7 +12,6 @@ import torch
 
 from .config import PI05_REPO_ID
 from . import sampler as _sampler
-from .pnp import PNP_CONFIG
 
 
 def default_device():
@@ -58,9 +57,9 @@ def _infer_action_dim(policy, default=7) -> int:
 def apply_pnp_patch(policy) -> None:
     """Install the unified hooked sampler on the pi0.5 policy model."""
     _sampler.install_patch(policy.model)
-    PNP_CONFIG.action_dim = _infer_action_dim(policy)
-    PNP_CONFIG.enabled = False
-    print(f"Patched pi05 sample_actions (action_dim={PNP_CONFIG.action_dim})")
+    adim = _infer_action_dim(policy)
+    policy.model._pnp_action_dim = adim   # informational; PnPConfig.action_dim defaults to ADIM=7
+    print(f"Patched pi05 sample_actions (action_dim={adim})")
 
 
 def load_pi05(device=None, repo_id: str = PI05_REPO_ID):

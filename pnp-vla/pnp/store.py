@@ -20,7 +20,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from .config import SCHEMA_VERSION, SAMPLER_ALGO_VERSION, PI05_REPO_ID
+from .config import SCHEMA_VERSION, SAMPLER_ALGO_VERSION, PI05_REPO_ID, ADIM
 
 BUCKET = "artifacts"
 
@@ -241,6 +241,127 @@ class SupabaseStore:
             yield "pcp_chunks", f"pcp_chunks/{rid}.parquet", _parquet_bytes(blobs["pcp_chunks"])
         if blobs.get("video"):
             yield "video", f"videos/{rid}.mp4", blobs["video"]
+
+    # ── notebook-ergonomic helpers (the driver-loop moved into notebooks) ──
+    @staticmethod
+    def _denorm(method: str, config) -> dict:
+        """Denormalized config columns for filtering + the logical-config hash key."""
+        pnp = config.pnp
+        on = bool(pnp and pnp.enabled)
+        return {
+            "method": method,
+            "pnp_enabled": on,
+            "pnp_step_indices": list(pnp.step_indices) if (on and pnp.step_indices) else None,
+            "pnp_k": pnp.num_iterations if on else None,
+            "refine_average": pnp.refine_average if on else None,
+            "pnp_time_min": pnp.time_min if on else None,
+            "num_inference_steps": config.num_inference_steps,
+            "num_samples": config.num_samples,
+        }
+
+    def rollout_id(self, experiment: str, ep: dict, method: str, config) -> str:
+        identity = {k: ep.get(k) for k in
+                    ("benchmark", "suite", "task_idx", "episode_idx", "ep_idx", "init_state_hash")}
+        return self.make_rollout_id(experiment, identity, self._denorm(method, config))
+
+    @staticmethod
+    def _dim_cols(vec, prefix):
+        vec = list(vec or [])
+        return {f"{prefix}{i}": (float(vec[i]) if i < len(vec) else None) for i in range(ADIM)}
+
+    def _recorder_to_rows(self, rec_ep, chunk_noise_seeds):
+        """PnPRecorder episode -> (euler_steps rows, action_vectors rows, summary metrics)."""
+        euler, vecs, u_means, u_vecs, mm_bc = [], [], [], [], []
+        for c in (rec_ep or {}).get("chunks", []):
+            ci = c["chunk_idx"]
+            cns = chunk_noise_seeds[ci] if ci < len(chunk_noise_seeds) else None
+            for st in c.get("steps", []):
+                u_means.append(st["u_mean"]); u_vecs.append(np.asarray(st.get("u_vec", [])))
+                euler.append({"chunk_idx": ci, "chunk_noise_seed": cns, "euler_step": st["step"],
+                              "s": st["s"], "u_mean": st["u_mean"], "u_max": st["u_max"],
+                              "a_std_mean": st.get("a_std_mean"),
+                              **self._dim_cols(st.get("u_vec"), "u_d"),
+                              **self._dim_cols(st.get("a_std_vec"), "a_std_d")})
+                v = {"chunk_idx": ci, "euler_step": st["step"],
+                     "a_mean_vec": list(map(float, st.get("a_mean_vec", []))),
+                     "a_std_vec": list(map(float, st.get("a_std_vec", [])))}
+                if "bc_vec" in st:
+                    v.update(bc_vec=list(map(float, st["bc_vec"])),
+                             mm_pc1_frac=st.get("mm_pc1_frac"), mm_bc_pc1=st.get("mm_bc_pc1"))
+                    mm_bc.append(st.get("mm_bc_pc1"))
+                vecs.append(v)
+        summary = {"u_mean_episode": float(np.mean(u_means)) if u_means else None,
+                   "u_max_episode": float(np.max(u_means)) if u_means else None,
+                   "n_pnp_activations": len(euler),
+                   "mm_bc_pc1_episode": float(np.nanmean(mm_bc)) if mm_bc else None}
+        if u_vecs:
+            padded = np.stack([np.pad(u, (0, max(0, ADIM - len(u))))[:ADIM] for u in u_vecs])
+            mean_uv = np.nanmean(padded, axis=0)
+            summary.update({f"u_mean_d{i}": float(mean_uv[i]) for i in range(ADIM)})
+        return euler, vecs, summary
+
+    def log_result(self, rid: str, ep: dict, method: str, config, result: dict) -> str:
+        """Map a run_episode result onto the canonical rollouts schema and persist it."""
+        euler, vecs, summary = self._recorder_to_rows(result.get("recorder_episode"),
+                                                       result.get("chunk_noise_seeds", []))
+        denorm = self._denorm(method, config)
+        row = {
+            "rollout_id": rid,
+            "benchmark": ep.get("benchmark"), "suite": ep["suite"], "task_idx": ep["task_idx"],
+            "task_desc": ep.get("task_desc"), "episode_idx": ep.get("ep_idx", ep.get("episode_idx")),
+            "init_state_hash": ep.get("init_state_hash"),
+            "suite_family": ep.get("suite_family"), "perturb_axis": ep.get("perturb_axis"),
+            "perturb_strength": ep.get("perturb_strength"),
+            "distractor_object": ep.get("distractor_object"),
+            "max_steps": ep.get("max_steps"), "chunk_size": result.get("chunk_size"),
+            "n_chunks": result["n_chunks"], "action_dim": ADIM,
+            "episode_seed": result["episode_seed"], "config_hash": self.config_hash(denorm),
+            "config_json": denorm,
+            "success": result["success"], "n_steps": result["n_steps"],
+            "elapsed_s": result["elapsed_s"],
+            "terminated_reason": "success" if result["success"] else result["status"],
+            "status": result["status"], "error_msg": result["error_msg"],
+            "nan_action_count": result["nan_action_count"], "n_vf_evals": result["n_vf_evals"],
+            **denorm, **summary, **result["instability"],
+        }
+        if config.pcp is not None and config.pcp.mode == "correct":
+            row.update(correction_lambda=config.pcp.lambda_pcp, q_gate=config.pcp.q_gate,
+                       correction_steps=list(config.pcp.correction_steps),
+                       q_ckpt_id=config.pcp.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
+        blobs = {}
+        if result.get("trajectory"):
+            blobs["trajectory"] = result["trajectory"]
+        if result.get("obs_frames"):
+            blobs["obs_frames"] = result["obs_frames"]
+        if config.record_per_iteration and result.get("recorder_episode"):
+            ah = {f"c{c['chunk_idx']}_s{st['step']}": st["a_hats"]
+                  for c in result["recorder_episode"].get("chunks", [])
+                  for st in c.get("steps", []) if "a_hats" in st}
+            if ah:
+                blobs["ahats"] = ah
+        return self.log_episode(row, euler_steps=euler, action_vectors=vecs, blobs=blobs or None)
+
+    def log_collect(self, rid: str, ep: dict, result: dict) -> str:
+        """Persist a PCP-collection episode: qc_rollouts row + per-chunk parquet blob."""
+        import pandas as pd
+        rows = []
+        for c in result.get("collected_chunks", []):
+            for st in c["steps"]:
+                rows.append({"chunk_idx": c["chunk_idx"], "chunk_pos": c["chunk_pos"],
+                             "obs_enc": np.asarray(c["obs_enc"]).tolist(),
+                             "step_idx": st["step_idx"], "s": st["s"],
+                             "z_hat": np.asarray(st["z_hat"]).reshape(-1).tolist()})
+        return self.log_qc_rollout(
+            {"rollout_id": rid, "suite": ep["suite"], "task_idx": ep["task_idx"],
+             "episode_idx": ep.get("ep_idx"), "init_state_hash": ep["init_state_hash"],
+             "success": result["success"], "n_chunks": len(result.get("collected_chunks", []))},
+            chunks_df=pd.DataFrame(rows) if rows else None)
+
+    def log_eval(self, rid: str, ep: dict, lam: float, result: dict) -> None:
+        """Persist a PCP 3-way eval outcome to qc_eval (lam: -1 vanilla / 0 pnp / 3 pcp)."""
+        self.log_qc_eval({"rollout_id": rid, "lambda": lam, "suite": ep["suite"],
+                          "task_idx": ep["task_idx"], "episode_idx": ep.get("ep_idx"),
+                          "success": result["success"]})
 
     # ── PCP ────────────────────────────────────────────────────────────────
     def log_qc_rollout(self, row: dict, chunks_df=None) -> str:

@@ -18,8 +18,6 @@ from typing import Any
 
 import torch
 
-from .pnp import PNP_CONFIG, PNP_RECORDER  # noqa: F401  (PNP_RECORDER used by strategies)
-
 
 @dataclass
 class ChunkContext:
@@ -39,6 +37,7 @@ def install_patch(model) -> None:
     model._pnp_strategy = None
     model._pnp_chunk_pos = 0.0
     model._pnp_vf_evals = 0
+    model._pnp_num_steps = None       # per-call num_inference_steps override (set by run_episode)
     import types
     model.sample_actions = types.MethodType(_sample_actions_hooked, model)
 
@@ -51,15 +50,14 @@ def set_strategy(model, strategy) -> None:
 def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
                            num_steps=None, **kwargs):
     from lerobot.policies.pi05.modeling_pi05 import make_att_2d_masks
-    cfg = PNP_CONFIG
+    # Resolve the step count: explicit arg > per-call override (extra_steps) > model default.
+    num_steps = num_steps or getattr(self, "_pnp_num_steps", None) or self.config.num_inference_steps
     strat = getattr(self, "_pnp_strategy", None)
     rtc = getattr(self, "_rtc_enabled", lambda: False)()
-    if strat is None or not cfg.enabled or rtc:
+    if strat is None or rtc:
         return self._orig_sample_actions(
             images, img_masks, tokens, masks, noise=noise, num_steps=num_steps, **kwargs)
 
-    if num_steps is None:
-        num_steps = self.config.num_inference_steps
     bsize = tokens.shape[0]
     device = tokens.device
     if noise is None:
@@ -113,24 +111,17 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
 
 def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3):
     """Run one measurement-only uncertainty pass; return (action_chunk, u_mean_scalar)."""
-    saved = (PNP_CONFIG.enabled, PNP_CONFIG.mode, PNP_CONFIG.step_indices,
-             PNP_CONFIG.num_iterations)
-    from .pnp import RecordStrategy
+    from .config import PnPConfig
+    from .pnp import RecordStrategy, PnPRecorder
     model = policy.model
     prev_strat = getattr(model, "_pnp_strategy", None)
     try:
-        PNP_CONFIG.enabled = True
-        PNP_CONFIG.mode = "uncertainty"
-        PNP_CONFIG.step_indices = tuple(probe_steps)
-        PNP_CONFIG.num_iterations = num_iterations
-        model._pnp_strategy = RecordStrategy(PNP_CONFIG)
-        PNP_RECORDER.new_episode()
+        cfg = PnPConfig(enabled=True, mode="uncertainty", step_indices=tuple(probe_steps),
+                        num_iterations=num_iterations)
+        rec = PnPRecorder(); rec.new_episode()
+        model._pnp_strategy = RecordStrategy(cfg, rec)
         action = policy.predict_action_chunk(batch, noise=noise)
-        ep = PNP_RECORDER._cur
-        us = [st["u_mean"] for c in ep["chunks"] for st in c["steps"]] if ep else []
-        u = float(sum(us) / len(us)) if us else 0.0
-        return action, u
+        us = [st["u_mean"] for c in (rec._cur or {}).get("chunks", []) for st in c["steps"]]
+        return action, (float(sum(us) / len(us)) if us else 0.0)
     finally:
-        (PNP_CONFIG.enabled, PNP_CONFIG.mode, PNP_CONFIG.step_indices,
-         PNP_CONFIG.num_iterations) = saved
         model._pnp_strategy = prev_strat

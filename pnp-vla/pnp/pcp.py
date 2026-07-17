@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 from .config import PCPConfig
-from .pnp import _pnp_gen, PNP_CONFIG
+from .pnp import _pnp_gen
 
 
 # ─────────────────────────────────────────────────────────────────────────────

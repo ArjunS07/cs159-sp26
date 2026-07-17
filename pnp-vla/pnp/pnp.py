@@ -17,11 +17,9 @@ import torch
 
 from .config import PnPConfig, PERTURB_SEED_MASK, ADIM
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Global runtime state read by the patched sampler (set by drivers per pass).
-# ─────────────────────────────────────────────────────────────────────────────
-PNP_CONFIG = PnPConfig()
-
+# No module-level config/recorder globals: config travels with the strategy, and the
+# recorder is created per run_episode call. Only the mechanical perturbation-generator state
+# below is module-level (reseeded per episode).
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Isolated perturbation generators (never advance the global / noise RNG).
@@ -187,17 +185,18 @@ class PnPRecorder:
         self._cur = None
 
 
-PNP_RECORDER = PnPRecorder()
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy (duck-typed; the sampler calls .selected / .step / .invasive).
+# Strategy (duck-typed; the sampler calls .selected / .step / .invasive / .finish).
 # ─────────────────────────────────────────────────────────────────────────────
 class RecordStrategy:
-    """P&P uncertainty/refinement. Non-invasive when do_refine is False (pure measurement)."""
+    """P&P uncertainty/refinement. Non-invasive when do_refine is False (pure measurement).
 
-    def __init__(self, cfg: PnPConfig | None = None):
-        self.cfg = cfg or PNP_CONFIG
+    Holds its config and the per-episode recorder explicitly — no module globals.
+    """
+
+    def __init__(self, cfg: PnPConfig, recorder: PnPRecorder):
+        self.cfg = cfg
+        self.recorder = recorder
 
     @property
     def invasive(self) -> bool:
@@ -213,7 +212,7 @@ class RecordStrategy:
         return x_out
 
     def finish(self, ctx):
-        PNP_RECORDER.log_chunk({"num_steps": ctx.num_steps, "steps": ctx.records})
+        self.recorder.log_chunk({"num_steps": ctx.num_steps, "steps": ctx.records})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,18 +223,16 @@ def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_
     """Return (chosen_action_chunk, chosen_idx, per_candidate_u).
 
     `noise_of(si)` yields the initial noise for candidate si (from the rollout's per-episode
-    noise generator family). Uncertainty is probed in measurement mode via PNP_CONFIG.
+    noise generator family). Uncertainty is probed in measurement mode.
     """
     from .sampler import measure_chunk_uncertainty  # local import avoids a cycle
     cand_u, cand_actions = [], []
-    saved_enabled, saved_mode = PNP_CONFIG.enabled, PNP_CONFIG.mode
     for si in range(num_samples):
         noise = noise_of(si)
         _pnp_seed_perturb(base_seed + chunk_idx * 1000 + si)
         action, u = measure_chunk_uncertainty(policy, batch, noise=noise, probe_steps=probe_steps)
         cand_actions.append(action)
         cand_u.append(float(u))
-    PNP_CONFIG.enabled, PNP_CONFIG.mode = saved_enabled, saved_mode
     chosen = int(np.argmin(cand_u))
     return cand_actions[chosen], chosen, cand_u
 
@@ -244,48 +241,41 @@ def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_
 # No-op / noise-pairing contract test (upgraded assert_pnp_noop).
 # ─────────────────────────────────────────────────────────────────────────────
 def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=True, tol=None):
-    """Verify the two contract properties on real weights:
+    """Verify the two contract properties on real weights, via predict_action_chunk(noise=None):
 
-      1. RNG ISOLATION (exact): after an uncertainty-mode chunk the global RNG is in the SAME
-         state as after a vanilla chunk (the dedicated perturbation generator guarantees this).
-      2. OUTPUT EQUALITY (within a tolerance): uncertainty mode returns vanilla's action up to
-         the bf16/flow-matching nondeterminism floor, measured by running vanilla twice.
+      1. RNG ISOLATION (exact): with the global RNG re-seeded identically before each call,
+         the global RNG state AFTER an uncertainty-mode chunk equals the state after a vanilla
+         chunk — the dedicated perturbation generator never advanced it.
+      2. OUTPUT EQUALITY (within a tolerance): uncertainty mode matches vanilla up to the
+         bf16/flow-matching nondeterminism floor, measured by running vanilla twice.
     """
-    saved = (PNP_CONFIG.enabled, PNP_CONFIG.mode, PNP_CONFIG.step_indices, PNP_CONFIG.num_iterations)
     model = policy.model
+    prev = getattr(model, "_pnp_strategy", None)
+
+    def _seeded_chunk():
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+        _pnp_seed_perturb(seed)
+        return policy.predict_action_chunk(batch, noise=None).detach().float().cpu().numpy()
+
     try:
-        # --- vanilla twice to measure the nondeterminism floor + RNG state ---
-        PNP_CONFIG.enabled = False
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-        _pnp_seed_perturb(seed)
-        a_van1 = model.sample_actions(*batch).detach().float().cpu().numpy()
+        model._pnp_strategy = None                       # vanilla (delegates to orig sampler)
+        a_van1 = _seeded_chunk()
         rng_after_vanilla = torch.random.get_rng_state()
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-        _pnp_seed_perturb(seed)
-        a_van2 = model.sample_actions(*batch).detach().float().cpu().numpy()
+        a_van2 = _seeded_chunk()
         floor = float(np.abs(a_van1 - a_van2).max())
 
-        # --- uncertainty mode: must match vanilla + leave the global RNG untouched ---
-        PNP_CONFIG.enabled = True
-        PNP_CONFIG.mode = "uncertainty"
-        PNP_CONFIG.step_indices = tuple(step_indices)
-        PNP_CONFIG.num_iterations = 3
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-        _pnp_seed_perturb(seed)
-        a_unc = model.sample_actions(*batch).detach().float().cpu().numpy()
+        cfg = PnPConfig(enabled=True, mode="uncertainty", step_indices=tuple(step_indices),
+                        num_iterations=3)
+        model._pnp_strategy = RecordStrategy(cfg, PnPRecorder())
+        a_unc = _seeded_chunk()
         rng_after_unc = torch.random.get_rng_state()
 
         rng_ok = torch.equal(rng_after_vanilla, rng_after_unc)
         gap = float(np.abs(a_unc - a_van1).max())
         thresh = tol if tol is not None else max(floor * 3.0, 1e-3)
-        out_ok = gap <= thresh
-        ok = rng_ok and out_ok
+        ok = rng_ok and gap <= thresh
         msg = (f"assert_pnp_noop: rng_isolated={rng_ok}  output_gap={gap:.2e} "
                f"(floor={floor:.2e}, thresh={thresh:.2e})  -> {'OK' if ok else 'FAIL'}")
         if not ok and raise_on_fail:
@@ -293,4 +283,4 @@ def assert_pnp_noop(policy, batch, step_indices=(1, 2), seed=0, raise_on_fail=Tr
         print(msg)
         return ok
     finally:
-        PNP_CONFIG.enabled, PNP_CONFIG.mode, PNP_CONFIG.step_indices, PNP_CONFIG.num_iterations = saved
+        model._pnp_strategy = prev
