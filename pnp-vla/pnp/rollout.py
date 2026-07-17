@@ -16,7 +16,7 @@ from itertools import groupby
 import numpy as np
 import torch
 
-from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, RolloutConfig
+from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, VIDEO_FPS, RolloutConfig
 from .libero_env import make_env, obs_to_policy
 from .pnp import PnPRecorder, _pnp_seed_perturb, multi_sample_select
 from .tap import RolloutTap
@@ -42,6 +42,22 @@ def _draw_chunk_noise(policy, device, seed: int) -> torch.Tensor:
     gen.manual_seed(int(seed))
     shape = (1, policy.config.chunk_size, policy.config.max_action_dim)
     return torch.empty(shape, device=device).normal_(generator=gen)
+
+
+def _encode_mp4(frames, fps: int = VIDEO_FPS) -> bytes:
+    """Encode a list of HxWx3 uint8 frames to mp4 bytes (imageio-ffmpeg)."""
+    import os
+    import tempfile
+    import imageio
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        path = f.name
+    try:
+        imageio.mimwrite(path, [np.ascontiguousarray(x) for x in frames], fps=fps,
+                         macro_block_size=1)
+        with open(path, "rb") as fh:
+            return fh.read()
+    finally:
+        os.remove(path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +136,8 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
     queue, ci = [], 0
     executed_actions, robot_states, chunk_boundary_actions, chunk_noise_seeds = [], [], [], []
     ms_selections = [] if multisample else None
-    frames = [] if config.save_observations else None
+    # capture agentview frames when either sink wants them (obs_frames OR a video)
+    frames = [] if (config.save_observations or config.video != "off") else None
     nan_count = 0
     success = False
     status, error_msg = "completed", None
@@ -182,6 +199,12 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
     if vf_evals == 0:                                   # vanilla path (orig sampler doesn't count)
         vf_evals = (config.num_inference_steps or policy.config.num_inference_steps) * max(ci, 1)
 
+    # video sink: encode iff configured for this outcome ('all', or 'failures_only' on failure)
+    video_bytes = None
+    if config.video != "off" and frames:
+        if config.video == "all" or (config.video == "failures_only" and not success):
+            video_bytes = _encode_mp4(frames)
+
     result = dict(
         success=success, n_steps=n_steps, elapsed_s=elapsed, status=status, error_msg=error_msg,
         nan_action_count=nan_count, n_chunks=ci, n_vf_evals=vf_evals, chunk_size=chunk_size,
@@ -191,7 +214,8 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
             actions=np.asarray(executed_actions, dtype=np.float32),
             robot_state=np.asarray(robot_states, dtype=np.float32),
         ) if config.save_trajectory else None,
-        obs_frames=frames,
+        obs_frames=frames if config.save_observations else None,
+        video=video_bytes,
     )
     if tap is not None:
         if tap.save_pcp:

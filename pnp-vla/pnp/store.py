@@ -335,6 +335,8 @@ class SupabaseStore:
             blobs["trajectory"] = result["trajectory"]
         if result.get("obs_frames"):
             blobs["obs_frames"] = result["obs_frames"]
+        if result.get("video"):
+            blobs["video"] = result["video"]
         if config.save_ahats and result.get("recorder_episode"):
             ah = {f"c{c['chunk_idx']}_s{st['step']}": st["a_hats"]
                   for c in result["recorder_episode"].get("chunks", [])
