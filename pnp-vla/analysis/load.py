@@ -6,6 +6,20 @@ import io
 import numpy as np
 import pandas as pd
 
+from pnp.config import PCP_3WAY
+
+
+def require_methods(df: pd.DataFrame, names) -> None:
+    """Fail LOUD (not silently empty) when an expected method is absent from the frame.
+
+    Guards analyses that filter by `method` — if a notebook wrote a different label, this raises
+    with expected-vs-present instead of returning an empty result that looks like 'no effect'."""
+    present = set(df["method"].unique()) if not df.empty else set()
+    missing = [n for n in names if n not in present]
+    if missing:
+        raise ValueError(f"expected method(s) {missing} not in data; present={sorted(present)}. "
+                         "Check the notebook wrote the canonical pnp.config.Method strings.")
+
 
 def _all_rows(client, table, experiment=None, select="*", page=1000, **eq):
     """Paginated fetch of a whole table (PostgREST caps rows per request)."""
@@ -41,11 +55,12 @@ def euler_steps(store, experiment=None) -> pd.DataFrame:
 
 
 def pcp_three_way(store, experiment=None) -> pd.DataFrame:
-    """PCP 3-way eval SR — just the three method rows in `rollouts` (no qc_eval table)."""
+    """PCP 3-way eval SR — the three PCP_3WAY method rows in `rollouts` (no qc_eval table)."""
     df = rollouts(store, experiment)
     if df.empty:
         return df
-    return df[df["method"].isin(["vanilla", "pnp_only", "pcp"])]
+    require_methods(df, PCP_3WAY)
+    return df[df["method"].isin(PCP_3WAY)]
 
 
 def action_vectors(store) -> pd.DataFrame:

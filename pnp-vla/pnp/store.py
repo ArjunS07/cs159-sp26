@@ -157,7 +157,7 @@ class SupabaseStore:
         row = {
             "run_id": self.run_id, "experiment": experiment, "driver": driver,
             "benchmark": benchmark, "status": "running",
-            "label": self._auto_label(driver, config), "notes": notes,
+            "label": self._auto_label(driver), "notes": notes,
             "config_json": self._json(config or {}),
         }
         row.update(provenance or gather_provenance())
@@ -174,15 +174,11 @@ class SupabaseStore:
         self.client.table("experiment_runs").update(patch).eq("run_id", self.run_id).execute()
 
     @staticmethod
-    def _auto_experiment(driver: str, config: dict | None) -> str:
-        day = _dt.date.today().isoformat()
-        summ = ""
-        if config:
-            summ = "-" + "-".join(str(config[k]) for k in ("suite", "method") if k in config)
-        return f"{driver}-{day}{summ}"
+    def _auto_experiment(driver: str, config: dict | None = None) -> str:
+        return f"{driver}-{_dt.date.today().isoformat()}"
 
     @staticmethod
-    def _auto_label(driver: str, config: dict | None) -> str:
+    def _auto_label(driver: str) -> str:
         return f"{driver}-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     # ── resume ─────────────────────────────────────────────────────────────

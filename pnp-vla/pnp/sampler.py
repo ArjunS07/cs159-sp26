@@ -52,8 +52,7 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
     # Resolve the step count: explicit arg > per-call override (extra_steps) > model default.
     num_steps = num_steps or getattr(self, "_pnp_num_steps", None) or self.config.num_inference_steps
     strat = getattr(self, "_pnp_strategy", None)
-    rtc = getattr(self, "_rtc_enabled", lambda: False)()
-    if strat is None or rtc:
+    if strat is None:
         return self._orig_sample_actions(
             images, img_masks, tokens, masks, noise=noise, num_steps=num_steps, **kwargs)
 

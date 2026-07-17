@@ -58,7 +58,7 @@ def apply_pnp_patch(policy) -> None:
     """Install the unified hooked sampler on the pi0.5 policy model."""
     _sampler.install_patch(policy.model)
     adim = _infer_action_dim(policy)
-    policy.model._pnp_action_dim = adim   # informational; PnPConfig.action_dim defaults to ADIM=7
+    policy.model._pnp_action_dim = adim   # informational; RolloutConfig.action_dim defaults to ADIM=7
     print(f"Patched pi05 sample_actions (action_dim={adim})")
 
 

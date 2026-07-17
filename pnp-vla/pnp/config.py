@@ -52,6 +52,28 @@ PERTURB_SEED_MASK = 0x9E3779B9
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Canonical method taxonomy — the SINGLE source of the `method` strings written to
+# rollouts.method. Both the Colab notebooks (which write them) and local analysis/ (which
+# filters/colors by them) import these, so the label never drifts across the two. The
+# refinement last/avg variant is NOT a separate method — it lives in the refine_average column.
+# ─────────────────────────────────────────────────────────────────────────────
+class Method:
+    VANILLA = "vanilla"
+    EXTRA_STEPS = "extra_steps"
+    UNCERTAINTY = "pnp_uncertainty_only"    # probe set, no action (RNG-isolated no-op)
+    REFINEMENT = "pnp_refinement"           # refine; last vs avg = refine_average column
+    MULTI_SAMPLE = "multi_sample_select"
+    PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
+    PCP = "pcp"                             # PCP correction, lambda > 0
+    COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
+
+
+ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.REFINEMENT,
+               Method.MULTI_SAMPLE, Method.PNP_ONLY, Method.PCP)
+PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Rollout config: three ORTHOGONAL axes, FLAT on one dataclass.
 #   (A) action  — how the executed action is produced. At most one of: refine /
 #                 correction_lambda (PCP) / num_samples (multi-sample); None => vanilla.

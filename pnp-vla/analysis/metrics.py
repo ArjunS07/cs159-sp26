@@ -8,6 +8,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from pnp.config import Method, DIM_NAMES   # single source: taxonomy + DOF names
+
 try:
     from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
     from scipy import stats
@@ -66,8 +68,8 @@ def _pivot_success(df, baseline_method, method, refine_average=None):
     return j
 
 
-def phase_comparison(df, baseline_method="pnp_uncertainty_only",
-                     method="pnp_refinement", refine_average=None) -> dict:
+def phase_comparison(df, baseline_method=Method.UNCERTAINTY,
+                     method=Method.REFINEMENT, refine_average=None) -> dict:
     j = _pivot_success(df, baseline_method, method, refine_average)
     if j.empty:
         return {"n": 0}
@@ -76,18 +78,15 @@ def phase_comparison(df, baseline_method="pnp_uncertainty_only",
     return {"n": len(j), "SR_baseline": sr_b, "SR_method": sr_m, "delta_pp": sr_m - sr_b}
 
 
-def transition_counts(df, baseline_method="pnp_uncertainty_only",
-                      method="pnp_refinement", refine_average=None) -> dict:
+def transition_counts(df, baseline_method=Method.UNCERTAINTY,
+                      method=Method.REFINEMENT, refine_average=None) -> dict:
     j = _pivot_success(df, baseline_method, method, refine_average)
     b = j["success_b"].astype(bool); m = j["success_m"].astype(bool)
     return {"F_to_S": int((~b & m).sum()), "S_to_F": int((b & ~m).sum()),
             "S_to_S": int((b & m).sum()), "F_to_F": int((~b & ~m).sum()), "n": len(j)}
 
 
-# ── B: per-DOF localization ─────────────────────────────────────────────────
-DIM_NAMES = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
-
-
+# ── B: per-DOF localization (DIM_NAMES imported from pnp.config) ─────────────
 def per_dof_auc(steps_df: pd.DataFrame, by="suite") -> pd.DataFrame:
     """Within-suite AUC of each per-DOF uncertainty (u_d0..u_d6) vs episode failure."""
     rows = []

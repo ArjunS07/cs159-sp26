@@ -8,16 +8,24 @@ from __future__ import annotations
 
 import os
 
-# Canonical method order/labels for consistent colors across every figure.
+from pnp.config import Method
+
+# The refinement last/avg variant is a COLUMN (refine_average), not a Method. For figures we
+# still want distinct colors per variant, so 'refine_average=True' resolves to this display-only
+# key (never written to the DB). See method_display_key / method_color below.
+REFINEMENT_AVG_KEY = "pnp_refinement_avg"
+
+# Canonical method order for consistent colors across every figure (Method taxonomy + the one
+# display-only variant key).
 METHOD_ORDER = [
-    "vanilla",
-    "extra_steps",
-    "pnp_uncertainty_only",
-    "pnp_refinement",          # refine_average=False (last)
-    "pnp_refinement_avg",      # refine_average=True
-    "multi_sample_select",
-    "pnp_only",                # PCP lambda=0
-    "pcp",                     # PCP lambda>0
+    Method.VANILLA,
+    Method.EXTRA_STEPS,
+    Method.UNCERTAINTY,
+    Method.REFINEMENT,         # refine_average=False (last)
+    REFINEMENT_AVG_KEY,        # refine_average=True
+    Method.MULTI_SAMPLE,
+    Method.PNP_ONLY,           # PCP lambda=0
+    Method.PCP,                # PCP lambda>0
 ]
 
 # Okabe-Ito colorblind-safe palette (8 hues), mapped by method.
@@ -26,12 +34,19 @@ _OKABE_ITO = ["#000000", "#E69F00", "#56B4E9", "#009E73",
 PALETTE = {m: _OKABE_ITO[i % len(_OKABE_ITO)] for i, m in enumerate(METHOD_ORDER)}
 
 METHOD_LABELS = {
-    "vanilla": "Vanilla", "extra_steps": "Extra steps",
-    "pnp_uncertainty_only": "P\\&P (uncertainty)",
-    "pnp_refinement": "P\\&P refine (last)",
-    "pnp_refinement_avg": "P\\&P refine (avg)",
-    "multi_sample_select": "Multi-sample", "pnp_only": "PnP-only", "pcp": "PCP",
+    Method.VANILLA: "Vanilla", Method.EXTRA_STEPS: "Extra steps",
+    Method.UNCERTAINTY: "P\\&P (uncertainty)",
+    Method.REFINEMENT: "P\\&P refine (last)",
+    REFINEMENT_AVG_KEY: "P\\&P refine (avg)",
+    Method.MULTI_SAMPLE: "Multi-sample", Method.PNP_ONLY: "PnP-only", Method.PCP: "PCP",
 }
+
+
+def method_display_key(method: str, refine_average=None) -> str:
+    """Map (method, refine_average) to the palette/label key — splitting the refine variant."""
+    if method == Method.REFINEMENT and refine_average:
+        return REFINEMENT_AVG_KEY
+    return method
 
 
 def set_style(use_latex: bool = True, base_fontsize: int = 11) -> None:
@@ -70,8 +85,8 @@ def set_style(use_latex: bool = True, base_fontsize: int = 11) -> None:
         print("[style] LaTeX toolchain not found — using mathtext CM fallback.")
 
 
-def method_color(method: str) -> str:
-    return PALETTE.get(method, "#666666")
+def method_color(method: str, refine_average=None) -> str:
+    return PALETTE.get(method_display_key(method, refine_average), "#666666")
 
 
 def savefig(fig, name: str, out_dir: str = "figures") -> None:
