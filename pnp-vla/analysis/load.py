@@ -37,10 +37,32 @@ def _all_rows(client, table, experiment=None, select="*", page=1000, **eq):
         start += page
 
 
+def _config_label(row) -> str:
+    """Compact label distinguishing a swept config (same method, different params) for grouping.
+
+    e.g. two `pnp_uncertainty_only` rows with different (S,K) become 'pnp_uncertainty_only-s2_3-k3'
+    vs '...-s5-k5'. Group/plot by `config_label` instead of `method` to compare a sweep."""
+    parts = [str(row.get("method"))]
+    if row.get("refine_average"):
+        parts.append("avg")
+    if row.get("pnp_step_indices"):
+        parts.append("s" + "_".join(str(s) for s in row["pnp_step_indices"]))
+    if row.get("pnp_k"):
+        parts.append(f"k{row['pnp_k']}")
+    if row.get("correction_lambda") is not None:
+        parts.append(f"lam{row['correction_lambda']}")
+    if row.get("num_samples"):
+        parts.append(f"n{row['num_samples']}")
+    if row.get("num_inference_steps"):
+        parts.append(f"steps{row['num_inference_steps']}")
+    return "-".join(parts)
+
+
 def rollouts(store, experiment=None, **eq) -> pd.DataFrame:
     df = pd.DataFrame(_all_rows(store.client, "rollouts", experiment, **eq))
     if not df.empty:
         df["fail"] = (~df["success"].astype(bool)).astype(int)
+        df["config_label"] = df.apply(_config_label, axis=1)   # distinguishes sweeps by config
     return df
 
 

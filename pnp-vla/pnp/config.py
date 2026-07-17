@@ -153,6 +153,22 @@ class RolloutConfig:
         """Whether to persist per-step uncertainty rows (default: on iff a probe is set)."""
         return self.save_uncertainty if self.save_uncertainty is not None else self.has_probe
 
+    def logical_dict(self) -> dict:
+        """The behavior-defining config — everything that changes the executed trajectory.
+
+        This (not a hand-picked subset) is what the rollout_id / config_hash are built from, so
+        sweeping ANY of these axes (e.g. correction_lambda, q_gate) yields distinct rollouts even
+        under one method name. Excludes: sinks + video (persistence-only), compute_multimodal
+        (recording-only), and q_model/q_scaler (runtime handles — q_ckpt_id captures their identity).
+        """
+        return {f: getattr(self, f) for f in LOGICAL_FIELDS}
+
+
+# Behavior-defining fields of RolloutConfig (see RolloutConfig.logical_dict).
+LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
+                  "refine", "refine_average", "correction_lambda", "q_gate", "q_ckpt_id",
+                  "num_samples", "ms_probe_steps", "num_inference_steps")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Q-corrector training hyperparameters (training-time, not a rollout concern).

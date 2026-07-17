@@ -256,10 +256,17 @@ class SupabaseStore:
             "num_samples": config.num_samples,
         }
 
+    @staticmethod
+    def _logical_key(method: str, config) -> dict:
+        """The full behavior-defining key hashed into rollout_id / config_hash: method + every
+        field that changes the trajectory. Sweeping any of it (e.g. correction_lambda) yields a
+        distinct rollout_id even under one method name — no silent collisions."""
+        return {"method": method, **config.logical_dict()}
+
     def rollout_id(self, experiment: str, ep: dict, method: str, config) -> str:
         identity = {k: ep.get(k) for k in
                     ("benchmark", "suite", "task_idx", "episode_idx", "ep_idx", "init_state_hash")}
-        return self.make_rollout_id(experiment, identity, self._denorm(method, config))
+        return self.make_rollout_id(experiment, identity, self._logical_key(method, config))
 
     @staticmethod
     def _dim_cols(vec, prefix):
@@ -301,7 +308,8 @@ class SupabaseStore:
         """Map a run_episode result onto the canonical rollouts schema and persist it."""
         euler, vecs, summary = self._recorder_to_rows(result.get("recorder_episode"),
                                                        result.get("chunk_noise_seeds", []))
-        denorm = self._denorm(method, config)
+        denorm = self._denorm(method, config)          # denormalized filter columns
+        logical = self._logical_key(method, config)    # full behavior config -> hash + provenance
         row = {
             "rollout_id": rid,
             "benchmark": ep.get("benchmark"), "suite": ep["suite"], "task_idx": ep["task_idx"],
@@ -312,8 +320,8 @@ class SupabaseStore:
             "distractor_object": ep.get("distractor_object"),
             "max_steps": ep.get("max_steps"), "chunk_size": result.get("chunk_size"),
             "n_chunks": result["n_chunks"], "action_dim": ADIM,
-            "episode_seed": result["episode_seed"], "config_hash": self.config_hash(denorm),
-            "config_json": denorm,
+            "episode_seed": result["episode_seed"], "config_hash": self.config_hash(logical),
+            "config_json": logical,
             "success": result["success"], "n_steps": result["n_steps"],
             "elapsed_s": result["elapsed_s"],
             "terminated_reason": "success" if result["success"] else result["status"],
