@@ -1,7 +1,9 @@
-"""PCP: Q-corrector model, training (wandb), collection + correction sampler strategies.
+"""PCP: Q-corrector model, training (wandb), and the correction action.
 
 Ported from build_final_notebooks.py PCP sections. The Q-corrector is a small calibrated
-MLP success-predictor; PCP nudges actions along its input-gradient at deploy time.
+MLP success-predictor; PCP nudges actions along its input-gradient at deploy time. Collection
+and 3-way eval are no longer strategy classes — collection is just a rollout with the
+`save_pcp_features` sink, and the correction feedback is `apply_correct` (driven by the tap).
 """
 from __future__ import annotations
 
@@ -9,14 +11,15 @@ import hashlib
 import io
 import json
 import uuid
+from dataclasses import dataclass, field
 from collections import defaultdict
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from .config import PCPConfig
-from .pnp import _pnp_gen
+from .config import Correct, TrainConfig
+from .pnp import _pnp_gen, ProbeResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,102 +58,18 @@ class TemperatureScaler(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared K predict-and-perturb -> full-width mean clean estimate (z_hat)
+# Correction action: gated Q-gradient nudge on the probe's z_hat (PCP deploy step).
 # ─────────────────────────────────────────────────────────────────────────────
-def _kpp_zhat(x_t, s, vf, K, adim=7):
-    """Run K predict/perturb iters (isolated generator); return (z_hat[chunk,adim], x_acc)."""
-    gen = _pnp_gen(x_t.device)
-    x_acc = x_t
-    a_hats = []
-    for _ in range(K):
-        v = vf(x_acc)
-        a_hat = x_acc - s * v
-        a_hats.append(a_hat)
-        x_acc = (1.0 - s) * a_hat + s * torch.empty_like(x_acc).normal_(generator=gen)
-    z_full = torch.stack(a_hats, 0).mean(0)              # (B, chunk, max_adim)
-    z_hat = z_full[0, :, :adim]                          # (chunk, adim)
-    return z_hat, x_acc
+@dataclass
+class CorrectTelemetry:
+    """Accumulated per-episode PCP deployment telemetry (did the corrector actually act?)."""
+    n_steps: int = 0
+    n_gate_fire: int = 0
+    n_applied: int = 0
+    corr_norms: list = field(default_factory=list)
+    q_scores: list = field(default_factory=list)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sampler strategies (duck-typed for pnp.sampler)
-# ─────────────────────────────────────────────────────────────────────────────
-class CollectStrategy:
-    """Measurement-only: record mean z_hat + obs_enc at collect steps. Non-invasive."""
-    invasive = False
-
-    def __init__(self, cfg: PCPConfig, adim=7):
-        self.cfg = cfg
-        self.adim = adim
-        self.chunks = []          # accumulated across the episode: {chunk_idx, obs_enc, chunk_pos, steps}
-        self._buf = []
-
-    def selected(self, step, s):
-        return step in tuple(self.cfg.collect_steps)
-
-    def step(self, x_t, s, vf, ctx):
-        z_hat, _ = _kpp_zhat(x_t, s, vf, self.cfg.pnp_k, self.adim)
-        self._buf.append({"step_idx": ctx.step, "s": float(s),
-                          "z_hat": z_hat.detach().float().cpu().numpy()})
-        return x_t                 # non-invasive: executed action stays vanilla
-
-    def finish(self, ctx):
-        self.chunks.append({
-            "chunk_idx": len(self.chunks),
-            "obs_enc": ctx.obs_enc.detach().float().cpu().numpy(),
-            "chunk_pos": ctx.chunk_pos,
-            "steps": list(self._buf),
-        })
-        self._buf = []
-
-
-class CorrectStrategy:
-    """PCP: gated Q-gradient nudge at correction steps. Invasive."""
-    invasive = True
-
-    def __init__(self, cfg: PCPConfig, q_model, q_scaler, lam, device, adim=7):
-        self.cfg = cfg
-        self.q_model = q_model
-        self.q_scaler = q_scaler
-        self.lam = lam
-        self.device = device
-        self.adim = adim
-        # telemetry
-        self.n_applied = 0
-        self.n_gate_fire = 0
-        self.n_steps = 0
-        self.corr_norms = []
-        self.q_scores = []
-
-    def selected(self, step, s):
-        return step in tuple(self.cfg.correction_steps)
-
-    def step(self, x_t, s, vf, ctx):
-        z_hat, x_acc = _kpp_zhat(x_t, s, vf, self.cfg.pnp_k, self.adim)  # z_hat (chunk, adim)
-        self.n_steps += 1
-        if self.lam and self.lam > 0 and self.q_model is not None:
-            zc = z_hat.reshape(1, -1).detach().clone().requires_grad_(True)
-            cp = torch.tensor([[float(ctx.chunk_pos), float(s)]], dtype=torch.float32,
-                              device=zc.device)
-            ob = ctx.obs_enc.reshape(1, -1).float()
-            with torch.enable_grad():
-                score = torch.sigmoid(self.q_scaler(self.q_model(zc, cp, ob)))
-            self.q_scores.append(float(score.item()))
-            if score.item() < self.cfg.q_gate:
-                self.n_gate_fire += 1
-                score.backward()
-                g = zc.grad.detach().reshape(z_hat.shape)
-                a_star = z_hat + self.lam * g
-                self.n_applied += 1
-                self.corr_norms.append(float((self.lam * g).norm().item()))
-                gen = _pnp_gen(x_t.device)
-                # re-noise the corrected full-width estimate (pad correction into first adim)
-                z_full = x_acc.clone()
-                z_full[0, :, :self.adim] = a_star
-                return (1.0 - s) * z_full + s * torch.empty_like(x_t).normal_(generator=gen)
-        return x_acc
-
-    def telemetry(self):
+    def telemetry(self) -> dict:
         return dict(
             n_corrections_applied=self.n_applied,
             gate_fire_rate=self.n_gate_fire / max(self.n_steps, 1),
@@ -159,10 +78,41 @@ class CorrectStrategy:
         )
 
 
+def apply_correct(pr: ProbeResult, ctx, cfg: Correct, adim: int, tel: CorrectTelemetry):
+    """Correction action given a probe result. Returns the (possibly corrected) re-noised state.
+
+    Gated: only chunks the corrector scores below `cfg.gate` get nudged; otherwise the plain
+    re-noised last estimate (pr.x_acc) passes through unchanged.
+    """
+    s = pr.s
+    z_hat = pr.z_hat_full[0, :, :adim]                       # (chunk, adim) mean clean estimate
+    tel.n_steps += 1
+    if cfg.lam and cfg.lam > 0 and cfg.q_model is not None:
+        zc = z_hat.reshape(1, -1).detach().clone().requires_grad_(True)
+        cp = torch.tensor([[float(ctx.chunk_pos), float(s)]], dtype=torch.float32, device=zc.device)
+        ob = ctx.obs_enc.reshape(1, -1).float()
+        with torch.enable_grad():
+            score = torch.sigmoid(cfg.q_scaler(cfg.q_model(zc, cp, ob)))
+        tel.q_scores.append(float(score.item()))
+        if score.item() < cfg.gate:
+            tel.n_gate_fire += 1
+            score.backward()
+            g = zc.grad.detach().reshape(z_hat.shape)
+            a_star = z_hat + cfg.lam * g
+            tel.n_applied += 1
+            tel.corr_norms.append(float((cfg.lam * g).norm().item()))
+            gen = _pnp_gen(pr.x_acc.device)
+            # re-noise the corrected estimate (correction lives in the first adim dims)
+            z_full = pr.x_acc.clone()
+            z_full[0, :, :adim] = a_star
+            return (1.0 - s) * z_full + s * torch.empty_like(z_full).normal_(generator=gen)
+    return pr.x_acc
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Training dataset assembly (hard-task filter)
 # ─────────────────────────────────────────────────────────────────────────────
-def load_qc_samples(qc_rows, cfg: PCPConfig):
+def load_qc_samples(qc_rows, cfg: TrainConfig):
     """qc_rows: iterable of dicts {rollout_id, suite, task_idx, success, chunks:[...]}.
 
     Returns {(rollout_id, success): [(z_flat, obs_enc, [chunk_pos, s], success), ...]} over the
@@ -199,8 +149,7 @@ def _dataset_hash(samples) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Training (AdamW + cosine + label-smoothed BCE, early-stop on val AUC, temp cal)
 # ─────────────────────────────────────────────────────────────────────────────
-def train_q_corrector(samples, device, *, seed=42, train_frac=0.80, lr=3e-4, weight_decay=1e-4,
-                      label_smooth=0.05, epochs=100, patience=20, batch=256, cfg=None,
+def train_q_corrector(samples, device, *, cfg: TrainConfig = None,
                       wandb_run=None, experiment=None):
     """Train + calibrate the Q-corrector. Returns (q_model, q_scaler, meta, split_ids)."""
     import torch.optim as optim
@@ -209,7 +158,10 @@ def train_q_corrector(samples, device, *, seed=42, train_frac=0.80, lr=3e-4, wei
     except Exception:
         roc_auc_score = average_precision_score = brier_score_loss = None
 
-    cfg = cfg or PCPConfig()
+    cfg = cfg or TrainConfig()
+    seed, train_frac, lr = cfg.seed, cfg.train_frac, cfg.lr
+    weight_decay, label_smooth = cfg.weight_decay, cfg.label_smooth
+    epochs, patience, batch = cfg.epochs, cfg.patience, cfg.batch
     rng = np.random.default_rng(seed)
     pos = [k for k in samples if k[1] == 1]
     neg = [k for k in samples if k[1] == 0]
