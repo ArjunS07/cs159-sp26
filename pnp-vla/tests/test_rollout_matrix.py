@@ -20,18 +20,19 @@ def _notebook_methods():
         for item in notebook["cells"]
         if "def build_schedule_methods" in "".join(item.get("source", []))
     )
-    definitions = cell.split("EXPERIMENT = 'libero-full-schedules-k3-v1'")[0]
+    definitions = cell.split("EXPERIMENT = 'libero-hybrid-schedules-k3-v1'")[0]
     namespace = {
         "Method": Method,
         "RolloutConfig": RolloutConfig,
         "store": object.__new__(SupabaseStore),
     }
     exec(definitions, namespace)
-    return namespace["SCHEDULES"], namespace["METHODS"]
+    return namespace
 
 
 def test_full_rollout_matrix_is_complete_and_unique():
-    schedules, methods = _notebook_methods()
+    namespace = _notebook_methods()
+    schedules, methods = namespace["SCHEDULES"], namespace["FULL_METHODS"]
 
     assert schedules == (
         (2, 3), (3, 4), (4, 5), (5, 6), (7, 8),
@@ -60,6 +61,37 @@ def test_full_rollout_matrix_is_complete_and_unique():
     refinements = [config for name, config in methods if name == Method.REFINEMENT]
     assert len(refinements) == 16
     assert {config.pnp_steps for config in refinements} == set(schedules)
+
+    broad = namespace["BROAD_METHODS"]
+    assert [name for name, _ in broad] == [
+        Method.UNCERTAINTY, Method.EXTRA_STEPS, Method.REFINEMENT,
+    ]
+    assert broad[1][1].num_inference_steps == 16
+    assert broad[2][1].pnp_steps == (4, 5)
+    assert not broad[2][1].refine_average
+
+
+def test_hybrid_cohort_has_eight_historical_tasks():
+    tasks = _notebook_methods()["FULL_ABLATION_TASKS"]
+    assert len(tasks) == 8
+    assert {suite for suite, _ in tasks} == {"libero_spatial", "libero_goal"}
+
+
+def test_identity_shards_are_disjoint_and_complete():
+    namespace = _notebook_methods()
+    episodes = [
+        {"suite": "suite", "task_idx": task, "ep_idx": ep, "init_state_hash": f"{task}-{ep}"}
+        for task in range(3) for ep in range(5)
+    ]
+    shards = []
+    for shard_index in range(4):
+        namespace["SHARD_COUNT"] = 4
+        namespace["SHARD_INDEX"] = shard_index
+        shards.append(namespace["identity_shard"](episodes))
+
+    keys = lambda shard: {(ep["task_idx"], ep["ep_idx"]) for ep in shard}
+    assert set().union(*(keys(shard) for shard in shards)) == keys(episodes)
+    assert sum(len(keys(shard)) for shard in shards) == len(episodes)
 
 
 def test_pro_manifest_is_a_stable_deduplicated_union():

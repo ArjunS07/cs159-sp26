@@ -2,9 +2,9 @@
 
 ## Objective
 
-Collect a complete, reusable `K=3` ablation dataset without a screening phase. One shared
-uncertainty-only rollout measures the union of all scheduled Euler steps and serves as the
-observed baseline; there is no redundant no-probe vanilla arm in the primary matrix.
+Collect a reusable `K=3` ablation dataset without a schedule-screening phase. Run the complete
+schedule matrix on the historical 80-identity failure-prone cohort, then validate the established
+refine-last `(4,5)` configuration across every remaining stock LIBERO identity.
 
 ## Rollout matrix
 
@@ -37,9 +37,11 @@ This gives 20 configurations per identity: 1 shared observed baseline, 8 refine-
 
 | Group | Episode identities | Observed base | Extra steps | Refine last | Refine average | Planned rollouts |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| LIBERO | 400 (4 suites x 10 tasks x 10 episodes) | 1 / identity | 3 / identity | 8 / identity | 8 / identity | **8,000** |
+| LIBERO full ablation | 80 (8 historical tasks x 10 episodes) | 1 / identity | 3 / identity | 8 / identity | 8 / identity | **1,600** |
+| LIBERO broad validation | 320 remaining identities | 1 / identity | 1 / identity (16 steps) | 1 / identity `(4,5)` | 0 | **960** |
+| **LIBERO total** | **400** | | | | | **2,560** |
 | LIBERO-PRO | `N_PRO` from the deduplicated union manifest | 1 / identity | 3 / identity | 8 / identity | 8 / identity | **20 x N_PRO** |
-| **Total** | `400 + N_PRO` | | | | | **20 x (400 + N_PRO)** |
+| **Total** | `400 + N_PRO` | | | | | **2,560 + 20 x N_PRO** |
 
 LIBERO-PRO uses one manifest containing the union of the prior canonical and expanded
 cohorts. Deduplicate by `(suite, task_idx, episode_idx, init_state_hash)` and retain explicit
@@ -48,7 +50,7 @@ and print it before starting the run rather than hard-coding a historical count.
 
 ## Experiment configuration
 
-- Use experiment labels `libero-full-schedules-k3-v1` and
+- Use experiment labels `libero-hybrid-schedules-k3-v1` and
   `pro-union-full-schedules-k3-v1`.
 - Build the schedule matrix through one helper shared by the LIBERO and LIBERO-PRO loops.
 - Enable uncertainty telemetry and the PCP feature sink (`obs_enc` and `z_hat`) on the shared
@@ -57,8 +59,9 @@ and print it before starting the run rather than hard-coding a historical count.
   a larger `K`.
 - Resume through the existing episode-identity and logical-config hashes. Never change a
   logical experiment in place after collection begins; use a new experiment label.
-- Print the identity count, 20 configs per identity, expected rollout count, and method/config
-  summary before executing either group.
+- Deterministically shard episode identities with common `SHARD_COUNT` and distinct
+  `SHARD_INDEX` values; never shard configurations for the same identity across workers.
+- Print each worker's identity/config counts and expected rollout count before execution.
 
 ## Supported downstream experiments
 
@@ -75,7 +78,8 @@ and print it before starting the run rather than hard-coding a historical count.
 
 1. Assert eight unique schedules, three unique compute controls, and 20 unique logical
    configuration hashes.
-2. Assert 400 unique standard LIBERO identities.
+2. Assert 400 unique standard LIBERO identities, with 80 in the historical ablation cohort and
+   320 in broad validation.
 3. Assert the PRO union manifest has no duplicate identity keys and valid cohort metadata.
 4. Assert the shared observed arm covers the union of every refinement schedule at the same `pnp_k`.
 5. Assert only the shared observed arm enables the PCP feature sink.
