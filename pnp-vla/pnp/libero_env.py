@@ -58,14 +58,10 @@ def init_state_hash(init_state) -> str:
     return hashlib.md5(np.asarray(init_state).tobytes()).hexdigest()[:12]
 
 
-def init_libero_benchmark(hf_login: bool = True):
-    """Load the LIBERO benchmark dict (+ optional HF login). Returns benchmark_dict."""
+def init_libero_benchmark():
+    """Load and return the LIBERO benchmark dictionary."""
     global BENCHMARK_DICT
     from libero.libero import benchmark
-    if hf_login:
-        from huggingface_hub import login
-        tok = os.getenv("HF_TOKEN")
-        login(token=tok) if tok else None
     BENCHMARK_DICT = benchmark.get_benchmark_dict()
     print(f"LIBERO ready ({len(BENCHMARK_DICT)} suites)")
     return BENCHMARK_DICT
