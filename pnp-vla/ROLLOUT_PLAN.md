@@ -1,4 +1,4 @@
-# Full LIBERO / LIBERO-PRO Rollout Collection Plan
+# Hybrid LIBERO / LIBERO-PRO Rollout Collection Plan
 
 ## Objective
 
@@ -15,9 +15,9 @@ The sampler uses zero-based step indices from 0 through 9. The eight schedules a
 | Adjacent | `(2,3)`, `(3,4)`, `(4,5)`, `(5,6)`, `(7,8)` |
 | Periodic | `(1,3,5,7,9)`, `(3,6,9)`, `(2,5,8)` |
 
-For every episode identity, collect one observed arm with `pnp_steps=(1,2,3,4,5,6,7,8,9)`
-and `K=3`. Its step-indexed telemetry supports every schedule as a downstream view. For each
-schedule, collect two refinement arms with the same interval and `K=3`:
+The shared observed arm uses `pnp_steps=(1,2,3,4,5,6,7,8,9)` and `K=3`. Its step-indexed
+telemetry supports every schedule as a downstream view. The full-ablation cohort additionally
+runs two refinement arms for every schedule at `K=3`:
 
 1. `refine_last`: refine from the final perturbation estimate.
 2. `refine_average`: refine from the mean perturbation estimate.
@@ -32,6 +32,12 @@ The unique matched-compute controls are based on `10 + K * len(schedule)`:
 
 This gives 20 configurations per identity: 1 shared observed baseline, 8 refine-last arms,
 8 refine-average arms, and 3 matched-compute controls.
+
+The broad-validation cohort runs only three configurations per identity:
+
+1. Shared observed/uncertainty at steps `(1,2,3,4,5,6,7,8,9)`, `K=3`, with PCP features.
+2. Matched-compute control with 16 ordinary inference steps.
+3. Refine-last at `(4,5)`, `K=3`.
 
 ## Collection groups
 
@@ -92,3 +98,15 @@ The six stable launchers under `notebooks/workers/` contain only repository boot
 environment setup, and a fixed shard index. The hybrid driver and matrices live in
 `pnp.experiments`, so code/configuration updates are made once and picked up by every launcher on
 restart. See `notebooks/workers/README.md` for direct Colab links and recovery instructions.
+
+### Current stock-LIBERO execution
+
+- Experiment: `libero-hybrid-schedules-k3-v1`.
+- Six fixed identity shards: `SHARD_COUNT=6`, indices `0` through `5`.
+- Colab currently permits three active sessions, so execute in two waves: workers `3`, `4`, and
+  `5` first; workers `0`, `1`, and `2` after they finish.
+- Keep `SHARD_COUNT=6` in both waves. Do not renumber the second wave to three shards.
+- All workers write to the same Supabase experiment. Deterministic rollout IDs make restart and
+  resumption safe; a terminated worker should be restarted with the same index.
+- Expected stock-LIBERO total: 2,560 rollouts, approximately 12–18 hours wall-clock across two
+  three-worker L4 waves.
