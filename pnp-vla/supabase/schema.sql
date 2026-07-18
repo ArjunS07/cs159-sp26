@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS rollouts (
     perturb_axis              TEXT,          -- 'x' | 'y' | NULL
     perturb_strength          REAL,
     distractor_object         TEXT,
+    canonical_member          BOOLEAN,
+    expanded_member           BOOLEAN,
     max_steps                 INTEGER,
     chunk_size                INTEGER,
     n_chunks                  INTEGER,
@@ -234,3 +236,7 @@ CREATE TABLE IF NOT EXISTS encoding_cache (
     blob_path       TEXT,          -- Storage: encodings/{cache_key}.npz
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Idempotent migration for databases created before PRO cohort membership was recorded.
+ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS canonical_member BOOLEAN;
+ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS expanded_member BOOLEAN;

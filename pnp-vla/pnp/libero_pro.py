@@ -43,12 +43,26 @@ TEMP_TASKS = [
 TEMP_STRENGTHS = ([f"libero_object_temp_x{v}" for v in ["0.1", "0.2", "0.3", "0.4", "0.5"]] +
                   [f"libero_object_temp_y{v}" for v in ["0.1", "0.2", "0.3", "0.4", "0.5"]])
 
-# The 6-suite headline PRO set (position-perturb + distractor).
-DEFAULT_PRO_SUITES = [
+# The prior headline and expanded cohorts. Collection uses their stable-order union and stores
+# both membership flags so analyses can reproduce either historical cohort without recollecting.
+CANONICAL_PRO_SUITES = [
     "libero_object_temp_x0.1", "libero_object_temp_x0.2",
     "libero_object_temp_y0.1", "libero_object_temp_y0.2",
     "libero_spatial_with_milk", "libero_goal_with_yellow_book",
 ]
+
+EXPANDED_PRO_SUITES = [
+    "libero_object_temp_x0.1", "libero_object_temp_x0.2", "libero_object_temp_x0.3",
+    "libero_object_temp_y0.1", "libero_object_temp_y0.2", "libero_object_temp_y0.3",
+    "libero_goal_swap", "libero_object_swap", "libero_spatial_swap", "libero_10_swap",
+    "libero_goal_task", "libero_object_task",
+    "libero_goal_with_milk", "libero_spatial_with_milk",
+    "libero_object_with_mug", "libero_goal_with_yellow_book",
+]
+
+UNION_PRO_SUITES = list(dict.fromkeys(CANONICAL_PRO_SUITES + EXPANDED_PRO_SUITES))
+# Backwards-compatible name; the default is now the deduplicated collection manifest.
+DEFAULT_PRO_SUITES = UNION_PRO_SUITES
 
 
 def libero_site() -> str:
@@ -216,12 +230,13 @@ def describe_suite(suite: str) -> dict:
 # Episode building
 # ─────────────────────────────────────────────────────────────────────────────
 def build_libero_pro_episodes(benchmark_dict, suites=None, episode_idxs=None):
-    """Build the PRO episode list (suites x tasks x episodes) with descriptors."""
+    """Build a deduplicated PRO manifest with historical cohort membership."""
     from .libero_env import init_state_hash
     from libero.libero import get_libero_path
-    suites = suites or DEFAULT_PRO_SUITES
+    suites = list(dict.fromkeys(suites or DEFAULT_PRO_SUITES))
     episode_idxs = episode_idxs if episode_idxs is not None else list(range(10))
     episodes = []
+    seen = set()
     for suite in suites:
         desc = describe_suite(suite)
         task_suite = benchmark_dict[suite]()
@@ -235,10 +250,18 @@ def build_libero_pro_episodes(benchmark_dict, suites=None, episode_idxs=None):
                 if ep_idx >= len(init_states):
                     continue
                 init_state = init_states[ep_idx]
+                state_hash = init_state_hash(init_state)
+                identity = (suite, task_idx, ep_idx, state_hash)
+                if identity in seen:
+                    continue
+                seen.add(identity)
                 episodes.append(dict(
                     benchmark="libero_pro", suite=suite, task_idx=task_idx,
                     task_desc=task.language, ep_idx=ep_idx, init_state=init_state,
                     bddl_path=bddl_path, max_steps=max_steps,
-                    init_state_hash=init_state_hash(init_state), **desc))
+                    init_state_hash=state_hash,
+                    canonical_member=suite in CANONICAL_PRO_SUITES,
+                    expanded_member=suite in EXPANDED_PRO_SUITES,
+                    **desc))
     print(f"LIBERO-PRO episodes: {len(episodes)} ({len(suites)} suites)")
     return episodes

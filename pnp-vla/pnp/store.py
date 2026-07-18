@@ -337,6 +337,8 @@ class SupabaseStore:
             "suite_family": ep.get("suite_family"), "perturb_axis": ep.get("perturb_axis"),
             "perturb_strength": ep.get("perturb_strength"),
             "distractor_object": ep.get("distractor_object"),
+            "canonical_member": ep.get("canonical_member"),
+            "expanded_member": ep.get("expanded_member"),
             "max_steps": ep.get("max_steps"), "chunk_size": result.get("chunk_size"),
             "n_chunks": result["n_chunks"], "action_dim": ADIM,
             "episode_seed": result["episode_seed"], "config_hash": self.config_hash(logical),
