@@ -42,6 +42,30 @@ def _fix_torch_quant_compat() -> None:
     print(f"torch {torch.__version__} — quantization compat OK{suffix}")
 
 
+def _remove_broken_optional_torchaudio() -> None:
+    """Remove an incompatible Colab TorchAudio build before Transformers sees it.
+
+    Transformers treats an installed ``torchaudio`` distribution as available without first
+    checking that its native extension can load.  Colab can retain a CUDA 12.8 TorchAudio wheel
+    after Torch has moved to CUDA 13.0; importing ``AutoProcessor`` then fails even though pi0.5
+    does not use audio.  Keep a working TorchAudio installation, but remove a broken optional one.
+    """
+    if importlib.util.find_spec("torchaudio") is None:
+        return
+
+    try:
+        importlib.import_module("torchaudio")
+    except Exception as exc:
+        print(f"Removing incompatible optional torchaudio ({exc})")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchaudio"]
+        )
+        for name in tuple(sys.modules):
+            if name == "torchaudio" or name.startswith("torchaudio."):
+                sys.modules.pop(name, None)
+        importlib.invalidate_caches()
+
+
 def _restore_snapshot(cache_dir: str) -> None:
     snapshot = os.path.join(cache_dir, "site_packages.tar.gz")
     if os.path.exists(snapshot):
@@ -72,6 +96,7 @@ def setup_environment(cache_dir: str | None = None, hf_home: str = "/content/hf_
     os.environ["HF_HOME"] = hf_home
 
     _fix_torch_quant_compat()
+    _remove_broken_optional_torchaudio()
     _ensure("mujoco", "mujoco")
     _ensure("libero", "libero")
     try:
