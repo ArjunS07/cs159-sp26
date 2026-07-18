@@ -21,26 +21,25 @@ def _ensure(mod: str, pip_spec: str) -> None:
 
 
 def _fix_torch_quant_compat() -> None:
-    """Ensure torch.ao.quantization.CUSTOM_KEY exists (lerobot/diffusers need torch>=2.6).
+    """Provide quantization constants expected by the LeRobot/diffusers import chain.
 
-    Probe FUNCTIONALLY in a child process so the parent never imports torch (and never locks
-    torch._C). On mismatch, upgrade torch and restart the runtime if torch was already loaded.
+    Some Colab Torch builds contain quantization modules whose ``fx.convert`` module imports
+    these names from ``torch.ao.quantization`` even though that package does not export them.
+    The constants are dictionary keys, so supplying the canonical string values is sufficient
+    and avoids replacing Colab's matched Torch/CUDA stack at runtime.
     """
-    probe = "from torch.ao.quantization import CUSTOM_KEY"
-    ok = subprocess.run([sys.executable, "-c", probe], capture_output=True).returncode == 0
-    if not ok:
-        print("torch/quantization mismatch — upgrading torch (CUDA wheels)...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-U",
-                               "torch", "torchvision", "torchaudio"])
-        importlib.invalidate_caches()
-        if any(m == "torch" or m.startswith("torch.") for m in sys.modules):
-            print("torch upgraded — restarting runtime. Re-run this cell after the restart.")
-            sys.stdout.flush()
-            os.kill(os.getpid(), 9)
-    import torch  # noqa: F401
-    from torch.ao.quantization import CUSTOM_KEY  # noqa: F401
-    import torch as _t
-    print(f"torch {_t.__version__} — quantization compat OK")
+    import torch
+    import torch.ao.quantization as taoq
+
+    patched = []
+    for name, value in (("CUSTOM_KEY", "custom"),
+                        ("NUMERIC_DEBUG_HANDLE_KEY", "numeric_debug_handle")):
+        if not hasattr(taoq, name):
+            setattr(taoq, name, value)
+            patched.append(name)
+
+    suffix = f" (patched {', '.join(patched)})" if patched else ""
+    print(f"torch {torch.__version__} — quantization compat OK{suffix}")
 
 
 def _restore_snapshot(cache_dir: str) -> None:
