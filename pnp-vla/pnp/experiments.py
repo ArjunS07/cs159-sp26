@@ -25,7 +25,7 @@ EXPERIMENT = "libero-hybrid-schedules-k3-v1"
 
 
 def build_full_methods(schedules=SCHEDULES, k=K):
-    """The 20-config schedule matrix used on the historical hard-task cohort."""
+    """The 12-config refine-last matrix used on the historical hard-task cohort."""
     extra_steps = sorted({BASE_INFERENCE_STEPS + k * len(schedule) for schedule in schedules})
     methods = [
         (Method.UNCERTAINTY, RolloutConfig(
@@ -35,13 +35,9 @@ def build_full_methods(schedules=SCHEDULES, k=K):
     ]
     for schedule in schedules:
         probe = dict(pnp_steps=schedule, pnp_k=k)
-        methods.extend([
-            (Method.REFINEMENT, RolloutConfig(**probe, refine=True)),
-            (Method.REFINEMENT, RolloutConfig(
-                **probe, refine=True, refine_average=True)),
-        ])
-    if len(methods) != 20:
-        raise AssertionError(f"expected 20 full methods, got {len(methods)}")
+        methods.append((Method.REFINEMENT, RolloutConfig(**probe, refine=True)))
+    if len(methods) != 12:
+        raise AssertionError(f"expected 12 full methods, got {len(methods)}")
     return methods
 
 

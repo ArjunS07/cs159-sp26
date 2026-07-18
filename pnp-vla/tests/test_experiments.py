@@ -15,19 +15,21 @@ from pnp.store import SupabaseStore
 def test_automated_worker_matrices_are_complete_and_unique():
     full = build_full_methods()
     broad = build_broad_methods(full)
-    assert len(full) == 20
+    assert len(full) == 12
     assert len(broad) == 3
     assert len({
         SupabaseStore.config_hash(SupabaseStore._logical_key(name, config))
         for name, config in full
-    }) == 20
+    }) == 12
     assert [name for name, _ in broad] == [
         Method.UNCERTAINTY, Method.EXTRA_STEPS, Method.REFINEMENT,
     ]
     assert broad[1][1].num_inference_steps == 16
     assert broad[2][1].pnp_steps == (4, 5)
     assert not broad[2][1].refine_average
-    assert {config.pnp_steps for name, config in full if name == Method.REFINEMENT} == set(SCHEDULES)
+    refinements = [config for name, config in full if name == Method.REFINEMENT]
+    assert {config.pnp_steps for config in refinements} == set(SCHEDULES)
+    assert all(not config.refine_average for config in refinements)
 
 
 def test_automated_worker_shards_are_disjoint_and_complete():
