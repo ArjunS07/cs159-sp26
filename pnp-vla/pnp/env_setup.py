@@ -9,10 +9,12 @@ import importlib
 import importlib.metadata
 import importlib.util
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
+import warnings
 
 
 _QUANTIZATION_CONSTANTS = (
@@ -122,6 +124,30 @@ def _require_core_runtime():
     return torch, torchvision
 
 
+def _configure_runtime_output(torch: object) -> None:
+    """Silence known third-party setup/autotune chatter without hiding exceptions."""
+    # robosuite installs two handlers for the same optional-macros warning.
+    logging.getLogger("robosuite_logs").setLevel(logging.ERROR)
+    # max-autotune is valuable over a long rollout run, but its rejected-candidate diagnostics
+    # are not actionable. Actual compilation exceptions still propagate normally.
+    logging.getLogger("torch._inductor").setLevel(logging.CRITICAL)
+    logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.CRITICAL)
+    try:
+        torch._logging.set_logs(inductor=logging.CRITICAL)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    warnings.filterwarnings(
+        "ignore",
+        message=r"datetime\.datetime\.utcnow\(\) is deprecated.*",
+        category=DeprecationWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"TypedStorage is deprecated.*",
+        category=UserWarning,
+    )
+
+
 def _require_hf_credentials() -> str:
     """Accept HF_TOKEN or a token already stored by huggingface_hub."""
     token = os.getenv("HF_TOKEN")
@@ -198,6 +224,7 @@ def setup_environment(hf_home: str = "/content/hf_home") -> None:
     os.environ["HF_HOME"] = hf_home
 
     torch, torchvision = _require_core_runtime()
+    _configure_runtime_output(torch)
     patched = _fix_torch_quant_compat()
     if patched:
         print(f"Patched Torch quantization constants: {', '.join(patched)}")

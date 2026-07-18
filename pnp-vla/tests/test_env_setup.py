@@ -85,6 +85,18 @@ class LiberoConfigTests(unittest.TestCase):
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def test_runtime_output_filters_only_known_noise(self):
+        torch = types.SimpleNamespace(
+            _logging=types.SimpleNamespace(set_logs=mock.Mock()),
+        )
+        with mock.patch.object(env_setup.logging, "getLogger") as get_logger, \
+                mock.patch.object(env_setup.warnings, "filterwarnings") as filterwarnings:
+            env_setup._configure_runtime_output(torch)
+
+        torch._logging.set_logs.assert_called_once_with(inductor=env_setup.logging.CRITICAL)
+        self.assertEqual(get_logger.call_count, 3)
+        self.assertEqual(filterwarnings.call_count, 2)
+
     def test_mujoco_310_api_is_rejected_before_rollout(self):
         mujoco = types.SimpleNamespace(__version__="3.10.0")
         with self.assertRaisesRegex(RuntimeError, r"mj_fullM\(model, data, dst\)"):
