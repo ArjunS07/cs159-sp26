@@ -27,7 +27,7 @@ os.environ["HF_TOKEN"]             = userdata.get("HF_TOKEN")
 os.environ["WANDB_API_KEY"]        = userdata.get("WANDB_API_KEY")
 GH_PAT = userdata.get("GH_PAT")
 REPO_DIR = "/content/cs159-sp26"
-GIT_REF = "refactor/pnp-vla"  # Change to "main" after the refactor is merged.
+GIT_REF = "main"  # Change to "main" after the refactor is merged.
 ![ -d "$REPO_DIR/.git" ] || git clone -q --branch "$GIT_REF" https://$GH_PAT@github.com/ArjunS07/cs159-sp26.git "$REPO_DIR"
 !git -C "$REPO_DIR" fetch -q origin "$GIT_REF"
 !git -C "$REPO_DIR" checkout -q "$GIT_REF"
