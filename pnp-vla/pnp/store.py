@@ -289,7 +289,9 @@ class SupabaseStore:
 
     @staticmethod
     def _dim_cols(vec, prefix):
-        vec = list(vec or [])
+        # NumPy arrays deliberately reject boolean coercion (``vec or []``),
+        # because it is ambiguous for vectors with more than one element.
+        vec = [] if vec is None else list(vec)
         return {f"{prefix}{i}": (float(vec[i]) if i < len(vec) else None) for i in range(ADIM)}
 
     def _recorder_to_rows(self, rec_ep, chunk_noise_seeds):
