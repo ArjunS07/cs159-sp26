@@ -337,8 +337,6 @@ class SupabaseStore:
             "suite_family": ep.get("suite_family"), "perturb_axis": ep.get("perturb_axis"),
             "perturb_strength": ep.get("perturb_strength"),
             "distractor_object": ep.get("distractor_object"),
-            "canonical_member": ep.get("canonical_member"),
-            "expanded_member": ep.get("expanded_member"),
             "max_steps": ep.get("max_steps"), "chunk_size": result.get("chunk_size"),
             "n_chunks": result["n_chunks"], "action_dim": ADIM,
             "episode_seed": result["episode_seed"], "config_hash": self.config_hash(logical),
@@ -350,6 +348,11 @@ class SupabaseStore:
             "nan_action_count": result["nan_action_count"], "n_vf_evals": result["n_vf_evals"],
             **denorm, **summary, **result["instability"],
         }
+        # Keep stock LIBERO compatible with pre-cohort schemas. PRO manifests carry these keys
+        # and require the idempotent migration at the bottom of supabase/schema.sql.
+        for cohort_key in ("canonical_member", "expanded_member"):
+            if cohort_key in ep:
+                row[cohort_key] = ep[cohort_key]
         if config.correction_lambda is not None:
             row.update(correction_lambda=config.correction_lambda, q_gate=config.q_gate,
                        correction_steps=list(config.pnp_steps),
