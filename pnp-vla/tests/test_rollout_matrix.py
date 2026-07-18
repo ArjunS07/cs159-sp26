@@ -37,13 +37,13 @@ def test_full_rollout_matrix_is_complete_and_unique():
         (2, 3), (3, 4), (4, 5), (5, 6), (7, 8),
         (1, 3, 5, 7, 9), (3, 6, 9), (2, 5, 8),
     )
-    assert len(methods) == 27
+    assert len(methods) == 20
 
     hashes = {
         SupabaseStore.config_hash(SupabaseStore._logical_key(name, config))
         for name, config in methods
     }
-    assert len(hashes) == 27
+    assert len(hashes) == 20
 
     controls = sorted(
         config.num_inference_steps
@@ -53,8 +53,13 @@ def test_full_rollout_matrix_is_complete_and_unique():
     assert controls == [16, 19, 25]
 
     observed = [config for name, config in methods if name == Method.UNCERTAINTY]
-    assert len(observed) == 8
-    assert [config.pnp_steps for config in observed if config.save_pcp_features] == [(7, 8)]
+    assert len(observed) == 1
+    assert observed[0].pnp_steps == tuple(range(1, 10))
+    assert observed[0].save_pcp_features
+
+    refinements = [config for name, config in methods if name == Method.REFINEMENT]
+    assert len(refinements) == 16
+    assert {config.pnp_steps for config in refinements} == set(schedules)
 
 
 def test_pro_manifest_is_a_stable_deduplicated_union():
@@ -64,4 +69,3 @@ def test_pro_manifest_is_a_stable_deduplicated_union():
     assert UNION_PRO_SUITES == list(dict.fromkeys(
         CANONICAL_PRO_SUITES + EXPANDED_PRO_SUITES
     ))
-

@@ -5,7 +5,7 @@ Handles both legacy schemas:
   - the pnp_pro schema (has `pnp_enabled` / `pnp_mode`, no `method`)
 
 Excludes synthetic `synthbase_`-prefixed rows. Each source DB is tagged with a trust level
-(--trust post_fix|pre_fix) -> sampler_algo_version 2|1, so pre-RNG-fix data is separable by
+(--trust post_fix|pre_fix) -> sampler_algo_version 1|0, so pre-RNG-fix data is separable by
 data. The DBs live on the user's Drive; run this wherever they are reachable.
 
 Usage:
@@ -89,7 +89,7 @@ def _jsonparse(v):
 
 def backfill_db(path: str, trust: str, dry_run: bool, limit: int | None):
     source = os.path.basename(path)
-    algo_version = 2 if trust == "post_fix" else 1
+    algo_version = 1 if trust == "post_fix" else 0
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     have = _cols(con, "rollouts")

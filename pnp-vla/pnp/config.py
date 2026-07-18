@@ -15,7 +15,7 @@ from typing import Optional, Sequence
 SCHEMA_VERSION = 1
 # Bump whenever P&P/PCP sampling SEMANTICS change (e.g. the RNG-isolation fix), so
 # results produced by different algorithm versions are separable *by data*.
-SAMPLER_ALGO_VERSION = 2  # v2 == post-RNG-isolation (dedicated perturbation generator)
+SAMPLER_ALGO_VERSION = 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LIBERO / simulator constants
