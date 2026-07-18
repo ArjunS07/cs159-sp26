@@ -85,3 +85,10 @@ and print it before starting the run rather than hard-coding a historical count.
 5. Assert only the shared observed arm enables the PCP feature sink.
 6. Run one identity through all 20 configurations and verify Supabase rows, uncertainty rows,
    PCP artifacts, resumption, and failure-free environment teardown before the full launch.
+
+## Automated Colab workers
+
+The six stable launchers under `notebooks/workers/` contain only repository bootstrap,
+environment setup, and a fixed shard index. The hybrid driver and matrices live in
+`pnp.experiments`, so code/configuration updates are made once and picked up by every launcher on
+restart. See `notebooks/workers/README.md` for direct Colab links and recovery instructions.
