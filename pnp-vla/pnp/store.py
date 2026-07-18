@@ -49,7 +49,9 @@ def gather_provenance(model_repo_id: str = PI05_REPO_ID, model_revision: str = "
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     prov: dict[str, Any] = {
         "pnp_git_sha": _git("rev-parse", "HEAD", cwd=here),
-        "git_dirty": bool(_git("status", "--porcelain", cwd=here)),
+        # The package lives inside a larger repository. Limit dirty-state provenance to
+        # pnp-vla so changes to legacy files elsewhere in the repository do not taint a run.
+        "git_dirty": bool(_git("status", "--porcelain", "--", ".", cwd=here)),
         "pnp_version": _pkg_version("pnp"),
         "sampler_algo_version": SAMPLER_ALGO_VERSION,
         "schema_version": SCHEMA_VERSION,
