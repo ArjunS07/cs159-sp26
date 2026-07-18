@@ -21,7 +21,8 @@ analysis/       local scripts: read Supabase -> tables/figures
 
 Start from a **fresh Colab GPU runtime**. The `sim` extra pins Transformers 5.5.4,
 LeRobot commit `01dcb4c29222bc9f2388cebf87f0e79965a9508b`, LIBERO 0.1.1, and MuJoCo
-`>=3.1.6,<4`. Colab's native Torch/TorchVision/CUDA stack is authoritative and is never
+`>=3.1.6,<3.10`. MuJoCo 3.10 changed `mj_fullM` incompatibly with LIBERO's bundled
+robosuite. Colab's native Torch/TorchVision/CUDA stack is authoritative and is never
 upgraded by `setup_environment()`.
 
 ```python

@@ -9,6 +9,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 
@@ -113,6 +114,7 @@ def _verify_model_and_sim_imports() -> dict[str, object]:
         getattr(factory, "make_pre_post_processors")
         libero = importlib.import_module("libero")
         mujoco = importlib.import_module("mujoco")
+        _require_robosuite_mujoco_api(mujoco)
         lerobot = importlib.import_module("lerobot")
     except Exception as exc:
         raise RuntimeError(
@@ -127,6 +129,18 @@ def _verify_model_and_sim_imports() -> dict[str, object]:
         "LIBERO": libero,
         "MuJoCo": mujoco,
     }
+
+
+def _require_robosuite_mujoco_api(mujoco: object) -> None:
+    """Reject MuJoCo's 3.10 API, which legacy robosuite cannot call."""
+    version = _version(mujoco, "mujoco")
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match and tuple(map(int, match.groups())) >= (3, 10):
+        raise RuntimeError(
+            f"MuJoCo {version} uses mj_fullM(model, data, dst), but LIBERO's robosuite "
+            "requires the pre-3.10 mj_fullM(model, dst, qM) API. Install the pinned "
+            "pnp-vla[sim] dependencies in a fresh runtime (mujoco>=3.1.6,<3.10)."
+        )
 
 
 def _version(module: object, distribution: str) -> str:

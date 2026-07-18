@@ -57,6 +57,15 @@ class OptionalPackageTests(unittest.TestCase):
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def test_mujoco_310_api_is_rejected_before_rollout(self):
+        mujoco = types.SimpleNamespace(__version__="3.10.0")
+        with self.assertRaisesRegex(RuntimeError, r"mj_fullM\(model, data, dst\)"):
+            env_setup._require_robosuite_mujoco_api(mujoco)
+
+    def test_pre_310_mujoco_api_is_accepted(self):
+        mujoco = types.SimpleNamespace(__version__="3.9.0")
+        env_setup._require_robosuite_mujoco_api(mujoco)
+
     def test_core_incompatibility_is_actionable_and_does_not_install(self):
         torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
         with mock.patch.object(env_setup.importlib, "import_module", return_value=torch), \
