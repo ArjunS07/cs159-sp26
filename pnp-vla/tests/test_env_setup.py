@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import types
@@ -54,6 +55,33 @@ class OptionalPackageTests(unittest.TestCase):
         with mock.patch.object(env_setup.importlib.util, "find_spec", return_value=object()):
             self.assertTrue(env_setup._remove_torchao())
         uninstall.assert_called_once_with("torchao")
+
+
+class LiberoConfigTests(unittest.TestCase):
+    def test_default_config_is_created_without_import_or_input(self):
+        with self.subTest("first setup creates the config"):
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as root:
+                package_root = os.path.join(root, "site", "libero")
+                inner_root = os.path.join(package_root, "libero")
+                os.makedirs(inner_root)
+                open(os.path.join(inner_root, "__init__.py"), "w").close()
+                config_dir = os.path.join(root, "config")
+                spec = types.SimpleNamespace(submodule_search_locations=[package_root])
+                with mock.patch.object(env_setup.importlib.util, "find_spec", return_value=spec):
+                    self.assertTrue(env_setup._ensure_libero_config(config_dir))
+
+                with open(os.path.join(config_dir, "config.yaml")) as handle:
+                    config = json.load(handle)
+                self.assertEqual(config["benchmark_root"], inner_root)
+                self.assertEqual(config["bddl_files"], os.path.join(inner_root, "bddl_files"))
+                self.assertTrue(os.path.isdir(config["datasets"]))
+
+                with self.subTest("later setup preserves the existing config"):
+                    with mock.patch.object(env_setup.importlib.util, "find_spec") as find_spec:
+                        self.assertFalse(env_setup._ensure_libero_config(config_dir))
+                    find_spec.assert_not_called()
 
 
 class RuntimeValidationTests(unittest.TestCase):

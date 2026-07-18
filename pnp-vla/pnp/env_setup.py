@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -19,6 +20,42 @@ _QUANTIZATION_CONSTANTS = (
     ("NUMERIC_DEBUG_HANDLE_KEY", "numeric_debug_handle"),
     ("FROM_NODE_KEY", "from_node"),
 )
+
+
+def _ensure_libero_config(config_dir: str | None = None) -> bool:
+    """Create LIBERO's default path config before its import-time input prompt runs.
+
+    Existing configs are never changed. JSON is valid YAML, so this avoids importing LIBERO
+    (or even PyYAML) while preparing the file that its package initializer expects.
+    """
+    config_dir = config_dir or os.getenv("LIBERO_CONFIG_PATH", os.path.expanduser("~/.libero"))
+    config_file = os.path.join(config_dir, "config.yaml")
+    if os.path.exists(config_file):
+        return False
+
+    spec = importlib.util.find_spec("libero")
+    locations = list(spec.submodule_search_locations or []) if spec else []
+    if not locations:
+        # The later import validation reports the actionable missing-package error.
+        return False
+
+    package_root = locations[0]
+    inner_root = os.path.join(package_root, "libero")
+    benchmark_root = inner_root if os.path.isfile(os.path.join(inner_root, "__init__.py")) \
+        else package_root
+    paths = {
+        "benchmark_root": benchmark_root,
+        "bddl_files": os.path.join(benchmark_root, "bddl_files"),
+        "init_states": os.path.join(benchmark_root, "init_files"),
+        "datasets": os.path.normpath(os.path.join(benchmark_root, "..", "datasets")),
+        "assets": os.path.join(benchmark_root, "assets"),
+    }
+    os.makedirs(config_dir, exist_ok=True)
+    os.makedirs(paths["datasets"], exist_ok=True)
+    with open(config_file, "x", encoding="utf-8") as handle:
+        json.dump(paths, handle, indent=2)
+    print(f"Initialized LIBERO default paths at {config_file} (noninteractive).")
+    return True
 
 
 def _fix_torch_quant_compat() -> tuple[str, ...]:
@@ -167,6 +204,7 @@ def setup_environment(hf_home: str = "/content/hf_home") -> None:
     _remove_torchao()
     _remove_broken_optional_torchaudio()
     _require_hf_credentials()
+    _ensure_libero_config()
     modules = _verify_model_and_sim_imports()
 
     try:
