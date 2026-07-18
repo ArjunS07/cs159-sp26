@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pnp"
+version = "0.1.0"
+description = "Predict-and-Perturb / Predict-Correct-Perturb inference for pi0.5 on LIBERO / LIBERO-PRO"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "imageio",
+    "imageio-ffmpeg",
+    "tqdm",
+    "supabase>=2.0",
+    "pandas",
+    "pyarrow",
+    "wandb",
+]
+
+[project.optional-dependencies]
+# Heavy sim/model deps — installed in Colab (GPU). Kept optional so the package
+# imports (config, store, analysis helpers) work locally without a GPU stack.
+sim = [
+    "mujoco",
+    "libero",
+    "lerobot[pi0]",
+]
+analysis = [
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "seaborn",
+]
+
+[tool.setuptools.packages.find]
+include = ["pnp*"]
