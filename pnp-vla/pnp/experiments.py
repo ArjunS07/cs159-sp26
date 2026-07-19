@@ -22,6 +22,7 @@ FULL_ABLATION_TASKS = {
 }
 LIBERO_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 EXPERIMENT = "libero-hybrid-schedules-k3-v1"
+PRO_EXPERIMENT = "libero-pro-canonical-core-k3-v1"
 
 
 def build_full_methods(schedules=SCHEDULES, k=K):
@@ -56,6 +57,20 @@ def build_broad_methods(full_methods=None):
     return methods
 
 
+def build_pro_methods(k=K):
+    """Canonical PRO core: observed/PCP + matched compute + established refinement."""
+    methods = [
+        (Method.UNCERTAINTY, RolloutConfig(
+            pnp_steps=OBSERVED_STEPS, pnp_k=k, save_pcp_features=True)),
+        (Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=16)),
+        (Method.REFINEMENT, RolloutConfig(
+            pnp_steps=(4, 5), pnp_k=k, refine=True)),
+    ]
+    if len(methods) != 3:
+        raise AssertionError(f"expected 3 PRO methods, got {len(methods)}")
+    return methods
+
+
 def identity_shard(episodes, shard_count: int, shard_index: int):
     """Return a stable, disjoint identity shard independent of input ordering."""
     if shard_count < 1 or not 0 <= shard_index < shard_count:
@@ -84,8 +99,39 @@ def _prepare_libero_episodes():
     return episodes
 
 
+def _prepare_libero_pro_episodes():
+    """Install the official canonical assets and build exactly 600 PRO identities."""
+    from . import libero_pro
+
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+        pro_dir = libero_pro.clone_libero_pro()
+        libero_pro.install_assets(
+            suites=libero_pro.CANONICAL_PRO_SUITES, pro_dir=pro_dir)
+        libero_pro.apply_env_patches(pro_dir=pro_dir)
+        libero_pro.patch_torch_load()
+        benchmark_dict = libero_pro.reload_benchmark()
+        episodes = libero_pro.build_libero_pro_episodes(
+            benchmark_dict, suites=libero_pro.CANONICAL_PRO_SUITES,
+            episode_idxs=range(10))
+    identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in episodes
+    }
+    if len(episodes) != 600 or len(identities) != 600:
+        tail = captured.getvalue()[-2000:]
+        raise AssertionError(
+            f"expected 600 unique canonical PRO identities, got "
+            f"{len(episodes)} rows/{len(identities)} identities\n{tail}")
+    if not all(ep["canonical_member"] for ep in episodes):
+        raise AssertionError("canonical PRO manifest contains a non-canonical identity")
+    print("LIBERO-PRO canonical manifest: 600 identities x 3 configs = 1800 rollouts")
+    return episodes
+
+
 def _run_collection(*, store, policy, preprocess, postprocess, device, experiment, episodes,
-                    methods, cohort, shard_count, shard_index):
+                    methods, cohort, shard_count, shard_index,
+                    benchmark="libero", driver="hybrid_schedules", run_metadata=None):
     from tqdm.auto import tqdm
     from .rollout import iter_task_envs, run_episode
 
@@ -97,11 +143,16 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     )
     print(f"{cohort}: {len(episodes)} identities x {len(methods)} configs; "
           f"{pending}/{expected} pending")
+    refinement_schedules = [
+        config.pnp_steps for name, config in methods if name == Method.REFINEMENT
+    ]
+    run_config = {"cohort": cohort, "schedules": refinement_schedules, "pnp_k": K,
+                  "n_configs": len(methods), "shard_count": shard_count,
+                  "shard_index": shard_index}
+    run_config.update(run_metadata or {})
     store.start_run(
-        driver="hybrid_schedules", benchmark="libero", experiment=experiment,
-        config={"cohort": cohort, "schedules": SCHEDULES, "pnp_k": K,
-                "n_configs": len(methods), "shard_count": shard_count,
-                "shard_index": shard_index},
+        driver=driver, benchmark=benchmark, experiment=experiment,
+        config=run_config,
     )
     completed = 0
     try:
@@ -153,4 +204,26 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
         experiment=experiment, episodes=broad, methods=broad_methods,
         cohort="broad_validation", shard_count=shard_count, shard_index=shard_index,
+    )
+
+
+def run_libero_pro_worker(*, shard_count: int, shard_index: int,
+                          experiment: str = PRO_EXPERIMENT):
+    """Run one of six disjoint shards of the 600-identity canonical PRO core plan."""
+    from . import libero_pro, models
+
+    episodes = identity_shard(_prepare_libero_pro_episodes(), shard_count, shard_index)
+    methods = build_pro_methods()
+    expected = len(episodes) * len(methods)
+    print(f"PRO worker {shard_index}/{shard_count}: {len(episodes)} identities x "
+          f"{len(methods)} configs = {expected} rollouts")
+    policy, preprocess, postprocess = models.load_pi05()
+    device = models.default_device()
+    store = SupabaseStore()
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
+        experiment=experiment, episodes=episodes, methods=methods,
+        cohort="canonical", shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="canonical_pro_core",
+        run_metadata={"libero_pro_revision": libero_pro.LIBERO_PRO_REVISION},
     )

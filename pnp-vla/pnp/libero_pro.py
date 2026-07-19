@@ -26,6 +26,7 @@ import sys
 from .config import MAX_STEPS_MAP, LIBERO_PRO_MAX_STEPS
 
 LIBERO_PRO_REPO = "https://github.com/Zxy-MLlab/LIBERO-PRO.git"
+LIBERO_PRO_REVISION = "eafdb809426b13153aa1e4c42d6601844217dfec"
 PRO_SUFFIXES = ("_lan", "_swap", "_object", "_task", "_env", "_temp")
 
 TEMP_TASKS = [
@@ -73,10 +74,45 @@ def libero_site() -> str:
 # Setup (Colab-only; mutates the installed libero package)
 # ─────────────────────────────────────────────────────────────────────────────
 def clone_libero_pro(dest: str = "/content/LIBERO-PRO") -> str:
-    if not os.path.isdir(dest):
-        import subprocess
-        subprocess.check_call(["git", "clone", "--depth=1", LIBERO_PRO_REPO, dest])
+    import subprocess
+    if not os.path.isdir(os.path.join(dest, ".git")):
+        os.makedirs(dest, exist_ok=True)
+        subprocess.check_call(["git", "-C", dest, "init"])
+        subprocess.check_call([
+            "git", "-C", dest, "remote", "add", "origin", LIBERO_PRO_REPO])
+    subprocess.check_call([
+        "git", "-C", dest, "fetch", "--depth=1", "origin", LIBERO_PRO_REVISION])
+    subprocess.check_call([
+        "git", "-C", dest, "checkout", "--detach", LIBERO_PRO_REVISION])
     return dest
+
+
+def install_assets(*, suites=None, site: str | None = None,
+                   pro_dir: str = "/content/LIBERO-PRO") -> str:
+    """Install selected official BDDL/init assets from the LIBERO-PRO clone.
+
+    Re-running this function is safe: identical files are copied over the prior installation.
+    Restricting the copy to the requested suites keeps the canonical 600-identity run independent
+    of expanded-cohort additions in the upstream repository.
+    """
+    suites = list(dict.fromkeys(suites or CANONICAL_PRO_SUITES))
+    site = site or libero_site()
+    asset_root = os.path.join(pro_dir, "libero", "libero")
+    for kind, suffix in (("bddl_files", ".bddl"), ("init_files", ".pruned_init")):
+        for suite in suites:
+            src = os.path.join(asset_root, kind, suite)
+            if not os.path.isdir(src):
+                raise FileNotFoundError(f"official LIBERO-PRO assets missing {kind}/{suite}")
+            files = [name for name in os.listdir(src) if name.endswith(suffix)]
+            if len(files) != 10:
+                raise RuntimeError(
+                    f"expected 10 {suffix} files for {suite}, found {len(files)}")
+            dst = os.path.join(site, kind, suite)
+            os.makedirs(dst, exist_ok=True)
+            for name in files:
+                shutil.copy2(os.path.join(src, name), os.path.join(dst, name))
+    print(f"installed official assets for {len(suites)} LIBERO-PRO suites")
+    return asset_root
 
 
 def apply_env_patches(site: str | None = None, pro_dir: str = "/content/LIBERO-PRO") -> None:
