@@ -32,6 +32,12 @@ subprocess.run([
     sys.executable, "-m", "pip", "install", "-q", "-e", f"{repo_dir}/pnp-vla[sim]",
 ], check=True)
 
+# Editable installs add a .pth file that a fresh interpreter would process at startup. This
+# notebook interpreter was already running during pip, so expose the source tree immediately.
+package_dir = f"{repo_dir}/pnp-vla"
+if package_dir not in sys.path:
+    sys.path.insert(0, package_dir)
+
 import pnp
 print("Loaded pnp from:", pnp.__file__)
 '''

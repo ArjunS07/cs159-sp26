@@ -79,6 +79,7 @@ def test_six_launchers_have_fixed_unique_indices():
         assert "SHARD_COUNT = 6" in source
         assert f"SHARD_INDEX = {index}" in source
         assert "run_libero_hybrid_worker" in source
+        assert "sys.path.insert(0, package_dir)" in source
 
 
 def test_six_pro_launchers_have_fixed_unique_indices():
@@ -93,3 +94,4 @@ def test_six_pro_launchers_have_fixed_unique_indices():
         assert "SHARD_COUNT = 6" in source
         assert f"SHARD_INDEX = {index}" in source
         assert "run_libero_pro_worker" in source
+        assert "sys.path.insert(0, package_dir)" in source
