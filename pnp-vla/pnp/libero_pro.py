@@ -214,11 +214,39 @@ def patch_torch_load() -> None:
     print("torch.load patched (weights_only=False default).")
 
 
+def _with_dynamic_suites(_bm, libero_task_map):
+    """Add lightweight Benchmark subclasses for task-map suites lacking named classes."""
+    bd = dict(_bm.get_benchmark_dict())
+    for suite in libero_task_map:
+        if suite in bd or not _bm.task_maps.get(suite):
+            continue
+
+        def make_suite_class(suite_name):
+            class DynamicSuite(_bm.Benchmark):
+                def __init__(self, task_order_index=0):
+                    super().__init__(task_order_index=task_order_index)
+                    self.name = suite_name
+                    self._make_benchmark()
+
+            DynamicSuite.__name__ = f"LIBERO_DYNAMIC_{suite_name.upper()}"
+            return DynamicSuite
+
+        bd[suite] = make_suite_class(suite)
+    return bd
+
+
 def reload_benchmark():
-    """importlib.reload the benchmark module after patching, return get_benchmark_dict()."""
+    """Reload patched task maps and return built-in plus dynamically registered suites."""
+    import libero.libero.benchmark.libero_suite_task_map as _task_map
     from libero.libero import benchmark as _bm
+
+    # apply_env_patches edits libero_suite_task_map.py after LIBERO was initially imported.
+    # Reload it first; otherwise benchmark's `from ... import libero_task_map` sees the stale
+    # in-memory dictionary and the position-perturbation suites disappear.
+    importlib.reload(_task_map)
     importlib.reload(_bm)
-    bd = _bm.get_benchmark_dict()
+
+    bd = _with_dynamic_suites(_bm, _task_map.libero_task_map)
     print(f"benchmark reloaded ({len(bd)} suites)")
     return bd
 

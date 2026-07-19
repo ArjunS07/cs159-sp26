@@ -6,6 +6,7 @@ from pnp.libero_pro import (
     CANONICAL_PRO_SUITES,
     EXPANDED_PRO_SUITES,
     UNION_PRO_SUITES,
+    _with_dynamic_suites,
 )
 from pnp.store import SupabaseStore
 
@@ -101,3 +102,35 @@ def test_pro_manifest_is_a_stable_deduplicated_union():
     assert UNION_PRO_SUITES == list(dict.fromkeys(
         CANONICAL_PRO_SUITES + EXPANDED_PRO_SUITES
     ))
+
+
+def test_dynamic_pro_suite_registration_fills_task_map_only_suites():
+    class Benchmark:
+        def __init__(self, task_order_index=0):
+            self.task_order_index = task_order_index
+
+        def _make_benchmark(self):
+            self.tasks = list(FakeBenchmark.task_maps[self.name].values())
+            self.n_tasks = len(self.tasks)
+
+    class BuiltIn(Benchmark):
+        pass
+
+    class FakeBenchmark:
+        task_maps = {
+            "built_in": {"a": object()},
+            "libero_object_temp_x0.1": {"a": object(), "b": object()},
+        }
+
+        @staticmethod
+        def get_benchmark_dict():
+            return {"built_in": BuiltIn}
+
+    FakeBenchmark.Benchmark = Benchmark
+
+    result = _with_dynamic_suites(
+        FakeBenchmark, {"built_in": ["a"], "libero_object_temp_x0.1": ["a", "b"]})
+    assert result["built_in"] is BuiltIn
+    dynamic = result["libero_object_temp_x0.1"]()
+    assert dynamic.name == "libero_object_temp_x0.1"
+    assert dynamic.n_tasks == 2
