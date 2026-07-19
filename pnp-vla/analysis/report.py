@@ -80,6 +80,140 @@ def success_figure(table: pd.DataFrame, output: Path) -> None:
     plt.close(fig)
 
 
+def _save_figure(fig, name: str, output: Path) -> None:
+    figures = output / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(figures / f"{name}.pdf", bbox_inches="tight")
+    fig.savefig(figures / f"{name}.png", dpi=200, bbox_inches="tight")
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
+    """Render every defensible figure supported by the rollout-only snapshot."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Full-ablation configuration SR: exact conditions, Wilson intervals, full 0-100 axis.
+    frame = tables["success_full_ablation"].sort_values("sr")
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.barh([f"{x} (n={n})" for x, n in zip(frame.condition_label, frame.n)], 100 * frame.sr,
+            xerr=np.vstack((100 * (frame.sr - frame.ci_low), 100 * (frame.ci_high - frame.sr))),
+            capsize=3, color="#4C78A8")
+    ax.set(xlim=(0, 100), xlabel="Success rate (%)",
+           title="Full-ablation success by exact configuration")
+    _save_figure(fig, "success_full_ablation", output)
+
+    # Paired effect forest plot, split by cohort and with a zero reference.
+    frame = tables["paired_comparisons"].sort_values(["cohort", "delta_pp"])
+    labels = [f"{r.condition_label} — {r.cohort} (n={r.n})" for r in frame.itertuples()]
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.errorbar(frame.delta_pp, labels,
+                xerr=np.vstack((frame.delta_pp - frame.delta_ci_low_pp,
+                                frame.delta_ci_high_pp - frame.delta_pp)),
+                fmt="o", capsize=3, color="#E45756")
+    ax.axvline(0, color="black", lw=1); ax.set_xlabel("Paired success-rate difference (pp)")
+    ax.set_title("Paired effects versus observed/no-op baseline")
+    _save_figure(fig, "paired_effects", output)
+
+    # Discordant transitions make both recovery and degradation visible.
+    frame = tables["paired_comparisons"].sort_values(["cohort", "condition_label"])
+    y = np.arange(len(frame)); fig, ax = plt.subplots(figsize=(10, 7))
+    ax.barh(y, frame.F_to_S, label="F→S recovery", color="#54A24B")
+    ax.barh(y, -frame.S_to_F, label="S→F degradation", color="#E45756")
+    ax.set_yticks(y, [f"{r.condition_label} — {r.cohort} (n={r.n})" for r in frame.itertuples()])
+    ax.axvline(0, color="black", lw=.8); ax.set_xlabel("Discordant pairs (degradation ← 0 → recovery)")
+    ax.set_title("Paired outcome transitions"); ax.legend()
+    _save_figure(fig, "paired_transitions", output)
+
+    # Pooled and suite-specific detector ROC-AUC with bootstrap intervals.
+    suite = tables["detector_by_suite"].copy()
+    pooled = tables["detector_summary"].query("estimate_scope == 'pooled'").iloc[0]
+    labels = ["pooled"] + suite.suite.tolist()
+    auc = np.r_[pooled.roc_auc, suite.roc_auc]
+    low = np.r_[pooled.roc_ci_low, suite.roc_ci_low]
+    high = np.r_[pooled.roc_ci_high, suite.roc_ci_high]
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.errorbar(auc, labels, xerr=np.vstack((auc - low, high - auc)), fmt="o", capsize=3)
+    ax.axvline(.5, color="black", ls="--", lw=1); ax.set_xlim(0, 1)
+    ax.set_xlabel("ROC-AUC (identity-bootstrap 95% CI)"); ax.set_title("Observed-arm failure detector")
+    _save_figure(fig, "detector_auc_by_suite", output)
+
+    # Seven action dimensions and declared aggregate scores.
+    frame = tables["detector_per_dof"].sort_values("roc_auc")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.barh(frame.score, frame.roc_auc, color="#72B7B2")
+    ax.axvline(.5, color="black", ls="--", lw=1); ax.set_xlim(0, 1)
+    ax.set_xlabel("ROC-AUC"); ax.set_title("Observed-arm detector by action dimension")
+    _save_figure(fig, "detector_per_dof", output)
+
+    # Early telemetry is prospective; full episode is the complete observed trajectory.
+    frame = tables["detector_early_window"]
+    fig, ax = plt.subplots(figsize=(6, 4))
+    x = np.arange(len(frame)); width = .36
+    ax.bar(x - width / 2, frame.roc_auc, width, label="ROC-AUC")
+    ax.bar(x + width / 2, frame.pr_auc, width, label="PR-AUC")
+    ax.set_xticks(x, frame.window); ax.set_ylim(0, 1); ax.set_ylabel("Area under curve")
+    ax.set_title("Early-window versus full-episode detector"); ax.legend()
+    _save_figure(fig, "detector_early_window", output)
+
+    # Outcome-conditioned score summaries (raw refinement scores are intentionally absent).
+    frame = tables["detector_score_distribution"].sort_values("fail")
+    labels = ["success" if not bool(x) else "failure" for x in frame.fail]
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.errorbar(labels, frame["mean"], yerr=frame["std"], fmt="o", capsize=5, label="mean ± SD")
+    ax.scatter(labels, frame["median"], marker="D", label="median")
+    ax.set_ylabel("Mean episode uncertainty"); ax.set_title("Observed-arm uncertainty by outcome")
+    ax.legend(); _save_figure(fig, "detector_score_by_outcome", output)
+
+    # Reliability is descriptive because uncertainty is a ranking score, not a fitted probability.
+    frame = tables["detector_reliability"]
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(frame.mean_score, frame.observed_failure_rate, marker="o")
+    for row in frame.itertuples(): ax.annotate(f"n={row.n}", (row.mean_score, row.observed_failure_rate), fontsize=7)
+    ax.set(xlabel="Mean uncertainty in bin", ylabel="Observed failure rate", ylim=(0, 1),
+           title="Observed-arm reliability by uncertainty decile")
+    _save_figure(fig, "detector_reliability", output)
+
+    frame = tables["detector_risk_coverage"]
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(100 * frame.coverage, 100 * frame.risk, marker="o")
+    ax.set(xlabel="Coverage retained (%)", ylabel="Failure risk (%)", xlim=(0, 100),
+           title="Observed-arm risk–coverage curve")
+    _save_figure(fig, "detector_risk_coverage", output)
+
+    # Cross-validated threshold results; thresholds were selected on training folds only.
+    frame = tables["detector_threshold_cross_validation"]
+    metrics = ["precision", "recall", "specificity", "accuracy"]
+    means, errors = frame[metrics].mean(), frame[metrics].std(ddof=1)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(metrics, means, yerr=errors, capsize=4, color="#F58518")
+    ax.set_ylim(0, 1); ax.set_ylabel("Held-out fold metric (mean ± SD)")
+    ax.set_title("Cross-validated detector threshold performance")
+    _save_figure(fig, "detector_threshold_cv", output)
+
+    # Observed behavioral baseline by suite, with Wilson intervals and 0-100 axis.
+    frame = tables["observed_success_by_suite"].sort_values("sr")
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.barh([f"{s} (n={n})" for s, n in zip(frame.suite, frame.n)], 100 * frame.sr,
+            xerr=np.vstack((100 * (frame.sr - frame.ci_low), 100 * (frame.ci_high - frame.sr))),
+            capsize=3, color="#4C78A8")
+    ax.set(xlim=(0, 100), xlabel="Observed/no-op success rate (%)", title="Observed baseline by suite")
+    _save_figure(fig, "observed_success_by_suite", output)
+
+    if "geometry_directional" in tables and not tables["geometry_directional"].empty:
+        frame = tables["geometry_directional"].copy()
+        labels = np.where(frame.success, "success", "failure")
+        x = np.arange(len(frame)); width = .36
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar(x - width / 2, frame.parallel_variance_mean, width, label="parallel")
+        ax.bar(x + width / 2, frame.lateral_variance_mean, width, label="lateral")
+        ax.set_xticks(x, labels); ax.set_ylabel("Mean directional variance")
+        ax.set_title("Observed-arm directional uncertainty geometry"); ax.legend()
+        _save_figure(fig, "geometry_directional", output)
+
+
 def write_report(experiment: str, snapshot: Path, validation: dict,
                  tables: dict[str, pd.DataFrame], availability: dict) -> Path:
     for name, frame in tables.items():
@@ -89,4 +223,5 @@ def write_report(experiment: str, snapshot: Path, validation: dict,
     summary = markdown_summary(experiment, snapshot.name, validation, tables, availability)
     (snapshot / "findings.md").write_text(summary)
     success_figure(tables["success_all_identity"], snapshot)
+    publication_figures(tables, snapshot)
     return snapshot
