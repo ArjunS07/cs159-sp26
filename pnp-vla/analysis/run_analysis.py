@@ -46,9 +46,11 @@ def main(argv=None) -> int:
         state = (pro if args.command == "pro" else pcp).analyze(validated)
         print(json.dumps(state, indent=2)); return 0
     tables = standard_libero.run(validated, frames["pnp_euler_steps"])
+    geometry_state, geometry_tables = geometry.analyze(validated, frames["pnp_action_vectors"], pnp_k=3)
+    tables.update(geometry_tables)
     availability = {"pro": pro.analyze(validated), "pcp": pcp.analyze(validated),
                     "cross_model": {"status": "not_available", "reason": "matching model conditions not present"},
-                    "larger_k_geometry": geometry.analyze(pnp_k=3)}
+                    "geometry": geometry_state}
     report.write_report(args.experiment, path, validation, tables, availability)
     print(f"analysis complete: {path}")
     return 0

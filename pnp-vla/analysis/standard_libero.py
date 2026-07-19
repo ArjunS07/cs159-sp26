@@ -46,21 +46,23 @@ def paired_comparisons(df: pd.DataFrame) -> pd.DataFrame:
     base = _observed(df)
     rows = []
     for config_hash, condition in df[df["method"] != Method.UNCERTAINTY].groupby("config_hash", sort=True):
-        base_set = base[base[PAIR_KEYS].apply(tuple, axis=1).isin(set(condition[PAIR_KEYS].apply(tuple, axis=1)))]
-        joined = pair_one_to_one(base_set, condition)
-        b = joined["success_baseline"].astype(bool).to_numpy()
-        c = joined["success_condition"].astype(bool).to_numpy()
-        counts = paired_counts(b, c)
-        lo, hi = paired_bootstrap_ci(b, c)
-        first = condition.iloc[0]
-        rows.append({"config_hash": config_hash, "condition_label": condition_label(first),
-                     "cohort": "all_identity" if len(joined) == 400 else "full_ablation",
-                     "schedule_family": schedule_family(first), "n": len(joined),
-                     "baseline_successes": int(b.sum()), "condition_successes": int(c.sum()),
-                     "baseline_sr": b.mean(), "condition_sr": c.mean(),
-                     "delta_pp": 100 * (c.mean() - b.mean()),
-                     "delta_ci_low_pp": 100 * lo, "delta_ci_high_pp": 100 * hi,
-                     **counts, "p_raw": discordant_test(counts["F_to_S"], counts["S_to_F"])})
+        scopes = [("all_identity", base, condition)] if len(condition) == 400 else []
+        scopes.append(("full_ablation", base[base.full_ablation_member],
+                       condition[condition.full_ablation_member]))
+        for cohort, base_set, condition_set in scopes:
+            joined = pair_one_to_one(base_set, condition_set)
+            b = joined["success_baseline"].astype(bool).to_numpy()
+            c = joined["success_condition"].astype(bool).to_numpy()
+            counts = paired_counts(b, c)
+            lo, hi = paired_bootstrap_ci(b, c)
+            first = condition.iloc[0]
+            rows.append({"config_hash": config_hash, "condition_label": condition_label(first),
+                         "cohort": cohort, "schedule_family": schedule_family(first), "n": len(joined),
+                         "baseline_successes": int(b.sum()), "condition_successes": int(c.sum()),
+                         "baseline_sr": b.mean(), "condition_sr": c.mean(),
+                         "delta_pp": 100 * (c.mean() - b.mean()),
+                         "delta_ci_low_pp": 100 * lo, "delta_ci_high_pp": 100 * hi,
+                         **counts, "p_raw": discordant_test(counts["F_to_S"], counts["S_to_F"])})
     out = pd.DataFrame(rows)
     out["p_holm_eight_schedules"] = np.nan
     mask = out["condition_label"].isin([
@@ -68,6 +70,34 @@ def paired_comparisons(df: pd.DataFrame) -> pd.DataFrame:
     ]) & (out["cohort"] == "full_ablation")
     out.loc[mask, "p_holm_eight_schedules"] = holm_adjust(out.loc[mask, "p_raw"])
     return out
+
+
+def _cross_validated_thresholds(frame: pd.DataFrame, score_col: str, folds: int = 5) -> pd.DataFrame:
+    """Choose an F1 threshold on four folds and evaluate only on the held-out fold."""
+    work = frame[["suite", "fail", score_col]].dropna().copy()
+    work["fold"] = -1
+    for _, indices in work.groupby(["suite", "fail"]).groups.items():
+        for offset, idx in enumerate(sorted(indices)):
+            work.loc[idx, "fold"] = offset % folds
+    rows = []
+    for fold in range(folds):
+        train, test = work[work.fold != fold], work[work.fold == fold]
+        candidates = np.unique(np.quantile(train[score_col], np.linspace(.02, .98, 97)))
+        best = (-1., candidates[0])
+        for threshold in candidates:
+            pred = train[score_col].to_numpy() >= threshold
+            y = train.fail.to_numpy(bool)
+            tp, fp, fn = (pred & y).sum(), (pred & ~y).sum(), (~pred & y).sum()
+            f1 = 2 * tp / max(1, 2 * tp + fp + fn)
+            if f1 > best[0]: best = (f1, threshold)
+        pred, y = test[score_col].to_numpy() >= best[1], test.fail.to_numpy(bool)
+        tp, fp, fn, tn = (pred & y).sum(), (pred & ~y).sum(), (~pred & y).sum(), (~pred & ~y).sum()
+        rows.append({"fold": fold, "n": len(test), "threshold_train_only": best[1],
+                     "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                     "precision": tp / max(1, tp + fp), "recall": tp / max(1, tp + fn),
+                     "specificity": tn / max(1, tn + fp),
+                     "accuracy": (tp + tn) / max(1, len(test))})
+    return pd.DataFrame(rows)
 
 
 def _macro_suite_auc(frame: pd.DataFrame, score: str) -> tuple[float, int]:
@@ -88,6 +118,13 @@ def detector_tables(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataF
     suite_rows = []
     for suite, group in observed.groupby("suite"):
         suite_rows.append({"suite": suite, **bootstrap_auc(group.fail, group.u_mean_episode, n_boot=1000)})
+    task_rows = []
+    for (suite, task), group in observed.groupby(["suite", "task_idx"]):
+        task_rows.append({"suite": suite, "task_idx": task,
+                          **auc_metrics(group.fail, group.u_mean_episode)})
+    hard = observed[observed.full_ablation_member]
+    hard_table = pd.DataFrame([{"cohort": "historical_full_ablation",
+                                **auc_metrics(hard.fail, hard.u_mean_episode)}])
     dof_rows = []
     for i, name in enumerate(DIM_NAMES):
         col = f"u_mean_d{i}"
@@ -120,16 +157,19 @@ def detector_tables(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataF
     early = pd.DataFrame()
     if not steps.empty:
         joined = steps.merge(observed[["rollout_id", "fail", "suite"]], on="rollout_id", how="inner")
-        ep = joined.groupby("rollout_id").agg(fail=("fail", "first"), suite=("suite", "first"),
-             early_score=("u_mean", lambda x: x.iloc[:max(1, min(4, len(x)))].mean()),
-             full_score=("u_mean", "mean")).reset_index()
+        full_ep = joined.groupby("rollout_id").agg(fail=("fail", "first"), suite=("suite", "first"),
+                                                    full_score=("u_mean", "mean"))
+        early_ep = joined[joined.euler_step <= 4].groupby("rollout_id").u_mean.mean().rename("early_score")
+        ep = full_ep.join(early_ep, how="left").reset_index()
         early = pd.DataFrame([{"window": "early", **auc_metrics(ep.fail, ep.early_score)},
                               {"window": "full_episode", **auc_metrics(ep.fail, ep.full_score)}])
     return {"detector_summary": summary, "detector_by_suite": pd.DataFrame(suite_rows),
+            "detector_by_task": pd.DataFrame(task_rows), "detector_hard_cohort": hard_table,
             "detector_per_dof": pd.DataFrame(dof_rows), "detector_score_distribution": score_dist,
             "observed_success_by_suite": suite_sr, "detector_length_confounding": confounding,
             "detector_reliability": reliability, "detector_risk_coverage": pd.DataFrame(risk_rows),
-            "legacy_uncertainty_taxonomy": legacy, "detector_early_window": early}
+            "legacy_uncertainty_taxonomy": legacy, "detector_early_window": early,
+            "detector_threshold_cross_validation": _cross_validated_thresholds(observed, "u_mean_episode")}
 
 
 def run(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataFrame]:
