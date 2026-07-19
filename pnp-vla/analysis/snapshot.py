@@ -51,7 +51,11 @@ def materialize(client, experiment: str, root: Path, *, page_size: int = 1000,
     for name in TABLES:
         digest.update(name.encode())
         if not frames[name].empty:
-            digest.update(pd.util.hash_pandas_object(frames[name], index=True).values.tobytes())
+            # PostgREST JSON/array columns contain lists and dicts, which pandas cannot hash.
+            # Canonical JSON also makes the content identifier stable across processes.
+            records = frames[name].where(pd.notna(frames[name]), None).to_dict("records")
+            digest.update(json.dumps(records, sort_keys=True, default=str,
+                                     separators=(",", ":")).encode())
     snapshot_id = digest.hexdigest()[:16]
     destination = Path(root) / experiment / snapshot_id
     destination.mkdir(parents=True, exist_ok=True)

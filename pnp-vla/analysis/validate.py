@@ -41,7 +41,8 @@ def coverage_matrix(df: pd.DataFrame) -> pd.DataFrame:
 def _single(df: pd.DataFrame, *, method: str, steps=None, inference_steps=None) -> pd.DataFrame:
     out = df[df["method"] == method]
     if steps is not None:
-        out = out[out["pnp_step_indices"].apply(lambda x: tuple(x or ()) == tuple(steps))]
+        out = out[out["pnp_step_indices"].apply(
+            lambda x: tuple(x) == tuple(steps) if x is not None else False)]
     if inference_steps is not None:
         out = out[out["num_inference_steps"] == inference_steps]
     return out
@@ -108,7 +109,8 @@ def validate_standard(rollouts: pd.DataFrame, runs: pd.DataFrame | None = None) 
     if int(df["full_ablation_member"].groupby(df[PAIR_KEYS].astype(str).agg("|".join, axis=1)).first().sum()) != 80:
         raise ValidationError("full-ablation manifest does not identify exactly 80 identities")
     observed = _single(df, method=Method.UNCERTAINTY)
-    if not observed["pnp_step_indices"].apply(lambda x: tuple(x or ()) == tuple(range(1, 10))).all():
+    if not observed["pnp_step_indices"].apply(
+            lambda x: tuple(x) == tuple(range(1, 10)) if x is not None else False).all():
         raise ValidationError("observed arm does not contain step-indexed telemetry schedule 1-9")
     if "episode_seed" in observed and "perturb_seed" in observed and not (observed["episode_seed"] == observed["perturb_seed"]).all():
         raise ValidationError("observed arm perturbation seed is not the isolated episode seed")
