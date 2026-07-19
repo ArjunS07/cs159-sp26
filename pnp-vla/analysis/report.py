@@ -10,7 +10,7 @@ import pandas as pd
 def write_table(frame: pd.DataFrame, name: str, output: Path) -> None:
     tables = output / "tables"
     tables.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(tables / f"{name}.parquet", index=False)
+    frame.to_csv(tables / f"{name}.csv", index=False)
 
 
 def legacy_delta(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -230,7 +230,6 @@ def write_report(experiment: str, snapshot: Path, validation: dict,
         write_table(frame, name, snapshot)
     delta = legacy_delta(tables)
     write_table(delta, "legacy_delta", snapshot)
-    delta.to_csv(snapshot / "tables" / "legacy_delta.csv", index=False)
     manifest_path = snapshot / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["availability"] = availability

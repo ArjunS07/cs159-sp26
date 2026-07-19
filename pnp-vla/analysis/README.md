@@ -25,9 +25,10 @@ set +a
 
 The second command reuses the latest snapshot and does not contact Supabase. Pass `--refresh`
 only when a new snapshot is intended, or `--snapshot PATH` to pin an existing snapshot. Output is
-written beneath `analysis_outputs/<experiment>/<snapshot_id>/`. Tables use Parquet to avoid
-duplicated formats; `legacy_delta.csv` remains CSV because it is an explicit compatibility output.
-Availability is recorded in `manifest.json`, alongside `validation.json` and publication figures.
+written beneath `analysis_outputs/<experiment>/<snapshot_id>/`. Analysis tables use CSV. Parquet
+is reserved for the versioned raw Supabase snapshot cache (`rollouts`, step/vector telemetry, and
+run metadata), where preserving nested data and types matters. Availability is recorded in
+`manifest.json`, alongside `validation.json` and publication figures.
 
 Commands are `snapshot`, `validate`, `standard`, `pro`, `pcp`, and `all`. Missing optional data is
 represented by explicit `not_available` records. Validation failures exit nonzero. In particular,
