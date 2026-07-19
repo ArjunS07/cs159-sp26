@@ -118,6 +118,18 @@ def detector_tables(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataF
     suite_rows = []
     for suite, group in observed.groupby("suite"):
         suite_rows.append({"suite": suite, **bootstrap_auc(group.fail, group.u_mean_episode, n_boot=1000)})
+    roc_rows = []
+    try:
+        from sklearn.metrics import roc_curve
+        for suite, group in observed.groupby("suite"):
+            fpr, tpr, thresholds = roc_curve(group.fail, group.u_mean_episode)
+            roc_rows.extend({"suite": suite, "fpr": x, "tpr": y, "threshold": t}
+                            for x, y, t in zip(fpr, tpr, thresholds))
+        fpr, tpr, thresholds = roc_curve(observed.fail, observed.u_mean_episode)
+        roc_rows.extend({"suite": "pooled", "fpr": x, "tpr": y, "threshold": t}
+                        for x, y, t in zip(fpr, tpr, thresholds))
+    except ImportError:  # pragma: no cover
+        pass
     task_rows = []
     for (suite, task), group in observed.groupby(["suite", "task_idx"]):
         task_rows.append({"suite": suite, "task_idx": task,
@@ -154,7 +166,23 @@ def detector_tables(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataF
         .groupby(["uncertainty_group", "fail"]).size().rename("n").reset_index()
     legacy["analysis_type"] = "descriptive_legacy_median_split"
 
+    uncertainty_bins = observed.copy()
+    uncertainty_bins["uncertainty_bin"] = uncertainty_bins.groupby("suite")["u_mean_episode"].transform(
+        lambda x: pd.qcut(x, 10, labels=False, duplicates="drop"))
+    uncertainty_bins = uncertainty_bins.groupby(["suite", "uncertainty_bin"]).agg(
+        n=("fail", "size"), mean_uncertainty=("u_mean_episode", "mean"),
+        failure_rate=("fail", "mean"), success_rate=("success", "mean")).reset_index()
+
+    dof_outcome_rows = []
+    for i, name in enumerate(DIM_NAMES):
+        for fail, group in observed.groupby("fail"):
+            values = group[f"u_mean_d{i}"]
+            dof_outcome_rows.append({"dimension": name, "fail": int(fail), "n": len(values),
+                                     "mean": values.mean(), "median": values.median(), "std": values.std()})
+
     early = pd.DataFrame()
+    euler_profile = pd.DataFrame()
+    time_profile = pd.DataFrame()
     if not steps.empty:
         joined = steps.merge(observed[["rollout_id", "fail", "suite"]], on="rollout_id", how="inner")
         full_ep = joined.groupby("rollout_id").agg(fail=("fail", "first"), suite=("suite", "first"),
@@ -163,13 +191,26 @@ def detector_tables(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataF
         ep = full_ep.join(early_ep, how="left").reset_index()
         early = pd.DataFrame([{"window": "early", **auc_metrics(ep.fail, ep.early_score)},
                               {"window": "full_episode", **auc_metrics(ep.fail, ep.full_score)}])
+        euler_profile = joined.groupby(["suite", "euler_step", "fail"]).u_mean.agg(
+            ["count", "mean", "std"]).reset_index()
+        euler_profile["sem"] = euler_profile["std"] / np.sqrt(euler_profile["count"])
+        maxima = joined.groupby("rollout_id").chunk_idx.transform("max").clip(lower=1)
+        joined["episode_progress_bin"] = np.minimum(
+            9, np.floor(10 * joined.chunk_idx / (maxima + 1)).astype(int))
+        time_profile = joined.groupby(["suite", "episode_progress_bin", "fail"]).u_mean.agg(
+            ["count", "mean", "std"]).reset_index()
+        time_profile["sem"] = time_profile["std"] / np.sqrt(time_profile["count"])
     return {"detector_summary": summary, "detector_by_suite": pd.DataFrame(suite_rows),
+            "detector_roc_curves": pd.DataFrame(roc_rows),
             "detector_by_task": pd.DataFrame(task_rows), "detector_hard_cohort": hard_table,
             "detector_per_dof": pd.DataFrame(dof_rows), "detector_score_distribution": score_dist,
             "observed_success_by_suite": suite_sr, "detector_length_confounding": confounding,
             "detector_reliability": reliability, "detector_risk_coverage": pd.DataFrame(risk_rows),
             "legacy_uncertainty_taxonomy": legacy, "detector_early_window": early,
-            "detector_threshold_cross_validation": _cross_validated_thresholds(observed, "u_mean_episode")}
+            "detector_threshold_cross_validation": _cross_validated_thresholds(observed, "u_mean_episode"),
+            "detector_uncertainty_bins": uncertainty_bins,
+            "detector_dof_by_outcome": pd.DataFrame(dof_outcome_rows),
+            "detector_euler_profile": euler_profile, "detector_time_profile": time_profile}
 
 
 def run(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataFrame]:

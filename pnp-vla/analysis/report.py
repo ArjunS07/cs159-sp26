@@ -10,7 +10,6 @@ import pandas as pd
 def write_table(frame: pd.DataFrame, name: str, output: Path) -> None:
     tables = output / "tables"
     tables.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(tables / f"{name}.csv", index=False)
     frame.to_parquet(tables / f"{name}.parquet", index=False)
 
 
@@ -26,44 +25,6 @@ def legacy_delta(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
                           "recomputed_value": current[key], "delta": current[key] - old,
                           "provenance": "user-supplied preliminary regression anchor"}
                          for key, old in historical.items()])
-
-
-def _pct(value) -> str:
-    return f"{100 * value:.2f}%"
-
-
-def markdown_summary(experiment: str, snapshot_id: str, validation: dict,
-                     tables: dict[str, pd.DataFrame], availability: dict) -> str:
-    all_sr = tables["success_all_identity"].sort_values("condition_label")
-    paired = tables["paired_comparisons"].sort_values(["cohort", "condition_label"])
-    detector = tables["detector_summary"].set_index("estimate_scope")
-    lines = [f"# Analysis findings: {experiment}", "",
-             f"Snapshot `{snapshot_id}` passed validation with {validation['n_rollouts']:,} rollouts, "
-             f"{validation['n_identities']} identities, and {validation['n_configurations']} configurations.", "",
-             "## Balanced all-identity success", ""]
-    for row in all_sr.to_dict("records"):
-        lines.append(f"- {row['condition_label']}: {row['successes']}/{row['n']} = {_pct(row['sr'])} "
-                     f"(Wilson 95% CI {_pct(row['ci_low'])}–{_pct(row['ci_high'])}).")
-    lines += ["", "## Paired effects", ""]
-    for row in paired.to_dict("records"):
-        lines.append(f"- {row['cohort']}, {row['condition_label']}: Δ {row['delta_pp']:+.2f} pp; "
-                     f"F→S {row['F_to_S']}, S→F {row['S_to_F']}, n={row['n']}; "
-                     f"paired 95% CI {row['delta_ci_low_pp']:+.2f} to {row['delta_ci_high_pp']:+.2f} pp; "
-                     f"two-sided discordant-pair p={row['p_raw']:.4g}.")
-    pooled = detector.loc["pooled"]
-    macro = detector.loc["macro_suite"]
-    lines += ["", "## Prospective observed-arm detector", "",
-              f"The observed/no-op arm has n={int(pooled['n'])} and {int(pooled['failures'])} failures. "
-              f"Pooled ROC-AUC is {pooled['roc_auc']:.4f} (identity-bootstrap 95% CI "
-              f"{pooled['roc_ci_low']:.4f}–{pooled['roc_ci_high']:.4f}); PR-AUC is {pooled['pr_auc']:.4f}. "
-              f"The macro mean of per-suite ROC-AUCs is {macro['roc_auc']:.4f}.", "",
-              "Refinement uncertainty is post-treatment and is excluded from these detector estimates.", "",
-              "## Availability and caveats", ""]
-    for name, state in availability.items():
-        lines.append(f"- {name}: `{state['status']}` — {state['reason']}")
-    lines += ["", "Point estimates and p-values are reported without claims of statistical significance. "
-              "Eight full-ablation schedule comparisons use Holm-adjusted p-values in the machine-readable table.", ""]
-    return "\n".join(lines)
 
 
 def success_figure(table: pd.DataFrame, output: Path) -> None:
@@ -140,6 +101,19 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     ax.set_xlabel("ROC-AUC (identity-bootstrap 95% CI)"); ax.set_title("Observed-arm failure detector")
     _save_figure(fig, "detector_auc_by_suite", output)
 
+    # Legacy ROC-curve view, corrected to use only prospective observed-arm telemetry.
+    curves = tables["detector_roc_curves"]
+    auc_lookup = dict(zip(suite.suite, suite.roc_auc)); auc_lookup["pooled"] = pooled.roc_auc
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    for name, group in curves.groupby("suite"):
+        width = 2 if name == "pooled" else 1.3
+        ax.plot(group.fpr, group.tpr, lw=width, label=f"{name} (AUC={auc_lookup[name]:.3f})")
+    ax.plot([0, 1], [0, 1], "k--", lw=.8, label="random")
+    ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="False positive rate", ylabel="True positive rate",
+           title="Observed-arm failure-detector ROC curves")
+    ax.legend(fontsize=8, loc="lower right")
+    _save_figure(fig, "detector_roc_curves", output)
+
     # Seven action dimensions and declared aggregate scores.
     frame = tables["detector_per_dof"].sort_values("roc_auc")
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -158,23 +132,15 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     ax.set_title("Early-window versus full-episode detector"); ax.legend()
     _save_figure(fig, "detector_early_window", output)
 
-    # Outcome-conditioned score summaries (raw refinement scores are intentionally absent).
-    frame = tables["detector_score_distribution"].sort_values("fail")
-    labels = ["success" if not bool(x) else "failure" for x in frame.fail]
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.errorbar(labels, frame["mean"], yerr=frame["std"], fmt="o", capsize=5, label="mean ± SD")
-    ax.scatter(labels, frame["median"], marker="D", label="median")
-    ax.set_ylabel("Mean episode uncertainty"); ax.set_title("Observed-arm uncertainty by outcome")
-    ax.legend(); _save_figure(fig, "detector_score_by_outcome", output)
-
-    # Reliability is descriptive because uncertainty is a ranking score, not a fitted probability.
-    frame = tables["detector_reliability"]
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(frame.mean_score, frame.observed_failure_rate, marker="o")
-    for row in frame.itertuples(): ax.annotate(f"n={row.n}", (row.mean_score, row.observed_failure_rate), fontsize=7)
-    ax.set(xlabel="Mean uncertainty in bin", ylabel="Observed failure rate", ylim=(0, 1),
-           title="Observed-arm reliability by uncertainty decile")
-    _save_figure(fig, "detector_reliability", output)
+    # Legacy SR-vs-uncertainty view with suite-local deciles and denominators.
+    frame = tables["detector_uncertainty_bins"]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for suite_name, group in frame.groupby("suite"):
+        ax.plot(group.mean_uncertainty, 100 * group.success_rate, marker="o",
+                label=suite_name.replace("libero_", ""))
+    ax.set(xlabel="Mean observed uncertainty (suite decile)", ylabel="Success rate (%)",
+           ylim=(0, 100), title="Success rate versus observed uncertainty")
+    ax.legend(fontsize=8); _save_figure(fig, "success_vs_uncertainty", output)
 
     frame = tables["detector_risk_coverage"]
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -183,24 +149,60 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
            title="Observed-arm risk–coverage curve")
     _save_figure(fig, "detector_risk_coverage", output)
 
-    # Cross-validated threshold results; thresholds were selected on training folds only.
-    frame = tables["detector_threshold_cross_validation"]
-    metrics = ["precision", "recall", "specificity", "accuracy"]
-    means, errors = frame[metrics].mean(), frame[metrics].std(ddof=1)
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.bar(metrics, means, yerr=errors, capsize=4, color="#F58518")
-    ax.set_ylim(0, 1); ax.set_ylabel("Held-out fold metric (mean ± SD)")
-    ax.set_title("Cross-validated detector threshold performance")
-    _save_figure(fig, "detector_threshold_cv", output)
+    # Euler-step discriminability profile from the single shared step-indexed rollout.
+    frame = tables["detector_euler_profile"]
+    suites = sorted(frame.suite.unique())
+    fig, axes = plt.subplots(1, len(suites), figsize=(4 * len(suites), 4), sharey=True)
+    for ax, suite_name in zip(np.atleast_1d(axes), suites):
+        group = frame[frame.suite == suite_name]
+        for fail, label, color in [(0, "success", "#4C78A8"), (1, "failure", "#E45756")]:
+            line = group[group.fail == fail]
+            ax.errorbar(line.euler_step, line["mean"], yerr=line["sem"], marker="o",
+                        capsize=2, label=label, color=color)
+        ax.set_title(suite_name.replace("libero_", "")); ax.set_xlabel("Euler step")
+    axes = np.atleast_1d(axes); axes[0].set_ylabel("Mean uncertainty ± SEM"); axes[-1].legend(fontsize=8)
+    fig.suptitle("Observed uncertainty by Euler step and outcome")
+    _save_figure(fig, "uncertainty_by_euler_step", output)
 
-    # Observed behavioral baseline by suite, with Wilson intervals and 0-100 axis.
-    frame = tables["observed_success_by_suite"].sort_values("sr")
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.barh([f"{s} (n={n})" for s, n in zip(frame.suite, frame.n)], 100 * frame.sr,
-            xerr=np.vstack((100 * (frame.sr - frame.ci_low), 100 * (frame.ci_high - frame.sr))),
-            capsize=3, color="#4C78A8")
-    ax.set(xlim=(0, 100), xlabel="Observed/no-op success rate (%)", title="Observed baseline by suite")
-    _save_figure(fig, "observed_success_by_suite", output)
+    # Episode-time trajectory, normalized independently within each observed rollout.
+    frame = tables["detector_time_profile"]
+    suites = sorted(frame.suite.unique())
+    fig, axes = plt.subplots(1, len(suites), figsize=(4 * len(suites), 4), sharey=True)
+    for ax, suite_name in zip(np.atleast_1d(axes), suites):
+        group = frame[frame.suite == suite_name]
+        for fail, label, color in [(0, "success", "#4C78A8"), (1, "failure", "#E45756")]:
+            line = group[group.fail == fail]
+            ax.plot(10 * line.episode_progress_bin + 5, line["mean"], marker="o", label=label, color=color)
+        ax.set_title(suite_name.replace("libero_", "")); ax.set_xlabel("Episode progress (%)")
+    axes = np.atleast_1d(axes); axes[0].set_ylabel("Mean uncertainty"); axes[-1].legend(fontsize=8)
+    fig.suptitle("Observed uncertainty over episode time")
+    _save_figure(fig, "uncertainty_over_time", output)
+
+    # Legacy suite phase comparison, now restricted to the three balanced 400-row conditions.
+    frame = tables["success_by_suite"]
+    broad = frame[frame.groupby("config_hash").config_hash.transform("size") == 4].copy()
+    labels = broad.condition_label.drop_duplicates().tolist()
+    suites = sorted(broad.suite.unique()); x = np.arange(len(suites)); width = .8 / len(labels)
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    for i, label in enumerate(labels):
+        group = broad[broad.condition_label == label].set_index("suite").loc[suites]
+        offset = (i - (len(labels) - 1) / 2) * width
+        ax.bar(x + offset, 100 * group.sr, width, label=label)
+    ax.set_xticks(x, [s.replace("libero_", "") for s in suites]); ax.set_ylim(0, 100)
+    ax.set_ylabel("Success rate (%)"); ax.set_title("Balanced conditions by suite"); ax.legend(fontsize=7)
+    _save_figure(fig, "success_balanced_by_suite", output)
+
+    # Observed per-task heatmap supersedes ad-hoc suite/task plots while showing exact values.
+    task = tables["success_by_task"]
+    task = task[task.condition_label.str.startswith("observed/no-op")]
+    pivot = task.pivot(index="suite", columns="task_idx", values="sr").sort_index()
+    fig, ax = plt.subplots(figsize=(10, 4))
+    image = ax.imshow(100 * pivot.to_numpy(), vmin=0, vmax=100, aspect="auto", cmap="Blues")
+    ax.set_yticks(np.arange(len(pivot)), [x.replace("libero_", "") for x in pivot.index])
+    ax.set_xticks(np.arange(len(pivot.columns)), pivot.columns); ax.set_xlabel("Task index")
+    ax.set_title("Observed/no-op success rate by suite and task")
+    fig.colorbar(image, ax=ax, label="Success rate (%)")
+    _save_figure(fig, "observed_success_task_heatmap", output)
 
     if "geometry_directional" in tables and not tables["geometry_directional"].empty:
         frame = tables["geometry_directional"].copy()
@@ -216,12 +218,23 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
 
 def write_report(experiment: str, snapshot: Path, validation: dict,
                  tables: dict[str, pd.DataFrame], availability: dict) -> Path:
+    # A rerun is a clean deterministic render, not an accumulation of stale formats/figures.
+    for directory in (snapshot / "tables", snapshot / "figures"):
+        if directory.exists():
+            for path in directory.iterdir():
+                if path.is_file():
+                    path.unlink()
+    for obsolete in (snapshot / "availability.json", snapshot / "findings.md"):
+        obsolete.unlink(missing_ok=True)
     for name, frame in tables.items():
         write_table(frame, name, snapshot)
-    delta = legacy_delta(tables); write_table(delta, "legacy_delta", snapshot)
-    (snapshot / "availability.json").write_text(json.dumps(availability, indent=2, sort_keys=True) + "\n")
-    summary = markdown_summary(experiment, snapshot.name, validation, tables, availability)
-    (snapshot / "findings.md").write_text(summary)
+    delta = legacy_delta(tables)
+    write_table(delta, "legacy_delta", snapshot)
+    delta.to_csv(snapshot / "tables" / "legacy_delta.csv", index=False)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["availability"] = availability
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     success_figure(tables["success_all_identity"], snapshot)
     publication_figures(tables, snapshot)
     return snapshot
