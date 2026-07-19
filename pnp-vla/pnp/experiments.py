@@ -84,7 +84,7 @@ def _prepare_libero_episodes():
     return episodes
 
 
-def _run_collection(*, store, policy, preprocess, device, experiment, episodes,
+def _run_collection(*, store, policy, preprocess, postprocess, device, experiment, episodes,
                     methods, cohort, shard_count, shard_index):
     from tqdm.auto import tqdm
     from .rollout import iter_task_envs, run_episode
@@ -110,7 +110,8 @@ def _run_collection(*, store, policy, preprocess, device, experiment, episodes,
             for env, task_episodes in iter_task_envs(episodes):
                 for ep, name, cfg, rid in store.iter_todo(
                         experiment, task_episodes, methods, done=done):
-                    result = run_episode(env, ep, policy, preprocess, device, cfg)
+                    result = run_episode(
+                        env, ep, policy, preprocess, postprocess, device, cfg)
                     store.log_result(rid, ep, name, cfg, result)
                     completed += 1
                     progress.update()
@@ -140,16 +141,16 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
 
     print(f"worker {shard_index}/{shard_count}: {len(ablation)} full-ablation + "
           f"{len(broad)} broad identities")
-    policy, preprocess, _ = models.load_pi05()
+    policy, preprocess, postprocess = models.load_pi05()
     device = models.default_device()
     store = SupabaseStore()
     _run_collection(
-        store=store, policy=policy, preprocess=preprocess, device=device,
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
         experiment=experiment, episodes=ablation, methods=full_methods,
         cohort="full_ablation", shard_count=shard_count, shard_index=shard_index,
     )
     _run_collection(
-        store=store, policy=policy, preprocess=preprocess, device=device,
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
         experiment=experiment, episodes=broad, methods=broad_methods,
         cohort="broad_validation", shard_count=shard_count, shard_index=shard_index,
     )

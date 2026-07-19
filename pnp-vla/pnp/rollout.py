@@ -1,6 +1,6 @@
 """Rollout PRIMITIVES (Dedup #2). No experiment/driver loops — those live in the notebooks.
 
-`run_episode(env, ep, policy, preprocess, device, config)` runs ONE episode: it builds the
+`run_episode(env, ep, policy, preprocess, postprocess, device, config)` runs ONE episode: it builds the
 `RolloutTap` from `config`, owns the per-(episode,chunk) noise generator so chunk i's initial
 noise is byte-identical across every method, and returns a plain result dict whose contents
 depend on which sinks were enabled. `iter_task_envs(episodes)` yields `(env, task_eps)`
@@ -105,7 +105,8 @@ def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int):
 # ─────────────────────────────────────────────────────────────────────────────
 # The one rollout primitive.
 # ─────────────────────────────────────────────────────────────────────────────
-def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | None = None):
+def run_episode(env, ep, policy, preprocess, postprocess, device,
+                config: RolloutConfig | None = None):
     """Run one episode under `config`. Returns a result dict (outcome, metrics, trajectory,
     recorder episode, and sink outputs — pcp_chunks / pcp_telemetry / ms_selections).
 
@@ -176,6 +177,15 @@ def run_episode(env, ep, policy, preprocess, device, config: RolloutConfig | Non
             if not np.all(np.isfinite(a)):
                 nan_count += 1
                 a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            # predict_action_chunk returns normalized policy-space actions. LIBERO must receive
+            # the official postprocessor's environment-space action, exactly as in LeRobot's
+            # select_action evaluation path and the pre-refactor notebooks.
+            action = torch.as_tensor(a, device=device).unsqueeze(0)
+            action = postprocess(action)
+            if isinstance(action, torch.Tensor):
+                a = action.squeeze(0).detach().cpu().numpy()
+            else:
+                a = np.asarray(action).squeeze(0)
             executed_actions.append(np.asarray(a).flatten()[:ADIM].copy())
             if frames is not None:
                 frames.append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
