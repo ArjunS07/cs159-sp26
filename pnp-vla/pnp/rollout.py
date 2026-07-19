@@ -10,6 +10,7 @@ loop calls `store.log_result(...)` with the result.
 from __future__ import annotations
 
 import hashlib
+import datetime as dt
 import time
 from itertools import groupby
 
@@ -142,6 +143,9 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     nan_count = 0
     success = False
     status, error_msg = "completed", None
+    terminated_reason = "max_steps"
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    inference_ms_total = 0.0
     t0 = time.time()
     step = 0
     try:
@@ -158,6 +162,7 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                 chunk_noise_seeds.append(cns)
                 noise = _draw_chunk_noise(policy, device, cns)
                 batch = preprocess(obs_to_policy(obs, task_desc))
+                inference_t0 = time.perf_counter()
                 if multisample:
                     def _noise_of(si, _ci=ci):
                         return _draw_chunk_noise(policy, device,
@@ -170,6 +175,7 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                     with torch.no_grad():
                         chunk = policy.predict_action_chunk(batch, noise=noise)
                 arr = chunk.squeeze(0).detach().cpu().numpy()
+                inference_ms_total += (time.perf_counter() - inference_t0) * 1000.0
                 queue = [arr[i].copy() for i in range(arr.shape[0])]
                 chunk_boundary_actions.append(np.asarray(queue[0]).flatten()[:ADIM].copy())
                 ci += 1
@@ -194,13 +200,17 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
             obs, _, done, _ = env.step(a)
             if env.check_success():
                 success = True
+                terminated_reason = "success"
                 break
             if done:
+                terminated_reason = "env_done"
                 break
     except Exception as e:                              # log errored episodes, don't drop them
         status, error_msg = "errored", f"{type(e).__name__}: {e}"
+        terminated_reason = "error"
 
     elapsed = time.time() - t0
+    finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
     n_steps = step + 1
     recorder.close_episode(success, n_steps)
     inst = compute_instability(executed_actions, chunk_boundary_actions)
@@ -217,8 +227,11 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
 
     result = dict(
         success=success, n_steps=n_steps, elapsed_s=elapsed, status=status, error_msg=error_msg,
+        terminated_reason=terminated_reason, started_at=started_at, finished_at=finished_at,
+        inference_ms_total=inference_ms_total,
         nan_action_count=nan_count, n_chunks=ci, n_vf_evals=vf_evals, chunk_size=chunk_size,
-        episode_seed=ep_seed, chunk_noise_seeds=chunk_noise_seeds, instability=inst,
+        episode_seed=ep_seed, perturb_seed=ep_seed,
+        chunk_noise_seeds=chunk_noise_seeds, instability=inst,
         recorder_episode=recorder.episodes[-1] if recorder.episodes else None,
         trajectory=dict(
             actions=np.asarray(executed_actions, dtype=np.float32),

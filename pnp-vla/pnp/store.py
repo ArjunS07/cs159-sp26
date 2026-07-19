@@ -223,12 +223,12 @@ class SupabaseStore:
         rollout_row.setdefault("experiment", self.experiment)
         rollout_row.setdefault("sampler_algo_version", SAMPLER_ALGO_VERSION)
         rollout_row.setdefault("schema_version", SCHEMA_VERSION)
-        rollout_row["updated_at"] = _now()
-
         for name, key, payload in self._blob_specs(rid, blobs or {}):
             self._upload(key, payload)
             rollout_row[f"{name}_path"] = key
 
+        # Stamp after potentially slow Storage uploads, close to the database write.
+        rollout_row["updated_at"] = _now()
         self.client.table("rollouts").upsert(self._json(rollout_row),
                                              on_conflict="rollout_id").execute()
         # replace per-step rows for idempotent re-writes
@@ -335,19 +335,22 @@ class SupabaseStore:
             "rollout_id": rid,
             "benchmark": ep.get("benchmark"), "suite": ep["suite"], "task_idx": ep["task_idx"],
             "task_desc": ep.get("task_desc"), "episode_idx": ep.get("ep_idx", ep.get("episode_idx")),
-            "init_state_hash": ep.get("init_state_hash"),
+            "init_state_hash": ep.get("init_state_hash"), "bddl_sha256": ep.get("bddl_sha256"),
             "suite_family": ep.get("suite_family"), "perturb_axis": ep.get("perturb_axis"),
             "perturb_strength": ep.get("perturb_strength"),
             "distractor_object": ep.get("distractor_object"),
             "max_steps": ep.get("max_steps"), "chunk_size": result.get("chunk_size"),
             "n_chunks": result["n_chunks"], "action_dim": ADIM,
-            "episode_seed": result["episode_seed"], "config_hash": self.config_hash(logical),
+            "episode_seed": result["episode_seed"], "perturb_seed": result.get("perturb_seed"),
+            "config_hash": self.config_hash(logical),
             "config_json": logical,
             "success": result["success"], "n_steps": result["n_steps"],
             "elapsed_s": result["elapsed_s"],
-            "terminated_reason": "success" if result["success"] else result["status"],
+            "terminated_reason": result.get("terminated_reason"),
             "status": result["status"], "error_msg": result["error_msg"],
             "nan_action_count": result["nan_action_count"], "n_vf_evals": result["n_vf_evals"],
+            "inference_ms_total": result.get("inference_ms_total"),
+            "started_at": result.get("started_at"), "finished_at": result.get("finished_at"),
             **denorm, **summary, **result["instability"],
         }
         # Keep stock LIBERO compatible with pre-cohort schemas. PRO manifests carry these keys

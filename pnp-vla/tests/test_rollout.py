@@ -65,5 +65,9 @@ def test_run_episode_postprocesses_actions_before_environment_step():
         )
 
     assert result["success"] is True
+    assert result["terminated_reason"] == "success"
+    assert result["started_at"] <= result["finished_at"]
+    assert result["perturb_seed"] == result["episode_seed"]
+    assert result["inference_ms_total"] >= 0.0
     assert np.allclose(env.actions[-1], 2.0)
     assert np.allclose(result["trajectory"]["actions"][0], 2.0)

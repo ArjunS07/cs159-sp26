@@ -58,6 +58,12 @@ def init_state_hash(init_state) -> str:
     return hashlib.md5(np.asarray(init_state).tobytes()).hexdigest()[:12]
 
 
+def bddl_sha256(path: str) -> str:
+    """Hash the exact task definition used by a rollout."""
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
 def init_libero_benchmark():
     """Load and return the LIBERO benchmark dictionary."""
     global BENCHMARK_DICT
@@ -93,6 +99,7 @@ def build_final_episodes(benchmark_dict=None, episode_idxs=None, tasks=None):
         task = task_suite.get_task(task_idx)
         init_states = task_suite.get_task_init_states(task_idx)
         bddl_path = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+        bddl_hash = bddl_sha256(bddl_path)
         max_steps = MAX_STEPS_MAP.get(suite, 300)
         for ep_idx in episode_idxs:
             if ep_idx >= len(init_states):
@@ -101,7 +108,8 @@ def build_final_episodes(benchmark_dict=None, episode_idxs=None, tasks=None):
             episodes.append(dict(
                 benchmark="libero", suite=suite, task_idx=task_idx, task_desc=task.language,
                 ep_idx=ep_idx, init_state=init_state, bddl_path=bddl_path,
-                max_steps=max_steps, init_state_hash=init_state_hash(init_state),
+                bddl_sha256=bddl_hash, max_steps=max_steps,
+                init_state_hash=init_state_hash(init_state),
                 suite_family="base", perturb_axis=None, perturb_strength=None,
                 distractor_object=None,
             ))

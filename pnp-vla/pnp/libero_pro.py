@@ -231,7 +231,7 @@ def describe_suite(suite: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def build_libero_pro_episodes(benchmark_dict, suites=None, episode_idxs=None):
     """Build a deduplicated PRO manifest with historical cohort membership."""
-    from .libero_env import init_state_hash
+    from .libero_env import bddl_sha256, init_state_hash
     from libero.libero import get_libero_path
     suites = list(dict.fromkeys(suites or DEFAULT_PRO_SUITES))
     episode_idxs = episode_idxs if episode_idxs is not None else list(range(10))
@@ -246,6 +246,7 @@ def build_libero_pro_episodes(benchmark_dict, suites=None, episode_idxs=None):
             init_states = task_suite.get_task_init_states(task_idx)
             bddl_path = os.path.join(get_libero_path("bddl_files"),
                                      task.problem_folder, task.bddl_file)
+            bddl_hash = bddl_sha256(bddl_path)
             for ep_idx in episode_idxs:
                 if ep_idx >= len(init_states):
                     continue
@@ -258,7 +259,7 @@ def build_libero_pro_episodes(benchmark_dict, suites=None, episode_idxs=None):
                 episodes.append(dict(
                     benchmark="libero_pro", suite=suite, task_idx=task_idx,
                     task_desc=task.language, ep_idx=ep_idx, init_state=init_state,
-                    bddl_path=bddl_path, max_steps=max_steps,
+                    bddl_path=bddl_path, bddl_sha256=bddl_hash, max_steps=max_steps,
                     init_state_hash=state_hash,
                     canonical_member=suite in CANONICAL_PRO_SUITES,
                     expanded_member=suite in EXPANDED_PRO_SUITES,
