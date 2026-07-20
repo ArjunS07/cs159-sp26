@@ -71,3 +71,20 @@ def test_run_episode_postprocesses_actions_before_environment_step():
     assert result["inference_ms_total"] >= 0.0
     assert np.allclose(env.actions[-1], 2.0)
     assert np.allclose(result["trajectory"]["actions"][0], 2.0)
+
+
+def test_run_episode_can_save_exact_policy_space_chunks():
+    env = _Env()
+    ep = {
+        "task_desc": "test task", "max_steps": 1,
+        "init_state": np.zeros(3), "ep_idx": 0,
+        "suite": "test", "task_idx": 0,
+    }
+    with patch("pnp.rollout.obs_to_policy", return_value={}):
+        result = run_episode(
+            env, ep, _Policy(), lambda obs: obs, lambda action: action * 2,
+            torch.device("cpu"), RolloutConfig(save_generated_chunks=True),
+        )
+    assert result["generated_chunks"]["chunks"].shape == (1, 2, 7)
+    assert np.allclose(result["generated_chunks"]["chunks"], 1.0)
+    assert np.allclose(result["trajectory"]["actions"], 2.0)

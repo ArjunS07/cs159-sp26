@@ -116,6 +116,7 @@ class RolloutConfig:
     save_ahats: bool = False                    # full K a_hats stacks -> Storage (geometry)
     save_observations: bool = False             # low-res decision-point frames -> Storage
     save_trajectory: bool = True                # executed actions + robot state -> Storage (cheap)
+    save_generated_chunks: bool = False         # exact policy-space clean chunks at t=1
     video: str = "off"                          # "off" | "failures_only" | "all"
 
     def __post_init__(self):

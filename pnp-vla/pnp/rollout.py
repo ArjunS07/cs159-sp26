@@ -137,6 +137,7 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     est_chunks = max(1, round(max_steps / chunk_size))
     queue, ci = [], 0
     executed_actions, robot_states, chunk_boundary_actions, chunk_noise_seeds = [], [], [], []
+    generated_chunks = [] if config.save_generated_chunks else None
     ms_selections = [] if multisample else None
     # capture agentview frames when either sink wants them (obs_frames OR a video)
     frames = [] if (config.save_observations or config.video != "off") else None
@@ -175,6 +176,8 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                     with torch.no_grad():
                         chunk = policy.predict_action_chunk(batch, noise=noise)
                 arr = chunk.squeeze(0).detach().cpu().numpy()
+                if generated_chunks is not None:
+                    generated_chunks.append(arr.copy())
                 inference_ms_total += (time.perf_counter() - inference_t0) * 1000.0
                 queue = [arr[i].copy() for i in range(arr.shape[0])]
                 chunk_boundary_actions.append(np.asarray(queue[0]).flatten()[:ADIM].copy())
@@ -237,6 +240,8 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
             actions=np.asarray(executed_actions, dtype=np.float32),
             robot_state=np.asarray(robot_states, dtype=np.float32),
         ) if config.save_trajectory else None,
+        generated_chunks=(dict(chunks=np.asarray(generated_chunks, dtype=np.float32))
+                          if generated_chunks is not None else None),
         obs_frames=frames if config.save_observations else None,
         video=video_bytes,
     )

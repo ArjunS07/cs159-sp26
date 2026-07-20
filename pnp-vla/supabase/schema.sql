@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS rollouts (
     ahats_path                TEXT,
     pcp_chunks_path           TEXT,
     trajectory_path           TEXT,
+    generated_chunks_path     TEXT,
     obs_frames_path           TEXT,
     created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -226,6 +227,58 @@ CREATE TABLE IF NOT EXISTS q_correctors (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- ── verifier models and exact same-state candidate supervision ─────────────
+CREATE TABLE IF NOT EXISTS verifier_models (
+    verifier_id        TEXT PRIMARY KEY,
+    experiment         TEXT,
+    run_id             UUID REFERENCES experiment_runs(run_id),
+    model_class        TEXT NOT NULL,
+    obs_dim            INTEGER NOT NULL,
+    action_dim         INTEGER NOT NULL,
+    horizon            INTEGER NOT NULL,
+    prefix_length      INTEGER,
+    checkpoint_path    TEXT NOT NULL,
+    split_path         TEXT NOT NULL,
+    config_json        JSONB NOT NULL,
+    metrics_json       JSONB NOT NULL,
+    dataset_hash       TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS verifier_candidate_groups (
+    candidate_group_id TEXT PRIMARY KEY,
+    experiment         TEXT NOT NULL,
+    benchmark          TEXT NOT NULL,
+    suite              TEXT NOT NULL,
+    task_idx           INTEGER NOT NULL,
+    episode_idx        INTEGER NOT NULL,
+    chunk_idx          INTEGER NOT NULL,
+    uncertainty_stratum TEXT NOT NULL,
+    pairing_mode       TEXT NOT NULL, -- snapshot | paired_full_episode
+    prefix_length      INTEGER NOT NULL,
+    snapshot_validated BOOLEAN NOT NULL,
+    metadata_json      JSONB,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS verifier_candidates (
+    candidate_id       TEXT PRIMARY KEY,
+    candidate_group_id TEXT NOT NULL REFERENCES verifier_candidate_groups(candidate_group_id)
+                         ON DELETE CASCADE,
+    rollout_id         TEXT REFERENCES rollouts(rollout_id) ON DELETE SET NULL,
+    candidate_kind     TEXT NOT NULL, -- default | fresh_noise
+    success            BOOLEAN NOT NULL,
+    n_steps            INTEGER,
+    policy_chunk_path  TEXT NOT NULL,
+    env_chunk_path     TEXT NOT NULL,
+    observation_path   TEXT NOT NULL,
+    metadata_json      JSONB,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(candidate_group_id, candidate_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_verifier_candidates_group
+    ON verifier_candidates(candidate_group_id);
+
 -- ── encoding_cache: content-addressed obs+language encodings ─────────────────
 CREATE TABLE IF NOT EXISTS encoding_cache (
     cache_key       TEXT PRIMARY KEY,
@@ -240,3 +293,4 @@ CREATE TABLE IF NOT EXISTS encoding_cache (
 -- Idempotent migration for databases created before PRO cohort membership was recorded.
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS canonical_member BOOLEAN;
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS expanded_member BOOLEAN;
+ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS generated_chunks_path TEXT;

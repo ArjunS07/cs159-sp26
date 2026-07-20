@@ -214,7 +214,7 @@ class SupabaseStore:
                     blobs: dict | None = None) -> str:
         """Upsert one rollout (+ its per-step rows + Storage blobs).
 
-        `blobs` may contain: ahats(dict of arrays), trajectory(dict of arrays),
+        `blobs` may contain: ahats(dict of arrays), trajectory(dict of arrays), generated_chunks,
         obs_frames(list of arrays), video(bytes), pcp_chunks(pandas.DataFrame).
         Their Storage keys are written back onto the row.
         """
@@ -249,6 +249,9 @@ class SupabaseStore:
             yield "ahats", f"ahats/{rid}.npz", _npz_bytes(blobs["ahats"])
         if blobs.get("trajectory"):
             yield "trajectory", f"trajectories/{rid}.npz", _npz_bytes(blobs["trajectory"])
+        if blobs.get("generated_chunks"):
+            yield "generated_chunks", f"generated_chunks/{rid}.npz", _npz_bytes(
+                blobs["generated_chunks"])
         if blobs.get("obs_frames"):
             yield "obs_frames", f"obs_frames/{rid}.npz", _npz_bytes(
                 {f"f{i}": a for i, a in enumerate(blobs["obs_frames"])})
@@ -370,6 +373,8 @@ class SupabaseStore:
         blobs = {}
         if result.get("trajectory"):
             blobs["trajectory"] = result["trajectory"]
+        if result.get("generated_chunks"):
+            blobs["generated_chunks"] = result["generated_chunks"]
         if result.get("obs_frames"):
             blobs["obs_frames"] = result["obs_frames"]
         if result.get("video"):
@@ -438,6 +443,41 @@ class SupabaseStore:
             row["split_path"] = split_key
         self.client.table("q_correctors").upsert(self._json(row), on_conflict="q_ckpt_id").execute()
         return q_ckpt_id
+
+    # ── clean-chunk verifier registry ────────────────────────────────────────
+    def register_verifier(self, verifier_id: str, checkpoint: bytes, config: dict, metrics: dict,
+                          split_manifest: dict, *, dataset_hash: str = "") -> str:
+        ckpt_path = f"verifiers/{verifier_id}.pt"
+        split_path = f"verifiers/{verifier_id}.split.json"
+        self._upload(ckpt_path, checkpoint)
+        self._upload(split_path, json.dumps(split_manifest, sort_keys=True).encode())
+        row = {
+            "verifier_id": verifier_id, "experiment": self.experiment, "run_id": self.run_id,
+            "model_class": config.get("model_class", "CleanChunkVerifier"),
+            "obs_dim": config["obs_dim"], "action_dim": config.get("action_dim", ADIM),
+            "horizon": config.get("horizon", 50), "prefix_length": config.get("prefix_length"),
+            "checkpoint_path": ckpt_path, "split_path": split_path,
+            "config_json": config, "metrics_json": metrics, "dataset_hash": dataset_hash,
+        }
+        self.client.table("verifier_models").upsert(
+            self._json(row), on_conflict="verifier_id").execute()
+        return verifier_id
+
+    def register_candidate_group(self, group: dict, candidates: list[dict]) -> str:
+        """Idempotently persist one exact/fallback pair after its artifacts are uploaded."""
+        group_id = group["candidate_group_id"]
+        self.client.table("verifier_candidate_groups").upsert(
+            self._json(group), on_conflict="candidate_group_id").execute()
+        for candidate in candidates:
+            blobs = candidate.pop("blobs", {})
+            for name in ("policy_chunk", "env_chunk", "observation"):
+                path = f"verifier_candidates/{group_id}/{candidate['candidate_id']}.{name}.npz"
+                self._upload(path, _npz_bytes(blobs[name]))
+                candidate[f"{name}_path"] = path
+            candidate["candidate_group_id"] = group_id
+            self.client.table("verifier_candidates").upsert(
+                self._json(candidate), on_conflict="candidate_id").execute()
+        return group_id
 
     def load_q_corrector(self, q_ckpt_id: str):
         import torch
