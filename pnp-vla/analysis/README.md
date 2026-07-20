@@ -54,3 +54,10 @@ from five held-out, suite/outcome-stratified folds. Detector thresholds transfer
 LIBERO are selected using standard labels only. Storage references are verified during snapshot
 creation; `ahats` and observation-frame analyses remain unavailable because those artifacts are
 not present.
+
+PRO reports also use the complete nine-step denoising telemetry. They report per-step detector
+metrics, uncertainty/action-dispersion/action-motion profiles, and regularized logistic models
+using either the legacy scalar, the nine-step uncertainty profile, or the full denoising dynamics.
+Every model metric comes from held-out predictions in deterministic five-fold splits stratified by
+suite and outcome. First-four-chunk and full-episode windows are reported separately so that early
+actionable prediction is not conflated with retrospective full-trajectory discrimination.

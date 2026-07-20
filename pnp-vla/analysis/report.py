@@ -69,10 +69,58 @@ def _write_availability(output: Path, availability: dict) -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
+def denoising_figures(tables: dict[str, pd.DataFrame], output: Path,
+                      *, prefix: str = "") -> None:
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    profile = tables[f"{prefix}denoising_profile_by_outcome"]
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    for ax, metric, label in zip(
+            axes, ("u_mean", "a_std_mean", "action_motion"),
+            ("Mean uncertainty", "Mean action SD", "Mean action motion")):
+        for fail, outcome, color in [(0, "success", "#4C78A8"), (1, "failure", "#E45756")]:
+            line = profile[profile.fail == fail]
+            ax.errorbar(line.euler_step, line[metric], yerr=line[f"{metric}_sem"],
+                        marker="o", capsize=2, label=outcome, color=color)
+        ax.set(xlabel="Denoising step", ylabel=label)
+    axes[-1].legend()
+    fig.suptitle("Observed-arm denoising dynamics by outcome")
+    _save_figure(fig, f"{prefix}denoising_profiles", output)
+
+    step_auc = tables[f"{prefix}denoising_step_metrics"]
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for metric, group in step_auc.groupby("metric"):
+        ax.plot(group.euler_step, group.roc_auc, marker="o",
+                label=metric.replace("_", " "))
+    ax.axhline(.5, color="black", ls="--", lw=1)
+    ax.set(xlabel="Denoising step", ylabel="Failure ROC-AUC", ylim=(0, 1),
+           title="Detector information across denoising")
+    ax.legend(fontsize=8)
+    _save_figure(fig, f"{prefix}denoising_step_auc", output)
+
+    models = tables[f"{prefix}denoising_oof_models"]
+    models = models[models.scope == "pooled"].copy()
+    models["label"] = (models.window.str.replace("_", " ") + " — " +
+                       models.model.str.replace("_", " "))
+    models = models.sort_values("roc_auc")
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.errorbar(models.roc_auc, models.label,
+                xerr=np.vstack((models.roc_auc - models.roc_ci_low,
+                                models.roc_ci_high - models.roc_auc)),
+                fmt="o", capsize=3)
+    ax.axvline(.5, color="black", ls="--", lw=1)
+    ax.set(xlim=(0, 1), xlabel="Held-out failure ROC-AUC (95% bootstrap CI)",
+           title="Out-of-fold denoising-trajectory detectors")
+    _save_figure(fig, f"{prefix}denoising_oof_models", output)
+
+
 def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     """Render every defensible figure supported by the rollout-only snapshot."""
     import matplotlib.pyplot as plt
     import numpy as np
+
+    denoising_figures(tables, output)
 
     # Full-ablation configuration SR: exact conditions, Wilson intervals, full 0-100 axis.
     frame = tables["success_full_ablation"].sort_values("sr")
@@ -364,8 +412,8 @@ def pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     _save_figure(fig, "pro_uncertainty_by_outcome", output)
 
     for table_name, file_name, x_column, x_label in [
-        ("pro_detector_euler_profile", "pro_uncertainty_by_euler_step", "euler_step", "Euler step"),
-        ("pro_detector_time_profile", "pro_uncertainty_over_time", "episode_progress_bin", "Episode progress bin")]:
+        ("pro_detector_time_profile", "pro_uncertainty_over_time",
+         "episode_progress_bin", "Episode progress bin")]:
         frame = tables[table_name]
         fig, axes = plt.subplots(2, 3, figsize=(14, 8), sharey=True)
         for ax, suite_name in zip(axes.ravel(), suites):
@@ -376,6 +424,8 @@ def pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
             ax.set_title(suite_name.replace("libero_", ""), fontsize=8); ax.set_xlabel(x_label)
         axes[0, 0].set_ylabel("Mean uncertainty"); axes[1, 0].set_ylabel("Mean uncertainty")
         axes[0, 2].legend(fontsize=7); _save_figure(fig, file_name, output)
+
+    denoising_figures(tables, output, prefix="pro_")
 
     sweep = tables["pro_legacy_threshold_sweep"]
     for score_name, group in sweep.groupby("score_name"):

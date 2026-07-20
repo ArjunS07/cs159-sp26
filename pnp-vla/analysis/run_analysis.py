@@ -83,7 +83,8 @@ def main(argv=None) -> int:
         report.write_pro_report(path, tables, availability)
         print(f"PRO analysis complete: {path}")
         return 0
-    tables = standard_libero.run(validated, frames["pnp_euler_steps"])
+    tables = standard_libero.run(
+        validated, frames["pnp_euler_steps"], frames["pnp_action_vectors"])
     geometry_state, geometry_tables = geometry.analyze(validated, frames["pnp_action_vectors"], pnp_k=3)
     tables.update(geometry_tables)
     availability = {"pro": {"status": "not_available", "reason": "separate PRO snapshot"},

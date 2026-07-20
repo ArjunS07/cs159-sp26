@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from pnp.config import DIM_NAMES, Method
+from . import denoising
 from pnp.experiments import SCHEDULES
 from .conditions import PAIR_KEYS, condition_label, schedule_family
 from .statistics import (auc_metrics, bootstrap_auc, discordant_test, holm_adjust,
@@ -213,6 +214,8 @@ def detector_tables(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataF
             "detector_euler_profile": euler_profile, "detector_time_profile": time_profile}
 
 
-def run(df: pd.DataFrame, steps: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def run(df: pd.DataFrame, steps: pd.DataFrame,
+        vectors: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return {**success_tables(df), "paired_comparisons": paired_comparisons(df),
-            **detector_tables(df, steps)}
+            **detector_tables(df, steps),
+            **denoising.analyze(df, steps, vectors, prefix="")}

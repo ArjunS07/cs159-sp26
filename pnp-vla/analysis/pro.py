@@ -8,6 +8,7 @@ import pandas as pd
 
 from pnp.config import DIM_NAMES, Method
 from .conditions import PAIR_KEYS, condition_label
+from . import denoising
 from .statistics import (auc_metrics, bootstrap_auc, discordant_test, holm_adjust,
                          paired_bootstrap_ci, paired_counts, wilson_interval)
 from .validate import pair_one_to_one
@@ -311,6 +312,7 @@ def analyze(df: pd.DataFrame, steps: pd.DataFrame, vectors: pd.DataFrame,
     cross_validated = pd.concat([cross_validated_policy(df, score_name=name)
                                  for name in ("full_vector", "position+gripper")], ignore_index=True)
     tables = {**success_and_pairs(df), **detector(df, steps),
+              **denoising.analyze(df, steps, vectors),
               "pro_legacy_threshold_sweep": legacy,
               "pro_threshold_cross_validation": cross_validated,
               **threshold_summaries(legacy, cross_validated),
