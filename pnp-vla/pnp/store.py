@@ -468,7 +468,8 @@ class SupabaseStore:
         group_id = group["candidate_group_id"]
         self.client.table("verifier_candidate_groups").upsert(
             self._json(group), on_conflict="candidate_group_id").execute()
-        for candidate in candidates:
+        for source in candidates:
+            candidate = dict(source)
             blobs = candidate.pop("blobs", {})
             for name in ("policy_chunk", "env_chunk", "observation"):
                 path = f"verifier_candidates/{group_id}/{candidate['candidate_id']}.{name}.npz"

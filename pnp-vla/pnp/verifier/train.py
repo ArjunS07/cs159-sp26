@@ -4,6 +4,9 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 import copy
+import hashlib
+import io
+import uuid
 
 import numpy as np
 import torch
@@ -24,6 +27,8 @@ class VerifierTrainConfig:
     patience: int = 15
     state_loss_weight: float = 0.25
     ranking_loss_weight: float = 0.50
+    score_head: str = "joint"                 # joint | state
+    zero_observation: bool = False             # action-only diagnostic
 
 
 class CleanChunkDataset(Dataset):
@@ -49,7 +54,7 @@ class DiscordantPairDataset(Dataset):
     def __init__(self, examples):
         groups = defaultdict(list)
         for example in examples or []:
-            if example.candidate_group_id:
+            if example.candidate_group_id and example.pairing_mode == "snapshot":
                 groups[example.candidate_group_id].append(example)
         self.pairs = []
         for members in groups.values():
@@ -109,24 +114,45 @@ def _ece(y, p, bins=10):
 
 
 def _metrics(labels, probabilities, task_keys):
-    from sklearn.metrics import brier_score_loss, roc_auc_score
+    from sklearn.metrics import brier_score_loss, precision_score, recall_score, roc_auc_score
     y, p = np.asarray(labels), np.asarray(probabilities)
     grouped = defaultdict(list)
     for i, task in enumerate(task_keys):
-        grouped[tuple(task)].append(i)
+        grouped[task].append(i)
     task_ap, task_auc = [], []
     for indices in grouped.values():
         yi, pi = y[indices], p[indices]
         if len(np.unique(yi)) > 1:
             task_ap.append(_average_precision(yi, pi))
             task_auc.append(float(roc_auc_score(yi, pi)))
+    predicted_failure = p < 0.5
+    actual_failure = y == 0
     return {
         "pr_auc": _average_precision(y, p),
         "roc_auc": float(roc_auc_score(y, p)) if len(np.unique(y)) > 1 else float("nan"),
         "task_macro_pr_auc": float(np.mean(task_ap)) if task_ap else float("nan"),
         "task_macro_roc_auc": float(np.mean(task_auc)) if task_auc else float("nan"),
         "brier": float(brier_score_loss(y, p)), "ece": _ece(y, p),
+        "failure_precision": float(precision_score(actual_failure, predicted_failure,
+                                                    zero_division=0)),
+        "failure_recall": float(recall_score(actual_failure, predicted_failure, zero_division=0)),
     }
+
+
+def _forward(model, batch, device, config):
+    obs = batch["obs"].to(device)
+    if config.zero_observation:
+        obs = torch.zeros_like(obs)
+    return model(obs, batch["actions"].to(device), batch["mask"].to(device),
+                 batch["position"].to(device), config.prefix_length)
+
+
+def _chosen_logit(output, config):
+    if config.score_head == "state":
+        return output.state_logit
+    if config.score_head != "joint":
+        raise ValueError("score_head must be 'joint' or 'state'")
+    return output.joint_logit
 
 
 @torch.no_grad()
@@ -135,10 +161,8 @@ def evaluate_verifier(model, examples, device, *, config=None, scaler=None, pair
     model.eval()
     labels, probs, tasks = [], [], []
     for batch in _loader(examples, config):
-        output = model(batch["obs"].to(device), batch["actions"].to(device),
-                       batch["mask"].to(device), batch["position"].to(device),
-                       config.prefix_length)
-        logits = output.joint_logit
+        output = _forward(model, batch, device, config)
+        logits = _chosen_logit(output, config)
         if scaler is not None:
             logits = scaler(logits)
         probs.extend(torch.sigmoid(logits).cpu().numpy().tolist())
@@ -174,18 +198,18 @@ def train_verifier(model, train_examples, val_examples, device, *, config=None, 
                                                             eta_min=config.lr / 50)
     best_score, best_state, bad = -float("inf"), None, 0
     pair_dataset = DiscordantPairDataset(paired_train_examples)
+    point_train_examples = list(train_examples) + list(paired_train_examples or [])
     for epoch in range(config.epochs):
         model.train()
         epoch_loss = []
-        for batch in _loader(train_examples, config, train=True):
+        for batch in _loader(point_train_examples, config, train=True):
             optimizer.zero_grad()
-            output = model(batch["obs"].to(device), batch["actions"].to(device),
-                           batch["mask"].to(device), batch["position"].to(device),
-                           config.prefix_length)
+            output = _forward(model, batch, device, config)
             label = batch["label"].to(device)
             joint = nn.functional.binary_cross_entropy_with_logits(output.joint_logit, label)
             state = nn.functional.binary_cross_entropy_with_logits(output.state_logit, label)
-            loss = joint + config.state_loss_weight * state
+            loss = (state if config.score_head == "state" else
+                    joint + config.state_loss_weight * state)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -241,10 +265,8 @@ def calibrate_temperature(model, calibration_examples, device, *, config=None):
     logits, labels = [], []
     with torch.no_grad():
         for batch in _loader(calibration_examples, config):
-            output = model(batch["obs"].to(device), batch["actions"].to(device),
-                           batch["mask"].to(device), batch["position"].to(device),
-                           config.prefix_length)
-            logits.append(output.joint_logit.detach())
+            output = _forward(model, batch, device, config)
+            logits.append(_chosen_logit(output, config).detach())
             labels.append(batch["label"].to(device))
     logits, labels = torch.cat(logits), torch.cat(labels)
     scaler = TemperatureScaler().to(device)
@@ -258,3 +280,19 @@ def calibrate_temperature(model, calibration_examples, device, *, config=None):
 
     optimizer.step(closure)
     return scaler
+
+
+def dataset_hash(examples):
+    keys = sorted((e.rollout_id, e.chunk_idx, e.candidate_group_id or "") for e in examples)
+    return hashlib.sha256(repr(keys).encode()).hexdigest()[:16]
+
+
+def verifier_checkpoint_bytes(model, scaler, metadata):
+    buffer = io.BytesIO()
+    torch.save({"model": model.state_dict(), "scaler": scaler.state_dict() if scaler else None,
+                "metadata": metadata}, buffer)
+    return buffer.getvalue()
+
+
+def new_verifier_id():
+    return uuid.uuid4().hex[:16]

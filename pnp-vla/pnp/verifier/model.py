@@ -60,7 +60,8 @@ class CleanChunkVerifier(nn.Module):
         self.position_encoder = nn.Sequential(nn.Linear(1, 32), nn.GELU(), nn.Linear(32, 32))
         self.state_head = nn.Sequential(
             nn.Linear(context_dim + 32, 128), nn.GELU(), nn.Dropout(dropout), nn.Linear(128, 1))
-        self.action_norm = nn.LayerNorm(action_dim)
+        self.register_buffer("action_mean", torch.zeros(action_dim))
+        self.register_buffer("action_std", torch.ones(action_dim))
         self.action_in = nn.Linear(action_dim, width)
         self.temporal = nn.ModuleList([
             ResidualTemporalBlock(width, dilation, dropout) for dilation in (1, 2, 4)])
@@ -77,9 +78,14 @@ class CleanChunkVerifier(nn.Module):
         position = self.position_encoder(chunk_position.reshape(-1, 1).float())
         return obs, position
 
+    def set_action_statistics(self, mean, std):
+        self.action_mean.copy_(torch.as_tensor(mean, dtype=self.action_mean.dtype))
+        self.action_std.copy_(torch.as_tensor(std, dtype=self.action_std.dtype).clamp_min(1e-6))
+
     def _encode_actions(self, actions, action_mask, prefix_length):
         valid = action_mask.float().unsqueeze(-1)
-        x = self.action_in(self.action_norm(actions)) * valid
+        normalized = (actions - self.action_mean) / self.action_std
+        x = self.action_in(normalized) * valid
         x = x.transpose(1, 2)
         for block in self.temporal:
             x = block(x) * valid.transpose(1, 2)
@@ -116,5 +122,45 @@ class CleanChunkVerifier(nn.Module):
     def forward(self, obs_enc, actions, action_mask, chunk_position, prefix_length=10):
         context = self.encode_context(obs_enc, chunk_position)
         state = self.state_head(torch.cat(context, dim=-1)).squeeze(-1)
+        joint = self.score_candidates(context, actions, action_mask, prefix_length).squeeze(-1)
+        return VerifierOutput(state_logit=state, joint_logit=joint)
+
+
+class FlattenedVerifier(nn.Module):
+    """Historical flattened-action baseline with the same public scoring interface."""
+    def __init__(self, obs_dim=2048, horizon=50, action_dim=7, hidden=256, dropout=0.2):
+        super().__init__()
+        self.obs_dim, self.action_dim, self.horizon = obs_dim, action_dim, horizon
+        self.register_buffer("action_mean", torch.zeros(action_dim))
+        self.register_buffer("action_std", torch.ones(action_dim))
+        self.obs_encoder = nn.Sequential(nn.LayerNorm(obs_dim), nn.Linear(obs_dim, 128), nn.GELU())
+        self.position_encoder = nn.Sequential(nn.Linear(1, 32), nn.GELU(), nn.Linear(32, 32))
+        self.state_head = nn.Linear(160, 1)
+        self.joint = nn.Sequential(
+            nn.LayerNorm(horizon * action_dim + 160), nn.Linear(horizon * action_dim + 160, hidden),
+            nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(hidden, 1))
+
+    def encode_context(self, obs_enc, chunk_position):
+        return self.obs_encoder(obs_enc), self.position_encoder(chunk_position.reshape(-1, 1))
+
+    def set_action_statistics(self, mean, std):
+        self.action_mean.copy_(torch.as_tensor(mean, dtype=self.action_mean.dtype))
+        self.action_std.copy_(torch.as_tensor(std, dtype=self.action_std.dtype).clamp_min(1e-6))
+
+    def score_candidates(self, context, actions, action_mask, prefix_length=50):
+        if actions.ndim == 3:
+            actions, action_mask = actions[:, None], action_mask[:, None]
+        batch, candidates = actions.shape[:2]
+        masked = ((actions - self.action_mean) / self.action_std) * action_mask.unsqueeze(-1)
+        flat = masked.reshape(batch * candidates, -1)
+        obs, position = context
+        ctx = torch.cat([obs, position], -1)
+        ctx = ctx[:, None].expand(batch, candidates, -1).reshape(batch * candidates, -1)
+        return self.joint(torch.cat([flat, ctx], -1)).reshape(batch, candidates)
+
+    def forward(self, obs_enc, actions, action_mask, chunk_position, prefix_length=50):
+        context = self.encode_context(obs_enc, chunk_position)
+        state = self.state_head(torch.cat(context, -1)).squeeze(-1)
         joint = self.score_candidates(context, actions, action_mask, prefix_length).squeeze(-1)
         return VerifierOutput(state_logit=state, joint_logit=joint)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from dataclasses import replace
 import hashlib
 import io
 from typing import Iterable, Sequence
@@ -32,6 +33,7 @@ class CleanChunkExample:
     success: int
     candidate_group_id: str | None = None
     candidate_kind: str | None = None
+    pairing_mode: str | None = None
 
     @property
     def task_key(self) -> tuple[str, str, int]:
@@ -106,6 +108,41 @@ def load_clean_chunk_examples(store, experiments: Sequence[str], *, horizon: int
     return examples
 
 
+def load_candidate_examples(store, experiment: str = "verifier-clean-pairs-v1"):
+    """Load exact/fallback candidate artifacts into the common verifier example type."""
+    groups = (store.client.table("verifier_candidate_groups").select("*")
+              .eq("experiment", experiment).execute().data or [])
+    group_by_id = {row["candidate_group_id"]: row for row in groups}
+    candidates = store.client.table("verifier_candidates").select("*").execute().data or []
+    examples = []
+    for row in candidates:
+        group = group_by_id.get(row["candidate_group_id"])
+        if group is None:
+            continue
+        with np.load(io.BytesIO(store._download(row["env_chunk_path"]))) as artifact:
+            actions = np.asarray(artifact["actions"], dtype=np.float32)[:, :7]
+            mask = (np.asarray(artifact["mask"], dtype=np.bool_) if "mask" in artifact
+                    else np.ones(len(actions), dtype=np.bool_))
+        with np.load(io.BytesIO(store._download(row["observation_path"]))) as artifact:
+            obs_enc = np.asarray(artifact["obs_enc"], dtype=np.float32).reshape(-1)
+        padded = np.zeros((50, 7), dtype=np.float32)
+        padded_mask = np.zeros(50, dtype=np.bool_)
+        n = min(50, len(actions))
+        padded[:n], padded_mask[:n] = actions[:n], mask[:n]
+        examples.append(CleanChunkExample(
+            rollout_id=row["candidate_id"], experiment=experiment,
+            benchmark=group["benchmark"], suite=group["suite"],
+            task_idx=int(group["task_idx"]), episode_idx=int(group["episode_idx"]),
+            chunk_idx=int(group["chunk_idx"]),
+            chunk_position=float((group.get("metadata_json") or {}).get(
+                "chunk_position", group["chunk_idx"])),
+            obs_enc=obs_enc, actions=padded, action_mask=padded_mask,
+            success=int(bool(row["success"])), candidate_group_id=row["candidate_group_id"],
+            candidate_kind=row["candidate_kind"], pairing_mode=group["pairing_mode"],
+        ))
+    return examples
+
+
 def _rollout_records(examples: Iterable[CleanChunkExample]) -> dict[str, CleanChunkExample]:
     return {example.rollout_id: example for example in examples}
 
@@ -117,6 +154,16 @@ def hard_task_keys(examples: Iterable[CleanChunkExample], lo: float = 0.10,
     for example in _rollout_records(examples).values():
         outcomes[example.task_key].append(example.success)
     return {key for key, values in outcomes.items() if lo < np.mean(values) < hi}
+
+
+def action_statistics(examples: Sequence[CleanChunkExample]):
+    """Training-only per-dimension statistics over valid environment actions."""
+    valid = [example.actions[example.action_mask] for example in examples
+             if example.action_mask.any()]
+    if not valid:
+        raise ValueError("cannot compute action statistics from an empty dataset")
+    actions = np.concatenate(valid, axis=0).astype(np.float64)
+    return actions.mean(0).astype(np.float32), actions.std(0).clip(min=1e-6).astype(np.float32)
 
 
 def _stable_order(values, seed: int):
@@ -183,10 +230,47 @@ def heldout_task_split(examples: Sequence[CleanChunkExample], fold: int = 0,
     val_tasks, cal_tasks = set(remaining[:n_aux]), set(remaining[n_aux:2 * n_aux])
     train_tasks = set(remaining[2 * n_aux:])
     split_tasks = {"train": train_tasks, "val": val_tasks, "cal": cal_tasks, "test": test_tasks}
-    return {name: [rid for task in tasks for rid in task_to_ids[task]]
+    return {name: [rid for task in sorted(tasks) for rid in sorted(task_to_ids[task])]
             for name, tasks in split_tasks.items()}
+
+
+def candidate_group_split(examples: Sequence[CleanChunkExample], seed: int = 42):
+    """Deterministic 60/10/10/20 split that never separates a matched candidate group."""
+    grouped, group_task = defaultdict(list), {}
+    for example in examples:
+        if example.candidate_group_id:
+            grouped[example.candidate_group_id].append(example.rollout_id)
+            group_task[example.candidate_group_id] = example.task_key
+    ordered = _stable_order(grouped, seed)
+    n = len(ordered)
+    a, b, c = round(.6 * n), round(.7 * n), round(.8 * n)
+    assignments = {"train": ordered[:a], "val": ordered[a:b],
+                   "cal": ordered[b:c], "test": ordered[c:]}
+    output = {name: [] for name in ("train", "val", "cal", "test")}
+    for name, ids in assignments.items():
+        output[name].extend(candidate_id for gid in ids for candidate_id in grouped[gid])
+    return output
 
 
 def select_examples(examples: Sequence[CleanChunkExample], rollout_ids: Iterable[str]):
     wanted = set(rollout_ids)
     return [example for example in examples if example.rollout_id in wanted]
+
+
+def shuffle_actions_within_task(examples: Sequence[CleanChunkExample], seed: int = 42):
+    """Return a shortcut-control copy with actions permuted within task and chunk index."""
+    rng = np.random.default_rng(seed)
+    groups = defaultdict(list)
+    for index, example in enumerate(examples):
+        groups[(example.task_key, example.chunk_idx)].append(index)
+    donors = list(range(len(examples)))
+    for indices in groups.values():
+        permuted = list(indices)
+        if len(permuted) > 1:
+            while any(a == b for a, b in zip(indices, permuted)):
+                rng.shuffle(permuted)
+        for target, donor in zip(indices, permuted):
+            donors[target] = donor
+    return [replace(example, actions=examples[donor].actions.copy(),
+                    action_mask=examples[donor].action_mask.copy())
+            for example, donor in zip(examples, donors)]
