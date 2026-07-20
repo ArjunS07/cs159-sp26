@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from pathlib import Path
 
 import pandas as pd
 
@@ -157,7 +155,8 @@ def _run_config(value):
     return {}
 
 
-def validate_pro(rollouts: pd.DataFrame, runs: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict]:
+def validate_pro(rollouts: pd.DataFrame, runs: pd.DataFrame | None = None,
+                 artifact_validation: dict | None = None) -> tuple[pd.DataFrame, dict]:
     """Validate the canonical six-suite, three-condition LIBERO-PRO collection."""
     required = set(PAIR_KEYS + ["experiment", "rollout_id", "run_id", "benchmark",
                    "config_hash", "method", "status", "success", "suite_family",
@@ -212,8 +211,16 @@ def validate_pro(rollouts: pd.DataFrame, runs: pd.DataFrame | None = None) -> tu
     if "episode_seed" in observed and "perturb_seed" in observed and not (
             observed["episode_seed"] == observed["perturb_seed"]).all():
         raise ValidationError("PRO observed perturbation seed is not isolated")
+    warnings = []
+    artifact_validation = artifact_validation or {}
+    pcp_artifacts = artifact_validation.get("pcp_chunks_path")
+    if pcp_artifacts is not None:
+        if pcp_artifacts.get("status") != "valid" or pcp_artifacts.get("verified") != 600:
+            raise ValidationError("expected 600 verified PRO PCP feature artifacts")
+    else:
+        warnings.append("PCP feature artifact references were not storage-verified")
 
-    warnings, run_summary = [], {"completed_shards": [], "failed_runs": 0}
+    run_summary = {"completed_shards": [], "failed_runs": 0}
     runs = runs if runs is not None else pd.DataFrame()
     if runs.empty:
         warnings.append("PRO run metadata unavailable")
@@ -241,4 +248,5 @@ def validate_pro(rollouts: pd.DataFrame, runs: pd.DataFrame | None = None) -> tu
                 "n_identities": len(identities), "n_configurations": df["config_hash"].nunique(),
                 "n_suites": df["suite"].nunique(), "canonical_complete": True,
                 "expanded_complete": False, "run_summary": run_summary,
-                "warnings": warnings, "coverage": matrix.to_dict("records")}
+                "warnings": warnings, "artifact_validation": artifact_validation,
+                "coverage": matrix.to_dict("records")}

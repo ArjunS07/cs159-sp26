@@ -12,6 +12,7 @@ import pandas as pd
 
 SNAPSHOT_SCHEMA_VERSION = "1"
 TABLES = ("rollouts", "pnp_euler_steps", "pnp_action_vectors", "experiment_runs")
+ARTIFACT_COLUMNS = ("ahats_path", "pcp_chunks_path", "trajectory_path", "obs_frames_path")
 
 
 def paginated_rows(client, table: str, *, experiment: str | None = None,
@@ -32,6 +33,31 @@ def _git_sha(repo: Path) -> str:
     result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                             text=True, capture_output=True, check=False)
     return result.stdout.strip()
+
+
+def verify_artifact_references(client, rollouts: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    """Verify referenced Storage keys by listing each bucket folder once."""
+    bucket = client.storage.from_("artifacts")
+    references = {
+        column: sorted(map(str, rollouts[column].dropna().unique()))
+        for column in ARTIFACT_COLUMNS if column in rollouts
+    }
+    folders = {path.rsplit("/", 1)[0] for paths in references.values() for path in paths}
+    available = set()
+    for folder in sorted(folders):
+        offset = 0
+        while True:
+            page = bucket.list(folder, {"limit": 1000, "offset": offset})
+            available.update(f"{folder}/{row['name']}" for row in page if row.get("name"))
+            if len(page) < 1000:
+                break
+            offset += 1000
+    result = {}
+    for column, paths in references.items():
+        missing = sorted(set(paths) - available)
+        result[column] = {"referenced": len(paths), "verified": len(paths) - len(missing),
+                          "missing": missing, "status": "valid" if not missing else "invalid"}
+    return result
 
 
 def materialize(client, experiment: str, root: Path, *, page_size: int = 1000,
@@ -62,6 +88,7 @@ def materialize(client, experiment: str, root: Path, *, page_size: int = 1000,
     for name, frame in frames.items():
         frame.to_parquet(destination / f"{name}.parquet", index=False)
     rollouts = frames["rollouts"]
+    artifact_validation = verify_artifact_references(client, rollouts)
     manifest = {
         "snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION,
         "snapshot_id": snapshot_id,
@@ -73,6 +100,7 @@ def materialize(client, experiment: str, root: Path, *, page_size: int = 1000,
         "package_git_sha": _git_sha(Path(__file__).parents[1]),
         "schema_versions": sorted(map(str, rollouts.get("schema_version", pd.Series(dtype=str)).dropna().unique())),
         "sampler_versions": sorted(map(str, rollouts.get("sampler_algo_version", pd.Series(dtype=str)).dropna().unique())),
+        "artifact_validation": artifact_validation,
         "validation": {"status": "not_run"},
     }
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
