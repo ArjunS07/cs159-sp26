@@ -85,7 +85,7 @@ def denoising_figures(tables: dict[str, pd.DataFrame], output: Path,
                         marker="o", capsize=2, label=outcome, color=color)
         ax.set(xlabel="Denoising step", ylabel=label)
     axes[-1].legend()
-    fig.suptitle("Observed-arm denoising dynamics by outcome")
+    fig.suptitle("Denoising dynamics by outcome")
     _save_figure(fig, f"{prefix}denoising_profiles", output)
 
     step_auc = tables[f"{prefix}denoising_step_metrics"]
@@ -164,7 +164,7 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.errorbar(auc, labels, xerr=np.vstack((auc - low, high - auc)), fmt="o", capsize=3)
     ax.axvline(.5, color="black", ls="--", lw=1); ax.set_xlim(0, 1)
-    ax.set_xlabel("ROC-AUC (identity-bootstrap 95% CI)"); ax.set_title("Observed-arm failure detector")
+    ax.set_xlabel("ROC-AUC (identity-bootstrap 95% CI)"); ax.set_title("Failure detector")
     _save_figure(fig, "detector_auc_by_suite", output)
 
     # Legacy ROC-curve view, corrected to use only prospective observed-arm telemetry.
@@ -176,7 +176,7 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
         ax.plot(group.fpr, group.tpr, lw=width, label=f"{name} (AUC={auc_lookup[name]:.3f})")
     ax.plot([0, 1], [0, 1], "k--", lw=.8, label="random")
     ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="False positive rate", ylabel="True positive rate",
-           title="Observed-arm failure-detector ROC curves")
+           title="Failure-detector ROC curves")
     ax.legend(fontsize=8, loc="lower right")
     _save_figure(fig, "detector_roc_curves", output)
 
@@ -185,7 +185,7 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.barh(frame.score, frame.roc_auc, color="#72B7B2")
     ax.axvline(.5, color="black", ls="--", lw=1); ax.set_xlim(0, 1)
-    ax.set_xlabel("ROC-AUC"); ax.set_title("Observed-arm detector by action dimension")
+    ax.set_xlabel("ROC-AUC"); ax.set_title("Detector by action dimension")
     _save_figure(fig, "detector_per_dof", output)
 
     # Early telemetry is prospective; full episode is the complete observed trajectory.
@@ -212,7 +212,7 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(100 * frame.coverage, 100 * frame.risk, marker="o")
     ax.set(xlabel="Coverage retained (%)", ylabel="Failure risk (%)", xlim=(0, 100),
-           title="Observed-arm risk–coverage curve")
+           title="Risk–coverage curve")
     _save_figure(fig, "detector_risk_coverage", output)
 
     # Euler-step discriminability profile from the single shared step-indexed rollout.
@@ -278,7 +278,7 @@ def publication_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
         ax.bar(x - width / 2, frame.parallel_variance_mean, width, label="parallel")
         ax.bar(x + width / 2, frame.lateral_variance_mean, width, label="lateral")
         ax.set_xticks(x, labels); ax.set_ylabel("Mean directional variance")
-        ax.set_title("Observed-arm directional uncertainty geometry"); ax.legend()
+        ax.set_title("Directional uncertainty geometry"); ax.legend()
         _save_figure(fig, "geometry_directional", output)
 
 
@@ -382,7 +382,7 @@ def pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.errorbar(auc, names, xerr=np.vstack((auc - low, high - auc)), fmt="o", capsize=3)
     ax.axvline(.5, color="black", ls="--"); ax.set_xlim(0, 1); ax.set_xlabel("ROC-AUC (95% CI)")
-    ax.set_title("PRO observed-arm detector by suite")
+    ax.set_title("PRO failure detector by suite")
     _save_figure(fig, "pro_detector_auc", output)
 
     curves = tables["pro_detector_roc_curves"]
@@ -470,7 +470,7 @@ def pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
         ax.bar(x - width / 2, directional.parallel_variance_mean, width, label="parallel")
         ax.bar(x + width / 2, directional.lateral_variance_mean, width, label="lateral")
         ax.set_xticks(x, labels); ax.set_ylabel("Mean directional variance")
-        ax.set_title("PRO observed-arm directional geometry"); ax.legend()
+        ax.set_title("PRO directional geometry"); ax.legend()
         _save_figure(fig, "pro_geometry_directional", output)
 
 
