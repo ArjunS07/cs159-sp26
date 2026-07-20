@@ -13,7 +13,6 @@ model files on local `/content/hf_home` rather than Google Drive FUSE. If it rep
 stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in place.
 
 - `01_run_experiments.ipynb` — `run_controlled_slice()` (LIBERO slice) + `run_pro()` (LIBERO-PRO)
-- `02_pcp_train_eval.ipynb` — `pcp_collect()` → `train_q_corrector()` → `pcp_eval()`
 - `03_verifier_experiments.ipynb` — clean t=1 reconstruction, shortcut controls, temporal
   verifier training, calibration, held-out evaluation, and checkpoint registration.
 - `04_collect_verifier_pairs.ipynb` — isolated, resumable 125-pair / 250-outcome exact clean
