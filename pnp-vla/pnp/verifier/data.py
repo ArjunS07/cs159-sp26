@@ -173,20 +173,43 @@ def _stable_order(values, seed: int):
     return sorted(values, key=key)
 
 
-def _interleaved_rollouts(records: Sequence[CleanChunkExample], seed: int) -> list[str]:
-    by_label = {0: [], 1: []}
+def _partition_sizes(n: int) -> dict[str, int]:
+    if n >= 10:
+        return {"train": n - 4, "val": 1, "cal": 1, "test": 2}
+    raw = {"train": .6 * n, "val": .1 * n, "cal": .1 * n, "test": .2 * n}
+    sizes = {name: int(value) for name, value in raw.items()}
+    for name in sorted(raw, key=lambda key: raw[key] - sizes[key], reverse=True)[:n - sum(sizes.values())]:
+        sizes[name] += 1
+    return sizes
+
+
+def _stratified_task_assignment(records: Sequence[CleanChunkExample], seed: int):
+    """Fill fixed split capacities while spreading every outcome proportionally.
+
+    In particular, two minority examples allocate to train and test under a 6/1/1/2 split,
+    rather than both being consumed by the leading training slice.
+    """
+    names = ("train", "val", "cal", "test")
+    capacities = _partition_sizes(len(records))
+    assigned = {name: [] for name in names}
+    by_label = defaultdict(list)
     for record in records:
         by_label[record.success].append(record.rollout_id)
-    queues = {label: _stable_order(ids, seed + label) for label, ids in by_label.items()}
-    result: list[str] = []
-    while queues[0] or queues[1]:
-        label = 0 if len(queues[0]) >= len(queues[1]) else 1
-        if queues[label]:
-            result.append(queues[label].pop(0))
-        other = 1 - label
-        if queues[other]:
-            result.append(queues[other].pop(0))
-    return result
+    label_order = sorted(by_label, key=lambda label: (len(by_label[label]), label))
+    for label in label_order:
+        ids = _stable_order(by_label[label], seed + int(label))
+        ideal = {name: len(ids) * capacities[name] / max(len(records), 1) for name in names}
+        label_counts = {name: 0 for name in names}
+        tie_order = list(names)
+        shift = (seed + int(label)) % len(names)
+        tie_order = tie_order[shift:] + tie_order[:shift]
+        for rollout_id in ids:
+            available = [name for name in names if len(assigned[name]) < capacities[name]]
+            chosen = max(available, key=lambda name: (
+                ideal[name] - label_counts[name], -tie_order.index(name)))
+            assigned[chosen].append(rollout_id)
+            label_counts[chosen] += 1
+    return assigned
 
 
 def known_task_split(examples: Sequence[CleanChunkExample], seed: int = 42) -> dict[str, list[str]]:
@@ -196,16 +219,10 @@ def known_task_split(examples: Sequence[CleanChunkExample], seed: int = 42) -> d
         grouped[record.task_key].append(record)
     split = {name: [] for name in ("train", "val", "cal", "test")}
     for task, records in sorted(grouped.items()):
-        ids = _interleaved_rollouts(records, seed + int(hashlib.md5(str(task).encode()).hexdigest()[:6], 16))
-        n = len(ids)
-        if n >= 10:
-            cuts = (6, 7, 8)
-        else:
-            cuts = (max(1, round(.6 * n)), max(2, round(.7 * n)), max(3, round(.8 * n)))
-        split["train"].extend(ids[:cuts[0]])
-        split["val"].extend(ids[cuts[0]:cuts[1]])
-        split["cal"].extend(ids[cuts[1]:cuts[2]])
-        split["test"].extend(ids[cuts[2]:])
+        task_seed = seed + int(hashlib.md5(str(task).encode()).hexdigest()[:6], 16)
+        assignment = _stratified_task_assignment(records, task_seed)
+        for name, ids in assignment.items():
+            split[name].extend(ids)
     return split
 
 

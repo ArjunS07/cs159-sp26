@@ -48,6 +48,24 @@ def test_known_split_keeps_rollout_chunks_together_and_disjoint():
     assert not any(a & b for i, a in enumerate(sets) for b in sets[i + 1:])
 
 
+def test_known_split_spreads_two_failures_between_train_and_test():
+    examples = [_example(0, episode, episode >= 2) for episode in range(10)]
+    split = known_task_split(examples)
+    label = {e.rollout_id: e.success for e in examples}
+    assert sum(not label[rid] for rid in split["train"]) == 1
+    assert sum(not label[rid] for rid in split["test"]) == 1
+    assert {name: len(ids) for name, ids in split.items()} == {
+        "train": 6, "val": 1, "cal": 1, "test": 2}
+
+
+def test_known_split_keeps_a_single_failure_in_training():
+    examples = [_example(0, episode, episode >= 1) for episode in range(10)]
+    split = known_task_split(examples)
+    label = {e.rollout_id: e.success for e in examples}
+    assert sum(not label[rid] for rid in split["train"]) == 1
+    assert all(label[rid] for name in ("val", "cal", "test") for rid in split[name])
+
+
 def test_heldout_split_has_disjoint_tasks():
     examples = [_example(task, episode, episode % 2) for task in range(40) for episode in range(10)]
     split = heldout_task_split(examples)
