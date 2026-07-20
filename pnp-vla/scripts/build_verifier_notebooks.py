@@ -127,7 +127,16 @@ print({kind: {k: len(v) for k, v in split.items()} for kind, split in manifests.
 
 results = {}'''),
     md("## 7. Observation-only shortcut baseline"),
-    code(r'''for seed in SEEDS:
+    code(r'''# Empirical task-prior baseline (diagnostic only; task identity is never fed to the model).
+train_records = {e.rollout_id: e for e in select_examples(hard_examples, known_split["train"])}
+test_records = {e.rollout_id: e for e in select_examples(hard_examples, known_split["test"])}
+task_rate = pd.DataFrame([{"task": e.task_key, "success": e.success} for e in train_records.values()]).groupby("task").success.mean()
+prior_labels = [e.success for e in test_records.values()]
+prior_probs = [float(task_rate.get(e.task_key, np.mean(prior_labels))) for e in test_records.values()]
+print("task-prior", classification_metrics(prior_labels, prior_probs,
+      [str(e.task_key) for e in test_records.values()]))
+
+for seed in SEEDS:
     cfg = VerifierTrainConfig(seed=seed, score_head="state", prefix_length=10)
     results[f"state_seed{seed}"] = run_experiment(
         f"state-seed{seed}", lambda: CleanChunkVerifier(), known_split, cfg)'''),
@@ -154,6 +163,13 @@ for seed in SEEDS:
     results[f"shuffled_seed{seed}"] = run_experiment(
         f"shuffled-seed{seed}", lambda: CleanChunkVerifier(), known_split, cfg,
         dataset=shuffled)'''),
+    md("## 11b. Zero-action shortcut test"),
+    code(r'''zeroed = zero_actions(hard_examples)
+for seed in SEEDS:
+    cfg = VerifierTrainConfig(seed=seed, prefix_length=10)
+    results[f"zero_action_seed{seed}"] = run_experiment(
+        f"zero-action-seed{seed}", lambda: CleanChunkVerifier(), known_split, cfg,
+        dataset=zeroed)'''),
     md("## 12. Cohort ablations: all tasks, LIBERO, PRO, and transfer"),
     code(r'''cohort_results = {}
 for label, cohort in {
@@ -166,6 +182,16 @@ for label, cohort in {
     cohort_results[label] = run_experiment(
         f"cohort-{label}", lambda: CleanChunkVerifier(), split, cfg, dataset=cohort)
 results.update({f"cohort_{k}": v for k, v in cohort_results.items()})'''),
+    md("## 12b. Cross-benchmark transfer"),
+    code(r'''libero_hard = [e for e in hard_examples if e.benchmark == "libero"]
+pro_hard = [e for e in hard_examples if e.benchmark == "libero_pro"]
+for source, target, trained in (
+    ("libero", pro_hard, cohort_results["libero_hard"]),
+    ("pro", libero_hard, cohort_results["pro_hard"]),
+):
+    transfer = evaluate_verifier(trained["model"], target, DEVICE,
+                                 config=trained["config"], scaler=trained["scaler"])
+    print(source, "transfer", json.dumps(transfer, indent=2))'''),
     md("## 13. Held-out-task evaluation for the selected prefix"),
     code(r'''heldout_results = {}
 SELECTED_PREFIX = 10

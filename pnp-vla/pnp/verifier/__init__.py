@@ -12,6 +12,7 @@ from .data import (
     load_candidate_examples,
     select_examples,
     shuffle_actions_within_task,
+    zero_actions,
 )
 from .model import CleanChunkVerifier, FlattenedVerifier, VerifierOutput
 from .collection import (
@@ -30,6 +31,7 @@ from .train import (
     TemperatureScaler,
     VerifierTrainConfig,
     calibrate_temperature,
+    classification_metrics,
     evaluate_verifier,
     dataset_hash,
     new_verifier_id,
@@ -48,6 +50,7 @@ __all__ = [
     "build_clean_chunk_examples",
     "candidate_group_split",
     "calibrate_temperature",
+    "classification_metrics",
     "evaluate_verifier",
     "dataset_hash",
     "hard_task_keys",
@@ -58,6 +61,7 @@ __all__ = [
     "new_verifier_id",
     "select_examples",
     "shuffle_actions_within_task",
+    "zero_actions",
     "train_verifier",
     "verifier_checkpoint_bytes",
     "SimulatorSnapshot",

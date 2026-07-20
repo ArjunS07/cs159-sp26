@@ -46,6 +46,7 @@ class CleanChunkDataset(Dataset):
             "position": torch.tensor(e.chunk_position, dtype=torch.float32),
             "label": torch.tensor(e.success, dtype=torch.float32),
             "rollout_id": e.rollout_id, "task_key": "|".join(map(str, e.task_key)),
+            "suite": e.suite,
             "candidate_group_id": e.candidate_group_id or "",
         }
 
@@ -139,6 +140,11 @@ def _metrics(labels, probabilities, task_keys):
     }
 
 
+def classification_metrics(labels, probabilities, task_keys):
+    """Public metric helper for empirical-prior and other non-neural baselines."""
+    return _metrics(labels, probabilities, task_keys)
+
+
 def _forward(model, batch, device, config):
     obs = batch["obs"].to(device)
     if config.zero_observation:
@@ -159,7 +165,7 @@ def _chosen_logit(output, config):
 def evaluate_verifier(model, examples, device, *, config=None, scaler=None, paired_examples=None):
     config = config or VerifierTrainConfig()
     model.eval()
-    labels, probs, tasks = [], [], []
+    labels, probs, tasks, suites = [], [], [], []
     for batch in _loader(examples, config):
         output = _forward(model, batch, device, config)
         logits = _chosen_logit(output, config)
@@ -168,7 +174,14 @@ def evaluate_verifier(model, examples, device, *, config=None, scaler=None, pair
         probs.extend(torch.sigmoid(logits).cpu().numpy().tolist())
         labels.extend(batch["label"].numpy().tolist())
         tasks.extend(batch["task_key"])
+        suites.extend(batch["suite"])
     metrics = _metrics(labels, probs, tasks)
+    metrics["per_suite"] = {
+        suite: _metrics([labels[i] for i in indices], [probs[i] for i in indices],
+                        [tasks[i] for i in indices])
+        for suite in sorted(set(suites))
+        for indices in [[i for i, value in enumerate(suites) if value == suite]]
+    }
     pair_dataset = DiscordantPairDataset(paired_examples)
     if len(pair_dataset):
         correct, total = 0, 0

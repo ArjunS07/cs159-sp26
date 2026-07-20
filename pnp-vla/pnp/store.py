@@ -480,6 +480,14 @@ class SupabaseStore:
                 self._json(candidate), on_conflict="candidate_id").execute()
         return group_id
 
+    def load_verifier(self, verifier_id: str):
+        import torch
+        row = (self.client.table("verifier_models").select("*")
+               .eq("verifier_id", verifier_id).single().execute().data)
+        checkpoint = torch.load(io.BytesIO(self._download(row["checkpoint_path"])),
+                                map_location="cpu", weights_only=False)
+        return checkpoint, row
+
     def load_q_corrector(self, q_ckpt_id: str):
         import torch
         row = self.client.table("q_correctors").select("*").eq("q_ckpt_id", q_ckpt_id) \

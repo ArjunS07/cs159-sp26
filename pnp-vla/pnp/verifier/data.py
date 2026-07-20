@@ -274,3 +274,8 @@ def shuffle_actions_within_task(examples: Sequence[CleanChunkExample], seed: int
     return [replace(example, actions=examples[donor].actions.copy(),
                     action_mask=examples[donor].action_mask.copy())
             for example, donor in zip(examples, donors)]
+
+
+def zero_actions(examples: Sequence[CleanChunkExample]):
+    """Return an action-ablated copy while preserving masks and every identity field."""
+    return [replace(example, actions=np.zeros_like(example.actions)) for example in examples]
