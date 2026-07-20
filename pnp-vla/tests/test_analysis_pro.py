@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from analysis.pro import base_suite, cross_validated_policy
+from analysis.pro import base_suite, cross_validated_policy, standard_threshold_transfer
 from analysis.validate import ValidationError, validate_pro
 from pnp.config import Method
 from pnp.libero_pro import CANONICAL_PRO_SUITES, LIBERO_PRO_REVISION
@@ -77,3 +77,23 @@ def test_cross_validated_policy_selects_on_training_folds_only():
     assert set(result.fold) == set(range(5))
     assert result.n.sum() == 100
     assert result[["lower_train_only", "upper_train_only"]].notna().all().all()
+
+
+def test_standard_threshold_transfer_selects_only_on_standard_labels():
+    standard = pd.DataFrame({
+        "method": [Method.UNCERTAINTY] * 6,
+        "success": [True, True, True, False, False, False],
+        "u_mean_episode": [.01, .02, .03, .07, .08, .09],
+    })
+    pro = pd.DataFrame({
+        "method": [Method.UNCERTAINTY] * 4,
+        "suite": ["libero_object_temp_x0.1"] * 4,
+        "success": [False, True, False, True],
+        "u_mean_episode": [.01, .02, .08, .09],
+    })
+    first = standard_threshold_transfer(pro, standard)
+    second = standard_threshold_transfer(pro.assign(success=~pro.success), standard)
+    assert first.threshold_standard_only.nunique() == 1
+    assert first.threshold_standard_only.iloc[0] == second.threshold_standard_only.iloc[0]
+    assert set(first.selection_dataset) == {"standard_libero"}
+    assert set(first.evaluation_dataset) == {"libero_pro"}
