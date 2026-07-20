@@ -34,3 +34,23 @@ Commands are `snapshot`, `validate`, `standard`, `pro`, `pcp`, and `all`. Missin
 represented by explicit `not_available` records. Validation failures exit nonzero. In particular,
 the current K=3 collection cannot support Sarle's bimodality coefficient, and refinement telemetry
 is never admitted to the prospective observed-arm detector analysis.
+
+For the canonical LIBERO-PRO collection, refresh its snapshot once and analyze it against a
+validated standard-LIBERO snapshot:
+
+```bash
+.venv-analysis/bin/python -m analysis.run_analysis snapshot \
+  --experiment libero-pro-canonical-core-k3-v1
+.venv-analysis/bin/python -m analysis.run_analysis pro \
+  --experiment libero-pro-canonical-core-k3-v1 \
+  --reference-experiment libero-hybrid-schedules-k3-v1
+```
+
+The canonical PRO result requires exactly 600 identities across the six declared suites and one
+row per identity for observed/no-op, 16-step control, and refine-last `(4,5)`. The expanded
+16-suite collection remains explicitly `not_available` until complete. Legacy threshold heatmaps
+are labeled exploratory and in-sample; the selective-refinement estimate is reported separately
+from five held-out, suite/outcome-stratified folds. Detector thresholds transferred from standard
+LIBERO are selected using standard labels only. Storage references are verified during snapshot
+creation; `ahats` and observation-frame analyses remain unavailable because those artifacts are
+not present.
