@@ -108,12 +108,31 @@ def load_clean_chunk_examples(store, experiments: Sequence[str], *, horizon: int
     return examples
 
 
-def load_candidate_examples(store, experiment: str = "verifier-clean-pairs-v1"):
+def load_candidate_examples(store, experiment="verifier-clean-pairs-v1"):
     """Load exact/fallback candidate artifacts into the common verifier example type."""
-    groups = (store.client.table("verifier_candidate_groups").select("*")
-              .eq("experiment", experiment).execute().data or [])
-    group_by_id = {row["candidate_group_id"]: row for row in groups}
+    experiments = [experiment] if isinstance(experiment, str) else list(experiment)
+    query = store.client.table("verifier_candidate_groups").select("*")
+    query = query.eq("experiment", experiments[0]) if len(experiments) == 1 else query.in_("experiment", experiments)
+    groups = query.execute().data or []
     candidates = store.client.table("verifier_candidates").select("*").execute().data or []
+    candidate_counts = Counter(row["candidate_group_id"] for row in candidates)
+    # Old fallback IDs included a requested mid-rollout chunk even though the
+    # actual branch was always episode-initial. Keep only the richest group per
+    # true causal identity so repeated fallbacks cannot inflate pair counts.
+    fallback = defaultdict(list)
+    retained = []
+    for group in groups:
+        if group["pairing_mode"] == "paired_full_episode":
+            key = (group["benchmark"], group["suite"], group["task_idx"], group["episode_idx"])
+            fallback[key].append(group)
+        else:
+            retained.append(group)
+    for members in fallback.values():
+        retained.append(max(members, key=lambda g: (
+            candidate_counts[g["candidate_group_id"]],
+            experiments.index(g["experiment"]), g["candidate_group_id"])))
+    groups = retained
+    group_by_id = {row["candidate_group_id"]: row for row in groups}
     examples = []
     for row in candidates:
         group = group_by_id.get(row["candidate_group_id"])
@@ -130,7 +149,7 @@ def load_candidate_examples(store, experiment: str = "verifier-clean-pairs-v1"):
         n = min(50, len(actions))
         padded[:n], padded_mask[:n] = actions[:n], mask[:n]
         examples.append(CleanChunkExample(
-            rollout_id=row["candidate_id"], experiment=experiment,
+            rollout_id=row["candidate_id"], experiment=group["experiment"],
             benchmark=group["benchmark"], suite=group["suite"],
             task_idx=int(group["task_idx"]), episode_idx=int(group["episode_idx"]),
             chunk_idx=int(group["chunk_idx"]),
@@ -252,17 +271,22 @@ def heldout_task_split(examples: Sequence[CleanChunkExample], fold: int = 0,
 
 
 def candidate_group_split(examples: Sequence[CleanChunkExample], seed: int = 42):
-    """Deterministic 60/10/10/20 split that never separates a matched candidate group."""
+    """Group-safe 60/10/10/20 split stratified by outcome discordance."""
     grouped, group_task = defaultdict(list), {}
     for example in examples:
         if example.candidate_group_id:
             grouped[example.candidate_group_id].append(example.rollout_id)
             group_task[example.candidate_group_id] = example.task_key
-    ordered = _stable_order(grouped, seed)
-    n = len(ordered)
-    a, b, c = round(.6 * n), round(.7 * n), round(.8 * n)
-    assignments = {"train": ordered[:a], "val": ordered[a:b],
-                   "cal": ordered[b:c], "test": ordered[c:]}
+    labels = {gid: {example.success for example in examples
+                    if example.candidate_group_id == gid} for gid in grouped}
+    assignments = {name: [] for name in ("train", "val", "cal", "test")}
+    for discordant in (False, True):
+        ordered = _stable_order([gid for gid in grouped if (len(labels[gid]) > 1) == discordant],
+                                seed + int(discordant))
+        n = len(ordered)
+        a, b, c = round(.6 * n), round(.7 * n), round(.8 * n)
+        for name, ids in zip(assignments, (ordered[:a], ordered[a:b], ordered[b:c], ordered[c:])):
+            assignments[name].extend(ids)
     output = {name: [] for name in ("train", "val", "cal", "test")}
     for name, ids in assignments.items():
         output[name].extend(candidate_id for gid in ids for candidate_id in grouped[gid])

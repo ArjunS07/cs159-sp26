@@ -109,8 +109,9 @@ def validate_snapshot_replay(env, actions, *, state_atol=1e-7, obs_atol=1e-6):
             "success_match": runs[0][2] == runs[1][2], "done_match": runs[0][3] == runs[1][3]}
 
 
-def candidate_group_id(benchmark, suite, task_idx, episode_idx, chunk_idx) -> str:
-    raw = f"{benchmark}|{suite}|{task_idx}|{episode_idx}|{chunk_idx}".encode()
+def candidate_group_id(benchmark, suite, task_idx, episode_idx, chunk_idx, *, namespace="") -> str:
+    identity = f"{benchmark}|{suite}|{task_idx}|{episode_idx}|{chunk_idx}"
+    raw = (f"{namespace}|{identity}" if namespace else identity).encode()
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
@@ -147,15 +148,16 @@ def build_stratified_manifest(rollout_rows, euler_rows, targets=None, seed=42):
                                            "mid" if row["u_mean"] <= q2 else "high")
         per = {name: target // 3 + (1 if i < target % 3 else 0)
                for i, name in enumerate(("low", "mid", "high"))}
-        used_rollouts = set()
+        used_identities = set()
         for stratum in ("low", "mid", "high"):
             stratum_pool = [row for row in pool if row["uncertainty_stratum"] == stratum]
             stratum_pool.sort(key=lambda row: hashlib.sha256(
                 f"{seed}|{row['rollout_id']}|{row['chunk_idx']}".encode()).hexdigest())
             for row in stratum_pool:
-                if row["rollout_id"] in used_rollouts:
+                identity = (row["suite"], row["task_idx"], row["episode_idx"])
+                if identity in used_identities:
                     continue
-                selected.append(row); used_rollouts.add(row["rollout_id"])
+                selected.append(row); used_identities.add(identity)
                 if sum(r["benchmark"] == benchmark and r["uncertainty_stratum"] == stratum
                        for r in selected) >= per[stratum]:
                     break
@@ -230,7 +232,8 @@ def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
 
 def collect_candidate_pair(env, ep, policy, preprocess, postprocess, device, *,
                            chunk_idx: int, uncertainty_stratum: str, prefix_length: int = 10,
-                           validate_snapshot: bool = True):
+                           validate_snapshot: bool = True, candidate_count: int = 2,
+                           experiment: str = "verifier-clean-pairs-v1"):
     """Collect default-vs-fresh outcomes from one replayed mid-episode state.
 
     Returns ``(group_row, candidate_rows)`` ready for ``SupabaseStore.register_candidate_group``.
@@ -257,13 +260,14 @@ def collect_candidate_pair(env, ep, policy, preprocess, postprocess, device, *,
     policy.model._pnp.chunk_pos = min(chunk_idx / est_chunks, 1.0)
     batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
     default_noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, chunk_idx))
-    fresh_noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, chunk_idx * 1000 + 1))
     default, obs_enc = predict_clean_chunk(policy, batch, default_noise, capture_context=True)
-    fresh, _ = predict_clean_chunk(policy, batch, fresh_noise)
     policy_chunks = {
-        "default": default.squeeze(0).detach().cpu().numpy().astype(np.float32),
-        "fresh_noise": fresh.squeeze(0).detach().cpu().numpy().astype(np.float32),
-    }
+        "default": default.squeeze(0).detach().cpu().numpy().astype(np.float32)}
+    for index in range(1, candidate_count):
+        noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, chunk_idx * 1000 + index))
+        fresh, _ = predict_clean_chunk(policy, batch, noise)
+        policy_chunks[f"fresh_noise_{index}"] = (
+            fresh.squeeze(0).detach().cpu().numpy().astype(np.float32))
     env_chunks = {kind: postprocess_chunk(chunk, postprocess, device)
                   for kind, chunk in policy_chunks.items()}
     snapshot = capture_snapshot(env)
@@ -271,10 +275,12 @@ def collect_candidate_pair(env, ep, policy, preprocess, postprocess, device, *,
               if validate_snapshot else {"deterministic": False})
     if validate_snapshot and not replay["deterministic"]:
         raise RuntimeError(f"snapshot replay is not deterministic: {replay}")
-    group_id = candidate_group_id(ep.get("benchmark", "libero"), ep["suite"], ep["task_idx"],
-                                  ep.get("ep_idx", ep.get("episode_idx", 0)), chunk_idx)
+    group_id = candidate_group_id(
+        ep.get("benchmark", "libero"), ep["suite"], ep["task_idx"],
+        ep.get("ep_idx", ep.get("episode_idx", 0)), chunk_idx,
+        namespace="" if experiment == "verifier-clean-pairs-v1" else experiment)
     candidates = []
-    for offset, kind in enumerate(("default", "fresh_noise")):
+    for offset, kind in enumerate(policy_chunks):
         restored_obs = restore_snapshot(env, snapshot)
         success, n_steps = _run_continuation(
             env, restored_obs, ep, policy, preprocess, postprocess, device,
@@ -293,7 +299,7 @@ def collect_candidate_pair(env, ep, policy, preprocess, postprocess, device, *,
             },
         })
     group = {
-        "candidate_group_id": group_id, "experiment": "verifier-clean-pairs-v1",
+        "candidate_group_id": group_id, "experiment": experiment,
         "benchmark": ep.get("benchmark", "libero"), "suite": ep["suite"],
         "task_idx": ep["task_idx"], "episode_idx": ep.get("ep_idx", ep.get("episode_idx", 0)),
         "chunk_idx": chunk_idx, "uncertainty_stratum": uncertainty_stratum,
@@ -307,19 +313,26 @@ def collect_candidate_pair(env, ep, policy, preprocess, postprocess, device, *,
 
 def collect_initial_pair_fallback(env, ep, policy, preprocess, postprocess, device, *,
                                   uncertainty_stratum: str, prefix_length: int = 10,
-                                  source_chunk_idx: int = 0):
+                                  source_chunk_idx: int = 0, candidate_count: int = 2,
+                                  experiment: str = "verifier-clean-pairs-v1",
+                                  fallback_reason: str | None = None):
     """Fallback paired full episodes: alternatives share only the initial simulator state."""
     seed = episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
-    group_id = candidate_group_id(ep.get("benchmark", "libero"), ep["suite"], ep["task_idx"],
-                                  ep.get("ep_idx", ep.get("episode_idx", 0)), source_chunk_idx)
+    # A fallback always branches at the initial state. Its causal identity is
+    # therefore chunk zero regardless of which mid-rollout state was requested.
+    group_id = candidate_group_id(
+        ep.get("benchmark", "libero"), ep["suite"], ep["task_idx"],
+        ep.get("ep_idx", ep.get("episode_idx", 0)), 0,
+        namespace="" if experiment == "verifier-clean-pairs-v1" else experiment)
     candidates, obs_enc = [], None
-    for offset, kind in enumerate(("default", "fresh_noise")):
+    kinds = ["default"] + [f"fresh_noise_{index}" for index in range(1, candidate_count)]
+    for offset, kind in enumerate(kinds):
         env.reset(); policy.reset()
         obs = env.set_init_state(ep["init_state"])
         for _ in range(NUM_STEPS_WAIT):
             obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
         batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
-        noise_index = 0 if kind == "default" else 1
+        noise_index = offset
         noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, noise_index))
         chunk, captured = predict_clean_chunk(policy, batch, noise, capture_context=(offset == 0))
         if captured is not None:
@@ -340,13 +353,14 @@ def collect_initial_pair_fallback(env, ep, policy, preprocess, postprocess, devi
                       "observation": {"obs_enc": obs_enc}},
         })
     group = {
-        "candidate_group_id": group_id, "experiment": "verifier-clean-pairs-v1",
+        "candidate_group_id": group_id, "experiment": experiment,
         "benchmark": ep.get("benchmark", "libero"), "suite": ep["suite"],
         "task_idx": ep["task_idx"], "episode_idx": ep.get("ep_idx", ep.get("episode_idx", 0)),
         "chunk_idx": 0, "uncertainty_stratum": uncertainty_stratum,
         "pairing_mode": "paired_full_episode", "prefix_length": prefix_length,
         "snapshot_validated": False,
-        "metadata_json": {"fallback": "snapshot_nondeterministic",
+        "metadata_json": {"fallback": "snapshot_unavailable",
+                          "fallback_reason": fallback_reason,
                           "source_chunk_idx": source_chunk_idx, "chunk_position": 0.0},
     }
     return group, candidates

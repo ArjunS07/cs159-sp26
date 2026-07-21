@@ -56,6 +56,7 @@ def test_candidate_group_id_is_stable_and_identity_sensitive():
     a = candidate_group_id("libero", "s", 1, 2, 3)
     assert a == candidate_group_id("libero", "s", 1, 2, 3)
     assert a != candidate_group_id("libero", "s", 1, 2, 4)
+    assert a != candidate_group_id("libero", "s", 1, 2, 3, namespace="round-2")
 
 
 def test_manifest_uses_mixed_tasks_and_one_state_per_rollout():

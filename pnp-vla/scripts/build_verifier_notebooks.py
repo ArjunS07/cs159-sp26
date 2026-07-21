@@ -229,7 +229,8 @@ if SELECTED_KEY:
 else:
     print("Set SELECTED_KEY only after reviewing shortcut controls and held-out results.")'''),
     md("## 16. Paired-data retraining (run after notebook 04)"),
-    code(r'''paired_examples = load_candidate_examples(store)
+    code(r'''paired_examples = load_candidate_examples(
+    store, ("verifier-clean-pairs-v1", "verifier-clean-pairs-v2"))
 if paired_examples:
     paired_split = candidate_group_split(paired_examples, seed=42)
     cfg = VerifierTrainConfig(seed=42, prefix_length=10)
@@ -243,17 +244,18 @@ else:
 
 
 COLLECTION_CELLS = [
-    md("# 04 — Exact clean-chunk paired collection\n\nCollects 125 default-vs-fresh candidate groups (250 outcomes). Apply the latest schema first."),
+    md("# 04 — Multi-candidate verifier collection\n\nSecond round: 300 unique states × 4 candidates = 1,200 outcomes (about 24 L4 GPU-hours). Resumable and shardable; v1 data is preserved."),
     md("## 1. Environment setup"), code(BOOTSTRAP.replace('"[analysis]"', '"[sim,analysis]"')),
     md("## 2. Load policy, store, and benchmark episode manifests"),
     code(r'''import json
 from tqdm.auto import tqdm
-from pnp import libero_env, models
+from pnp import libero_env, libero_pro, models
 from pnp.experiments import _prepare_libero_pro_episodes
 from pnp.store import SupabaseStore
 from pnp.verifier import *
 
 benchmark_dict = libero_env.init_libero_benchmark()
+libero_pro.patch_torch_load()
 policy, preprocess, postprocess = models.load_pi05()
 device = models.default_device()
 store = SupabaseStore()
@@ -267,8 +269,16 @@ for ep in pro: ep["benchmark"] = "libero_pro"
 episode_lookup = {(e["benchmark"], e["suite"], e["task_idx"], e.get("ep_idx", e.get("episode_idx"))): e
                   for e in standard + pro}
 print(len(standard), len(pro), len(episode_lookup))'''),
-    md("## 3. Build the fixed low/mid/high uncertainty manifest"),
-    code(r'''def pages(table, columns, configure):
+    md("## 3. Configure workers and build the fixed uncertainty manifest"),
+    code(r'''COLLECTION_EXPERIMENT = "verifier-clean-pairs-v2"
+TARGETS = {"libero": 120, "libero_pro": 180}
+CANDIDATE_COUNT = 4
+PREFIX_LENGTH = 10
+SHARD_COUNT = 1   # Use 3 for three parallel Colab sessions.
+SHARD_INDEX = 0   # Set to 0, 1, or 2 in each session.
+assert 0 <= SHARD_INDEX < SHARD_COUNT
+
+def pages(table, columns, configure):
     rows=[]; start=0
     while True:
         q = configure(store.client.table(table).select(columns)).range(start, start+999)
@@ -288,8 +298,9 @@ for start in range(0, len(id_list), 100):
     batch_ids = id_list[start:start+100]
     euler += pages("pnp_euler_steps", "rollout_id,chunk_idx,u_mean",
                    lambda q, batch_ids=batch_ids: q.in_("rollout_id", batch_ids))
-manifest = build_stratified_manifest(rollouts, euler, {"libero": 50, "libero_pro": 75})
-assert len(manifest) == 125, len(manifest)
+manifest = build_stratified_manifest(rollouts, euler, TARGETS)
+assert len(manifest) == sum(TARGETS.values()), len(manifest)
+manifest = manifest[SHARD_INDEX::SHARD_COUNT]
 print({k: sum(r["benchmark"] == k for r in manifest) for k in ("libero", "libero_pro")})
 print({k: sum(r["uncertainty_stratum"] == k for r in manifest) for k in ("low", "mid", "high")})'''),
     md("## 4. Dry-run identity and schema checks"),
@@ -297,18 +308,25 @@ print({k: sum(r["uncertainty_stratum"] == k for r in manifest) for k in ("low", 
 assert not missing, missing[:3]
 store.client.table("verifier_candidate_groups").select("candidate_group_id").limit(1).execute()
 print("manifest identities and verifier tables are ready")'''),
-    md("## 5. Collect 125 resumable pairs (250 outcomes)"),
+    md("## 5. Collect resumable four-candidate groups"),
     code(r'''existing = {r["candidate_group_id"] for r in
             (store.client.table("verifier_candidate_groups").select("candidate_group_id")
-             .eq("experiment", "verifier-clean-pairs-v1").execute().data or [])}
-store.start_run("verifier_pair_collection", "libero+libero_pro", "verifier-clean-pairs-v1",
-                config={"groups": 125, "outcomes": 250, "prefix_length": 10})
+             .eq("experiment", COLLECTION_EXPERIMENT).execute().data or [])}
+store.start_run("verifier_pair_collection", "libero+libero_pro", COLLECTION_EXPERIMENT,
+                config={"groups": sum(TARGETS.values()),
+                        "outcomes": sum(TARGETS.values()) * CANDIDATE_COUNT,
+                        "candidate_count": CANDIDATE_COUNT, "prefix_length": PREFIX_LENGTH,
+                        "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX})
 completed = 0
 for item in tqdm(manifest, desc="candidate groups"):
     ep = episode_lookup[(item["benchmark"], item["suite"], item["task_idx"], item["episode_idx"])]
     expected_id = candidate_group_id(item["benchmark"], item["suite"], item["task_idx"],
-                                     item["episode_idx"], item["chunk_idx"])
-    if expected_id in existing:
+                                     item["episode_idx"], item["chunk_idx"],
+                                     namespace=COLLECTION_EXPERIMENT)
+    fallback_id = candidate_group_id(item["benchmark"], item["suite"], item["task_idx"],
+                                     item["episode_idx"], 0,
+                                     namespace=COLLECTION_EXPERIMENT)
+    if expected_id in existing or fallback_id in existing:
         continue
     env = libero_env.make_env(ep["bddl_path"])
     try:
@@ -316,28 +334,33 @@ for item in tqdm(manifest, desc="candidate groups"):
             pair = collect_candidate_pair(
                 env, ep, policy, preprocess, postprocess, device,
                 chunk_idx=item["chunk_idx"], uncertainty_stratum=item["uncertainty_stratum"],
-                prefix_length=10, validate_snapshot=True)
-        except RuntimeError as error:
+                prefix_length=PREFIX_LENGTH, validate_snapshot=True,
+                candidate_count=CANDIDATE_COUNT, experiment=COLLECTION_EXPERIMENT)
+        except Exception as error:
             print("snapshot fallback:", error)
             pair = collect_initial_pair_fallback(
                 env, ep, policy, preprocess, postprocess, device,
-                uncertainty_stratum=item["uncertainty_stratum"], prefix_length=10,
-                source_chunk_idx=item["chunk_idx"])
+                uncertainty_stratum=item["uncertainty_stratum"], prefix_length=PREFIX_LENGTH,
+                source_chunk_idx=item["chunk_idx"], candidate_count=CANDIDATE_COUNT,
+                experiment=COLLECTION_EXPERIMENT,
+                fallback_reason=f"{type(error).__name__}: {error}")
         if pair is None:
             pair = collect_initial_pair_fallback(
                 env, ep, policy, preprocess, postprocess, device,
-                uncertainty_stratum=item["uncertainty_stratum"], prefix_length=10,
-                source_chunk_idx=item["chunk_idx"])
+                uncertainty_stratum=item["uncertainty_stratum"], prefix_length=PREFIX_LENGTH,
+                source_chunk_idx=item["chunk_idx"], candidate_count=CANDIDATE_COUNT,
+                experiment=COLLECTION_EXPERIMENT,
+                fallback_reason="vanilla replay terminated before requested chunk")
         group, candidates = pair
         store.register_candidate_group(group, candidates)
-        existing.add(group["candidate_group_id"]); completed += 2
+        existing.add(group["candidate_group_id"]); completed += len(candidates)
     finally:
         env.close()
 store.finish_run(n_rollouts=completed)
 print("new outcomes:", completed, "total groups:", len(existing))'''),
     md("## 6. Integrity and outcome-balance report"),
     code(r'''groups = store.client.table("verifier_candidate_groups").select("*").eq(
-    "experiment", "verifier-clean-pairs-v1").execute().data or []
+    "experiment", COLLECTION_EXPERIMENT).execute().data or []
 candidates = store.client.table("verifier_candidates").select(
     "candidate_id,candidate_group_id,candidate_kind,success").execute().data or []
 group_ids = {g["candidate_group_id"] for g in groups}

@@ -3,7 +3,7 @@ import pandas as pd
 from dataclasses import replace
 
 from pnp.verifier.data import (
-    CleanChunkExample, build_clean_chunk_examples, hard_task_keys,
+    CleanChunkExample, build_clean_chunk_examples, candidate_group_split, hard_task_keys,
     heldout_task_split, known_task_split,
 )
 from pnp.verifier.train import DiscordantPairDataset
@@ -88,3 +88,18 @@ def test_discordant_pairs_include_initial_state_fallback_groups():
                 pairing_mode="paired_full_episode", success=False),
     ]
     assert len(DiscordantPairDataset(fallback)) == 1
+
+
+def test_candidate_split_stratifies_discordant_groups():
+    examples = []
+    for group_index in range(20):
+        base = _example(group_index, 0, True)
+        for success in (True, False):
+            examples.append(replace(
+                base, rollout_id=f"g{group_index}-{success}",
+                candidate_group_id=f"g{group_index}", pairing_mode="paired_full_episode",
+                success=success))
+    split = candidate_group_split(examples)
+    assert {name: len(DiscordantPairDataset(
+        [e for e in examples if e.rollout_id in ids])) for name, ids in split.items()} == {
+            "train": 12, "val": 2, "cal": 2, "test": 4}
