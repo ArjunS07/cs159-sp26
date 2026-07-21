@@ -1,10 +1,12 @@
 import numpy as np
 import pandas as pd
+from dataclasses import replace
 
 from pnp.verifier.data import (
     CleanChunkExample, build_clean_chunk_examples, hard_task_keys,
     heldout_task_split, known_task_split,
 )
+from pnp.verifier.train import DiscordantPairDataset
 
 
 def _example(task, episode, success, chunk=0):
@@ -75,3 +77,14 @@ def test_heldout_split_has_disjoint_tasks():
     assert len(task_sets["val"]) == len(task_sets["cal"]) == 4
     assert not any(a & b for i, a in enumerate(task_sets.values())
                    for b in list(task_sets.values())[i + 1:])
+
+
+def test_discordant_pairs_include_initial_state_fallback_groups():
+    base = _example(0, 0, True)
+    fallback = [
+        replace(base, rollout_id="candidate-positive", candidate_group_id="group",
+                pairing_mode="paired_full_episode", success=True),
+        replace(base, rollout_id="candidate-negative", candidate_group_id="group",
+                pairing_mode="paired_full_episode", success=False),
+    ]
+    assert len(DiscordantPairDataset(fallback)) == 1

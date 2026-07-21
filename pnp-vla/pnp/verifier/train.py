@@ -55,7 +55,12 @@ class DiscordantPairDataset(Dataset):
     def __init__(self, examples):
         groups = defaultdict(list)
         for example in examples or []:
-            if example.candidate_group_id and example.pairing_mode == "snapshot":
+            # Both modes hold the scored observation fixed across candidates.
+            # ``snapshot`` branches mid-rollout; ``paired_full_episode`` is the
+            # conservative fallback that branches from the identical episode
+            # initial state when simulator snapshots cannot be restored.
+            if (example.candidate_group_id and
+                    example.pairing_mode in {"snapshot", "paired_full_episode"}):
                 groups[example.candidate_group_id].append(example)
         self.pairs = []
         for members in groups.values():
