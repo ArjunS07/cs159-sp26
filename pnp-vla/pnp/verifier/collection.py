@@ -15,29 +15,38 @@ from ..rollout import _draw_chunk_noise, chunk_noise_seed, episode_seed
 from ..sampler import _temp_strategy
 
 
-def _unwrap_sim(env):
+def _env_chain(env):
+    """Yield an environment and its nested ``.env`` wrappers once each."""
     current = env
     seen = set()
     while id(current) not in seen:
         seen.add(id(current))
+        yield current
+        current = getattr(current, "env", None)
+        if current is None:
+            break
+
+
+def _unwrap_sim(env):
+    for current in _env_chain(env):
         sim = getattr(current, "sim", None)
         if sim is not None:
             return current, sim
-        next_env = getattr(current, "env", None)
-        if next_env is None:
-            break
-        current = next_env
     raise TypeError("environment does not expose a MuJoCo sim")
 
 
-def _observations(owner):
-    getter = getattr(owner, "_get_observations", None)
-    if getter is None:
-        raise TypeError("environment does not expose _get_observations after restoration")
-    try:
-        return getter(force_update=True)
-    except TypeError:
-        return getter()
+def _observations(env):
+    # OffScreenRenderEnv may expose ``sim`` on its outer wrapper while the
+    # robosuite observation getter lives on the wrapped task environment.
+    for owner in _env_chain(env):
+        getter = getattr(owner, "_get_observations", None)
+        if getter is None:
+            continue
+        try:
+            return getter(force_update=True)
+        except TypeError:
+            return getter()
+    raise TypeError("environment does not expose _get_observations after restoration")
 
 
 @dataclass
@@ -60,7 +69,7 @@ def capture_snapshot(env) -> SimulatorSnapshot:
 
 
 def restore_snapshot(env, snapshot: SimulatorSnapshot):
-    owner, sim = _unwrap_sim(env)
+    _, sim = _unwrap_sim(env)
     sim.set_state_from_flattened(snapshot.sim_state.copy())
     sim.forward()
     np.random.set_state(snapshot.numpy_state)
@@ -68,7 +77,7 @@ def restore_snapshot(env, snapshot: SimulatorSnapshot):
     torch.random.set_rng_state(snapshot.torch_state)
     if snapshot.cuda_states is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(snapshot.cuda_states)
-    return _observations(owner)
+    return _observations(env)
 
 
 def _obs_arrays(obs):
