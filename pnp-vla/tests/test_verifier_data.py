@@ -89,6 +89,9 @@ def test_discordant_pairs_include_initial_state_fallback_groups():
     ]
     assert len(DiscordantPairDataset(fallback)) == 1
 
+    replay = [replace(example, pairing_mode="deterministic_replay") for example in fallback]
+    assert len(DiscordantPairDataset(replay)) == 1
+
 
 def test_candidate_split_stratifies_discordant_groups():
     examples = []

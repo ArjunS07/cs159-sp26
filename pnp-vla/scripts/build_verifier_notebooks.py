@@ -230,7 +230,8 @@ else:
     print("Set SELECTED_KEY only after reviewing shortcut controls and held-out results.")'''),
     md("## 16. Paired-data retraining (run after notebook 04)"),
     code(r'''paired_examples = load_candidate_examples(
-    store, ("verifier-clean-pairs-v1", "verifier-clean-pairs-v2"))
+    store, ("verifier-clean-pairs-v1", "verifier-clean-pairs-v2",
+            "verifier-clean-pairs-v3"))
 if paired_examples:
     paired_split = candidate_group_split(paired_examples, seed=42)
     cfg = VerifierTrainConfig(seed=42, prefix_length=10)
@@ -244,7 +245,7 @@ else:
 
 
 COLLECTION_CELLS = [
-    md("# 04 — Multi-candidate verifier collection\n\nSecond round: 300 unique states × 4 candidates = 1,200 outcomes (about 24 L4 GPU-hours). Resumable and shardable; v1 data is preserved."),
+    md("# 04 — Deterministic-replay verifier collection\n\nCollect up to 300 unique mid-rollout states × 4 candidates without simulator snapshots. Each branch reaches its state by replaying an identical fixed action prefix. Resumable and shardable; v1/v2 data is preserved."),
     md("## 1. Environment setup"), code(BOOTSTRAP.replace('"[analysis]"', '"[sim,analysis]"')),
     md("## 2. Load policy, store, and benchmark episode manifests"),
     code(r'''import json
@@ -270,7 +271,7 @@ episode_lookup = {(e["benchmark"], e["suite"], e["task_idx"], e.get("ep_idx", e.
                   for e in standard + pro}
 print(len(standard), len(pro), len(episode_lookup))'''),
     md("## 3. Configure workers and build the fixed uncertainty manifest"),
-    code(r'''COLLECTION_EXPERIMENT = "verifier-clean-pairs-v2"
+    code(r'''COLLECTION_EXPERIMENT = "verifier-clean-pairs-v3"
 TARGETS = {"libero": 120, "libero_pro": 180}
 CANDIDATE_COUNT = 4
 PREFIX_LENGTH = 10
@@ -311,7 +312,7 @@ print({k: sum(r["uncertainty_stratum"] == k for r in manifest) for k in ("low", 
 assert not missing, missing[:3]
 store.client.table("verifier_candidate_groups").select("candidate_group_id").limit(1).execute()
 print("manifest identities and verifier tables are ready")'''),
-    md("## 5. Collect resumable four-candidate groups"),
+    md("## 5. Collect deterministic-replay four-candidate groups"),
     code(r'''existing = {r["candidate_group_id"] for r in
             (store.client.table("verifier_candidate_groups").select("candidate_group_id")
              .eq("experiment", COLLECTION_EXPERIMENT).execute().data or [])}
@@ -326,34 +327,21 @@ for item in tqdm(manifest, desc="candidate groups"):
     expected_id = candidate_group_id(item["benchmark"], item["suite"], item["task_idx"],
                                      item["episode_idx"], item["chunk_idx"],
                                      namespace=COLLECTION_EXPERIMENT)
-    fallback_id = candidate_group_id(item["benchmark"], item["suite"], item["task_idx"],
-                                     item["episode_idx"], 0,
-                                     namespace=COLLECTION_EXPERIMENT)
-    if expected_id in existing or fallback_id in existing:
+    if expected_id in existing:
         continue
     env = libero_env.make_env(ep["bddl_path"])
     try:
         try:
-            pair = collect_candidate_pair(
+            pair = collect_replay_candidate_group(
                 env, ep, policy, preprocess, postprocess, device,
                 chunk_idx=item["chunk_idx"], uncertainty_stratum=item["uncertainty_stratum"],
-                prefix_length=PREFIX_LENGTH, validate_snapshot=True,
+                prefix_length=PREFIX_LENGTH,
                 candidate_count=CANDIDATE_COUNT, experiment=COLLECTION_EXPERIMENT)
         except Exception as error:
-            print("snapshot fallback:", error)
-            pair = collect_initial_pair_fallback(
-                env, ep, policy, preprocess, postprocess, device,
-                uncertainty_stratum=item["uncertainty_stratum"], prefix_length=PREFIX_LENGTH,
-                source_chunk_idx=item["chunk_idx"], candidate_count=CANDIDATE_COUNT,
-                experiment=COLLECTION_EXPERIMENT,
-                fallback_reason=f"{type(error).__name__}: {error}")
+            print("replay group skipped:", type(error).__name__, error)
+            pair = None
         if pair is None:
-            pair = collect_initial_pair_fallback(
-                env, ep, policy, preprocess, postprocess, device,
-                uncertainty_stratum=item["uncertainty_stratum"], prefix_length=PREFIX_LENGTH,
-                source_chunk_idx=item["chunk_idx"], candidate_count=CANDIDATE_COUNT,
-                experiment=COLLECTION_EXPERIMENT,
-                fallback_reason="vanilla replay terminated before requested chunk")
+            continue
         group, candidates = pair
         store.register_candidate_group(group, candidates)
         existing.add(group["candidate_group_id"]); completed += len(candidates)
@@ -373,8 +361,9 @@ print({"groups": len(groups), "outcomes": len(candidates),
        "failures": sum(not c["success"] for c in candidates),
        "discordant_groups": sum(len({c["success"] for c in candidates if c["candidate_group_id"] == gid}) == 2
                                 for gid in group_ids),
-       "snapshot_groups": sum(g["pairing_mode"] == "snapshot" for g in groups),
-       "fallback_groups": sum(g["pairing_mode"] != "snapshot" for g in groups)})'''),
+       "replay_groups": sum(g["pairing_mode"] == "deterministic_replay" for g in groups),
+       "validated_groups": sum(bool((g.get("metadata_json") or {}).get("replay_validated"))
+                               for g in groups)})'''),
 ]
 
 

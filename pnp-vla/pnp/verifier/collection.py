@@ -230,6 +230,112 @@ def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
     return success, steps
 
 
+def _reset_and_replay_actions(env, ep, policy, replay_actions):
+    """Reach a branch state through the public environment API using fixed actions."""
+    env.reset(); policy.reset()
+    obs = env.set_init_state(ep["init_state"])
+    for _ in range(NUM_STEPS_WAIT):
+        obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+    for action in replay_actions:
+        obs, _, done, _ = env.step(action)
+        if env.check_success() or done:
+            return None
+    return obs
+
+
+def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, device, *,
+                                   chunk_idx: int, uncertainty_stratum: str,
+                                   prefix_length: int = 10, candidate_count: int = 4,
+                                   experiment: str = "verifier-clean-pairs-v3",
+                                   state_atol: float = 1e-6):
+    """Collect candidates at a mid-rollout state by deterministic action replay.
+
+    Unlike simulator snapshots, replay reconstructs wrapper state, contacts, and
+    observations through normal resets and steps. Candidate generation happens
+    once at the canonical replay state; each outcome branch independently
+    replays the exact same environment-space action prefix before intervention.
+    """
+    seed = episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
+    obs = _reset_and_replay_actions(env, ep, policy, [])
+    replay_actions = []
+    steps = 0
+    for ci in range(chunk_idx):
+        batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
+        noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, ci))
+        chunk, _ = predict_clean_chunk(policy, batch, noise)
+        env_chunk = postprocess_chunk(chunk.squeeze(0).detach().cpu().numpy(), postprocess, device)
+        for action in env_chunk:
+            obs, _, done, _ = env.step(action)
+            replay_actions.append(action.copy()); steps += 1
+            if env.check_success() or done:
+                return None
+
+    _, canonical_sim = _unwrap_sim(env)
+    canonical_state = np.asarray(canonical_sim.get_state().flatten()).copy()
+    chunk_size = policy.config.chunk_size
+    est_chunks = max(1, round(ep["max_steps"] / chunk_size))
+    policy.model._pnp.chunk_pos = min(chunk_idx / est_chunks, 1.0)
+    batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
+    policy_chunks = {}
+    obs_enc = None
+    for index in range(candidate_count):
+        kind = "default" if index == 0 else f"fresh_noise_{index}"
+        noise_index = chunk_idx if index == 0 else chunk_idx * 1000 + index
+        noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, noise_index))
+        chunk, captured = predict_clean_chunk(
+            policy, batch, noise, capture_context=(index == 0))
+        if captured is not None:
+            obs_enc = captured
+        policy_chunks[kind] = chunk.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    env_chunks = {kind: postprocess_chunk(chunk, postprocess, device)
+                  for kind, chunk in policy_chunks.items()}
+
+    group_id = candidate_group_id(
+        ep.get("benchmark", "libero"), ep["suite"], ep["task_idx"],
+        ep.get("ep_idx", ep.get("episode_idx", 0)), chunk_idx, namespace=experiment)
+    candidates, state_errors = [], []
+    for kind in policy_chunks:
+        branch_obs = _reset_and_replay_actions(env, ep, policy, replay_actions)
+        if branch_obs is None:
+            raise RuntimeError("fixed replay terminated before the branch state")
+        _, branch_sim = _unwrap_sim(env)
+        branch_state = np.asarray(branch_sim.get_state().flatten())
+        state_error = float(np.max(np.abs(branch_state - canonical_state)))
+        state_errors.append(state_error)
+        if not np.allclose(branch_state, canonical_state, atol=state_atol, rtol=0):
+            raise RuntimeError(f"fixed replay state mismatch (max_abs={state_error:.3g})")
+        success, n_steps = _run_continuation(
+            env, branch_obs, ep, policy, preprocess, postprocess, device,
+            prefix=env_chunks[kind][:prefix_length], branch_seed=seed ^ 0x51A7,
+            steps_already=steps)
+        candidate_id = hashlib.sha256(f"{group_id}|{kind}".encode()).hexdigest()[:24]
+        candidates.append({
+            "candidate_id": candidate_id, "candidate_kind": kind, "success": success,
+            "n_steps": n_steps, "rollout_id": None,
+            "metadata_json": {"source_episode_seed": seed, "chunk_idx": chunk_idx,
+                              "replay_state_max_abs": state_error},
+            "blobs": {
+                "policy_chunk": {"actions": policy_chunks[kind]},
+                "env_chunk": {"actions": env_chunks[kind],
+                              "mask": np.ones(len(env_chunks[kind]), dtype=np.bool_)},
+                "observation": {"obs_enc": obs_enc},
+            },
+        })
+    group = {
+        "candidate_group_id": group_id, "experiment": experiment,
+        "benchmark": ep.get("benchmark", "libero"), "suite": ep["suite"],
+        "task_idx": ep["task_idx"], "episode_idx": ep.get("ep_idx", ep.get("episode_idx", 0)),
+        "chunk_idx": chunk_idx, "uncertainty_stratum": uncertainty_stratum,
+        "pairing_mode": "deterministic_replay", "prefix_length": prefix_length,
+        "snapshot_validated": False,
+        "metadata_json": {"replay_validated": True,
+                          "replay_state_max_abs": max(state_errors, default=0.0),
+                          "replay_action_count": len(replay_actions),
+                          "chunk_position": float(policy.model._pnp.chunk_pos)},
+    }
+    return group, candidates
+
+
 def collect_candidate_pair(env, ep, policy, preprocess, postprocess, device, *,
                            chunk_idx: int, uncertainty_stratum: str, prefix_length: int = 10,
                            validate_snapshot: bool = True, candidate_count: int = 2,
