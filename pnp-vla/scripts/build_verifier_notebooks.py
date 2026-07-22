@@ -299,7 +299,10 @@ for start in range(0, len(id_list), 100):
     euler += pages("pnp_euler_steps", "rollout_id,chunk_idx,u_mean",
                    lambda q, batch_ids=batch_ids: q.in_("rollout_id", batch_ids))
 manifest = build_stratified_manifest(rollouts, euler, TARGETS)
-assert len(manifest) == sum(TARGETS.values()), len(manifest)
+TOTAL_GROUPS = len(manifest)
+if TOTAL_GROUPS < sum(TARGETS.values()):
+    print(f"eligible unique-state capacity: {TOTAL_GROUPS}/{sum(TARGETS.values())}; "
+          "collecting all available groups")
 manifest = manifest[SHARD_INDEX::SHARD_COUNT]
 print({k: sum(r["benchmark"] == k for r in manifest) for k in ("libero", "libero_pro")})
 print({k: sum(r["uncertainty_stratum"] == k for r in manifest) for k in ("low", "mid", "high")})'''),
@@ -313,8 +316,8 @@ print("manifest identities and verifier tables are ready")'''),
             (store.client.table("verifier_candidate_groups").select("candidate_group_id")
              .eq("experiment", COLLECTION_EXPERIMENT).execute().data or [])}
 store.start_run("verifier_pair_collection", "libero+libero_pro", COLLECTION_EXPERIMENT,
-                config={"groups": sum(TARGETS.values()),
-                        "outcomes": sum(TARGETS.values()) * CANDIDATE_COUNT,
+                config={"groups": TOTAL_GROUPS,
+                        "outcomes": TOTAL_GROUPS * CANDIDATE_COUNT,
                         "candidate_count": CANDIDATE_COUNT, "prefix_length": PREFIX_LENGTH,
                         "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX})
 completed = 0
