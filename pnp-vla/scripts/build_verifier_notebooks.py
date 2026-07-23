@@ -397,6 +397,13 @@ def main():
     for path, value in outputs.items():
         path.write_text(json.dumps(value, indent=1) + "\n")
         print(path)
+    # Keep upload-ready worker copies synchronized with the canonical notebook.
+    from generate_verifier_workers import generate_workers
+    generate_workers(
+        ROOT / "notebooks" / "04_collect_verifier_pairs.ipynb",
+        ROOT / "notebooks" / "workers",
+        shard_count=3,
+    )
 
 
 if __name__ == "__main__":
