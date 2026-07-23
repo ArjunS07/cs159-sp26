@@ -3,8 +3,10 @@ import pandas as pd
 from dataclasses import replace
 
 from pnp.verifier.data import (
-    CleanChunkExample, build_clean_chunk_examples, candidate_group_split, hard_task_keys,
-    heldout_task_split, known_task_split,
+    CleanChunkExample, build_clean_chunk_examples, candidate_cv_splits,
+    candidate_group_split, exclude_candidate_identities, hard_task_keys,
+    heldout_task_split, known_task_split, locked_candidate_split, select_examples,
+    shuffle_candidate_actions_within_group,
 )
 from pnp.verifier.train import DiscordantPairDataset
 
@@ -105,4 +107,55 @@ def test_candidate_split_stratifies_discordant_groups():
     split = candidate_group_split(examples)
     assert {name: len(DiscordantPairDataset(
         [e for e in examples if e.rollout_id in ids])) for name, ids in split.items()} == {
-            "train": 12, "val": 2, "cal": 2, "test": 4}
+        "train": 12, "val": 2, "cal": 2, "test": 4}
+
+
+def _candidate_examples(n_groups=20):
+    examples = []
+    for group_index in range(n_groups):
+        base = replace(
+            _example(group_index % 4, group_index, True),
+            benchmark="libero_pro" if group_index % 2 else "libero",
+            uncertainty_stratum=("high" if group_index % 3 else "medium"),
+            candidate_group_id=f"g{group_index}", candidate_kind="default",
+        )
+        outcomes = (True, False, True, False) if group_index < 10 else (True,) * 4
+        for candidate_index, success in enumerate(outcomes):
+            actions = np.full((50, 7), candidate_index + group_index * 10, np.float32)
+            examples.append(replace(
+                base, rollout_id=f"g{group_index}-c{candidate_index}",
+                candidate_kind="default" if candidate_index == 0 else "sampled",
+                success=success, actions=actions))
+    return examples
+
+
+def test_locked_split_and_cv_are_group_safe_and_cover_development_once():
+    examples = _candidate_examples()
+    locked = locked_candidate_split(examples, seed=7)
+    development = select_examples(examples, locked["development"])
+    test = select_examples(examples, locked["test"])
+    assert len({e.candidate_group_id for e in test}) == 4
+    assert ({e.candidate_group_id for e in development}
+            .isdisjoint({e.candidate_group_id for e in test}))
+    folds = candidate_cv_splits(examples, locked["development"], seed=7)
+    validation = []
+    for fold in folds:
+        train_groups = {e.candidate_group_id for e in select_examples(examples, fold["train"])}
+        val_groups = {e.candidate_group_id for e in select_examples(examples, fold["val"])}
+        assert train_groups.isdisjoint(val_groups)
+        validation.extend(val_groups)
+    assert sorted(validation) == sorted({e.candidate_group_id for e in development})
+
+
+def test_identity_exclusion_and_within_group_shuffle():
+    candidates = _candidate_examples(2)
+    historical = [_example(0, 0, True), _example(9, 9, False)]
+    filtered = exclude_candidate_identities(historical, candidates)
+    assert [example.task_idx for example in filtered] == [9]
+    shuffled = shuffle_candidate_actions_within_group(candidates, seed=4)
+    for group in ("g0", "g1"):
+        before = [e for e in candidates if e.candidate_group_id == group]
+        after = [e for e in shuffled if e.candidate_group_id == group]
+        assert all(not np.array_equal(a.actions, b.actions) for a, b in zip(before, after))
+        assert sorted(float(e.actions[0, 0]) for e in before) == sorted(
+            float(e.actions[0, 0]) for e in after)

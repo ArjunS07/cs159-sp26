@@ -7,7 +7,7 @@ is treated as data.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from dataclasses import replace
 import hashlib
@@ -34,6 +34,7 @@ class CleanChunkExample:
     candidate_group_id: str | None = None
     candidate_kind: str | None = None
     pairing_mode: str | None = None
+    uncertainty_stratum: str | None = None
 
     @property
     def task_key(self) -> tuple[str, str, int]:
@@ -111,10 +112,20 @@ def load_clean_chunk_examples(store, experiments: Sequence[str], *, horizon: int
 def load_candidate_examples(store, experiment="verifier-clean-pairs-v1"):
     """Load exact/fallback candidate artifacts into the common verifier example type."""
     experiments = [experiment] if isinstance(experiment, str) else list(experiment)
-    query = store.client.table("verifier_candidate_groups").select("*")
-    query = query.eq("experiment", experiments[0]) if len(experiments) == 1 else query.in_("experiment", experiments)
-    groups = query.execute().data or []
-    candidates = store.client.table("verifier_candidates").select("*").execute().data or []
+    def pages(table, configure):
+        rows, start = [], 0
+        while True:
+            batch = configure(store.client.table(table).select("*")).range(
+                start, start + 999).execute().data or []
+            rows.extend(batch)
+            if len(batch) < 1000:
+                return rows
+            start += 1000
+
+    groups = pages("verifier_candidate_groups", lambda query: (
+        query.eq("experiment", experiments[0]) if len(experiments) == 1
+        else query.in_("experiment", experiments)))
+    candidates = pages("verifier_candidates", lambda query: query)
     candidate_counts = Counter(row["candidate_group_id"] for row in candidates)
     # Old fallback IDs included a requested mid-rollout chunk even though the
     # actual branch was always episode-initial. Keep only the richest group per
@@ -158,6 +169,7 @@ def load_candidate_examples(store, experiment="verifier-clean-pairs-v1"):
             obs_enc=obs_enc, actions=padded, action_mask=padded_mask,
             success=int(bool(row["success"])), candidate_group_id=row["candidate_group_id"],
             candidate_kind=row["candidate_kind"], pairing_mode=group["pairing_mode"],
+            uncertainty_stratum=group.get("uncertainty_stratum"),
         ))
     return examples
 
@@ -290,6 +302,128 @@ def candidate_group_split(examples: Sequence[CleanChunkExample], seed: int = 42)
     output = {name: [] for name in ("train", "val", "cal", "test")}
     for name, ids in assignments.items():
         output[name].extend(candidate_id for gid in ids for candidate_id in grouped[gid])
+    return output
+
+
+def _candidate_groups(examples: Sequence[CleanChunkExample]):
+    groups: dict[str, list[CleanChunkExample]] = defaultdict(list)
+    for example in examples:
+        if example.candidate_group_id:
+            groups[example.candidate_group_id].append(example)
+    return groups
+
+
+def _candidate_ids(groups, group_ids):
+    return [example.rollout_id for gid in group_ids for example in groups[gid]]
+
+
+def _balanced_group_order(groups, group_ids, seed):
+    """Stable interleave across benchmark/uncertainty strata."""
+    buckets = defaultdict(list)
+    for gid in group_ids:
+        first = groups[gid][0]
+        buckets[(first.benchmark, first.uncertainty_stratum or "unknown")].append(gid)
+    for key in buckets:
+        buckets[key] = _stable_order(
+            buckets[key], seed + int(hashlib.md5(str(key).encode()).hexdigest()[:6], 16))
+    ordered = []
+    while any(buckets.values()):
+        for key in sorted(buckets):
+            if buckets[key]:
+                ordered.append(buckets[key].pop(0))
+    return ordered
+
+
+def locked_candidate_split(examples: Sequence[CleanChunkExample], test_fraction: float = .20,
+                           seed: int = 42):
+    """Lock a group-safe test set while preserving discordance and coarse cohort balance."""
+    groups = _candidate_groups(examples)
+    discordant = {
+        gid: len({example.success for example in members}) > 1
+        for gid, members in groups.items()
+    }
+    development, test = [], []
+    for status in (False, True):
+        ids = [gid for gid in groups if discordant[gid] == status]
+        ordered = _balanced_group_order(groups, ids, seed + int(status))
+        n_test = min(len(ordered), max(1, round(test_fraction * len(ordered))))
+        test.extend(ordered[:n_test])
+        development.extend(ordered[n_test:])
+    return {
+        "development": _candidate_ids(groups, development),
+        "test": _candidate_ids(groups, test),
+    }
+
+
+def candidate_cv_splits(examples: Sequence[CleanChunkExample],
+                        development_ids: Iterable[str], n_folds: int = 4,
+                        seed: int = 42):
+    """Return deterministic group-safe folds over a locked development partition."""
+    development = select_examples(examples, development_ids)
+    groups = _candidate_groups(development)
+    discordant = {
+        gid: len({example.success for example in members}) > 1
+        for gid, members in groups.items()
+    }
+    fold_groups = [[] for _ in range(n_folds)]
+    for status in (False, True):
+        ids = [gid for gid in groups if discordant[gid] == status]
+        ordered = _balanced_group_order(groups, ids, seed + int(status))
+        for index, gid in enumerate(ordered):
+            fold_groups[index % n_folds].append(gid)
+    all_groups = set(groups)
+    return [{
+        "train": _candidate_ids(groups, sorted(all_groups - set(validation))),
+        "val": _candidate_ids(groups, validation),
+    } for validation in fold_groups]
+
+
+def candidate_episode_identities(examples: Sequence[CleanChunkExample]):
+    return {
+        (example.benchmark, example.suite, example.task_idx, example.episode_idx)
+        for example in examples
+    }
+
+
+def exclude_candidate_identities(historical: Sequence[CleanChunkExample],
+                                 candidates: Sequence[CleanChunkExample]):
+    held_out = candidate_episode_identities(candidates)
+    return [example for example in historical if (
+        example.benchmark, example.suite, example.task_idx, example.episode_idx
+    ) not in held_out]
+
+
+def prefix_action_statistics(examples: Sequence[CleanChunkExample], prefix_length: int = 10):
+    valid = []
+    for example in examples:
+        mask = example.action_mask.copy()
+        mask[prefix_length:] = False
+        if mask.any():
+            valid.append(example.actions[mask])
+    if not valid:
+        raise ValueError("cannot compute prefix action statistics from an empty dataset")
+    actions = np.concatenate(valid).astype(np.float64)
+    return actions.mean(0).astype(np.float32), actions.std(0).clip(min=1e-6).astype(np.float32)
+
+
+def shuffle_candidate_actions_within_group(examples: Sequence[CleanChunkExample],
+                                           seed: int = 42):
+    """Permute action chunks within each state while preserving outcomes and identities."""
+    rng = np.random.default_rng(seed)
+    output = list(examples)
+    index_groups = defaultdict(list)
+    for index, example in enumerate(examples):
+        if example.candidate_group_id:
+            index_groups[example.candidate_group_id].append(index)
+    for indices in index_groups.values():
+        donors = list(indices)
+        if len(donors) > 1:
+            shift = int(rng.integers(1, len(donors)))
+            donors = donors[shift:] + donors[:shift]
+        for target, donor in zip(indices, donors):
+            output[target] = replace(
+                examples[target], actions=examples[donor].actions.copy(),
+                action_mask=examples[donor].action_mask.copy())
     return output
 
 
