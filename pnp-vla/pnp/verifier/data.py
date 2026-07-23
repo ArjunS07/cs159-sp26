@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from dataclasses import replace
 import hashlib
 import io
+import time
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -45,6 +46,19 @@ ROLLOUT_COLUMNS = (
     "rollout_id,experiment,benchmark,suite,task_idx,episode_idx,success,"
     "pcp_chunks_path,trajectory_path,status"
 )
+
+
+def _download_with_retry(store, path: str, attempts: int = 5):
+    """Retry transient Supabase/httpx transport failures with bounded backoff."""
+    import httpx
+
+    for attempt in range(attempts):
+        try:
+            return store._download(path)
+        except (httpx.TransportError, httpx.TimeoutException):
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(2 ** attempt)
 
 
 def _paged_rollouts(store, experiments: Sequence[str]) -> list[dict]:
@@ -102,8 +116,10 @@ def load_clean_chunk_examples(store, experiments: Sequence[str], *, horizon: int
     iterator = progress(rows) if progress else rows
     examples: list[CleanChunkExample] = []
     for row in iterator:
-        pcp = pd.read_parquet(io.BytesIO(store._download(row["pcp_chunks_path"])))
-        with np.load(io.BytesIO(store._download(row["trajectory_path"]))) as trajectory:
+        pcp = pd.read_parquet(io.BytesIO(
+            _download_with_retry(store, row["pcp_chunks_path"])))
+        with np.load(io.BytesIO(
+                _download_with_retry(store, row["trajectory_path"]))) as trajectory:
             examples.extend(build_clean_chunk_examples(
                 row, pcp, trajectory, horizon=horizon, action_dim=action_dim))
     return examples
@@ -150,17 +166,24 @@ def load_candidate_examples(store, experiment="verifier-clean-pairs-v1"):
             experiments.index(g["experiment"]), g["candidate_group_id"])))
     groups = retained
     group_by_id = {row["candidate_group_id"]: row for row in groups}
+    observation_cache = {}
     examples = []
     for row in candidates:
         group = group_by_id.get(row["candidate_group_id"])
         if group is None:
             continue
-        with np.load(io.BytesIO(store._download(row["env_chunk_path"]))) as artifact:
+        with np.load(io.BytesIO(
+                _download_with_retry(store, row["env_chunk_path"]))) as artifact:
             actions = np.asarray(artifact["actions"], dtype=np.float32)[:, :7]
             mask = (np.asarray(artifact["mask"], dtype=np.bool_) if "mask" in artifact
                     else np.ones(len(actions), dtype=np.bool_))
-        with np.load(io.BytesIO(store._download(row["observation_path"]))) as artifact:
-            obs_enc = np.asarray(artifact["obs_enc"], dtype=np.float32).reshape(-1)
+        group_id = row["candidate_group_id"]
+        if group_id not in observation_cache:
+            with np.load(io.BytesIO(
+                    _download_with_retry(store, row["observation_path"]))) as artifact:
+                observation_cache[group_id] = np.asarray(
+                    artifact["obs_enc"], dtype=np.float32).reshape(-1)
+        obs_enc = observation_cache[group_id]
         padded = np.zeros((50, 7), dtype=np.float32)
         padded_mask = np.zeros(50, dtype=np.bool_)
         n = min(50, len(actions))
