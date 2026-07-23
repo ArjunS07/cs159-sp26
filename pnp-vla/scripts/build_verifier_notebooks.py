@@ -313,9 +313,23 @@ assert not missing, missing[:3]
 store.client.table("verifier_candidate_groups").select("candidate_group_id").limit(1).execute()
 print("manifest identities and verifier tables are ready")'''),
     md("## 5. Collect deterministic-replay four-candidate groups"),
-    code(r'''existing = {r["candidate_group_id"] for r in
-            (store.client.table("verifier_candidate_groups").select("candidate_group_id")
-             .eq("experiment", COLLECTION_EXPERIMENT).execute().data or [])}
+    code(r'''existing_group_rows = pages(
+    "verifier_candidate_groups", "candidate_group_id",
+    lambda q: q.eq("experiment", COLLECTION_EXPERIMENT))
+existing_group_ids = {row["candidate_group_id"] for row in existing_group_rows}
+all_candidate_ids = pages(
+    "verifier_candidates", "candidate_group_id",
+    lambda q: q)
+candidate_counts = {}
+for row in all_candidate_ids:
+    gid = row["candidate_group_id"]
+    if gid in existing_group_ids:
+        candidate_counts[gid] = candidate_counts.get(gid, 0) + 1
+# A crash can leave a group row with fewer than four candidates. Recollect it.
+existing = {gid for gid in existing_group_ids
+            if candidate_counts.get(gid, 0) == CANDIDATE_COUNT}
+print({"complete_existing_groups": len(existing),
+       "partial_groups_to_repair": len(existing_group_ids - existing)})
 store.start_run("verifier_pair_collection", "libero+libero_pro", COLLECTION_EXPERIMENT,
                 config={"groups": TOTAL_GROUPS,
                         "outcomes": TOTAL_GROUPS * CANDIDATE_COUNT,
@@ -350,17 +364,25 @@ for item in tqdm(manifest, desc="candidate groups"):
 store.finish_run(n_rollouts=completed)
 print("new outcomes:", completed, "total groups:", len(existing))'''),
     md("## 6. Integrity and outcome-balance report"),
-    code(r'''groups = store.client.table("verifier_candidate_groups").select("*").eq(
-    "experiment", COLLECTION_EXPERIMENT).execute().data or []
-candidates = store.client.table("verifier_candidates").select(
-    "candidate_id,candidate_group_id,candidate_kind,success").execute().data or []
+    code(r'''groups = pages(
+    "verifier_candidate_groups", "*",
+    lambda q: q.eq("experiment", COLLECTION_EXPERIMENT))
+candidates = pages(
+    "verifier_candidates", "candidate_id,candidate_group_id,candidate_kind,success",
+    lambda q: q)
 group_ids = {g["candidate_group_id"] for g in groups}
 candidates = [c for c in candidates if c["candidate_group_id"] in group_ids]
+by_group = {}
+for candidate in candidates:
+    by_group.setdefault(candidate["candidate_group_id"], []).append(candidate)
+complete = {gid for gid in group_ids if len(by_group.get(gid, [])) == CANDIDATE_COUNT}
 print({"groups": len(groups), "outcomes": len(candidates),
+       "complete_groups": len(complete),
+       "partial_groups": len(group_ids - complete),
        "successes": sum(c["success"] for c in candidates),
        "failures": sum(not c["success"] for c in candidates),
-       "discordant_groups": sum(len({c["success"] for c in candidates if c["candidate_group_id"] == gid}) == 2
-                                for gid in group_ids),
+       "discordant_groups": sum(len({c["success"] for c in by_group.get(gid, [])}) == 2
+                                for gid in complete),
        "replay_groups": sum(g["pairing_mode"] == "deterministic_replay" for g in groups),
        "validated_groups": sum(bool((g.get("metadata_json") or {}).get("replay_validated"))
                                for g in groups)})'''),
