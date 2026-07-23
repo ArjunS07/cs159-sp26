@@ -453,7 +453,7 @@ class SupabaseStore:
         self._upload(split_path, json.dumps(split_manifest, sort_keys=True).encode())
         row = {
             "verifier_id": verifier_id, "experiment": self.experiment, "run_id": self.run_id,
-            "model_class": config.get("model_class", "CleanChunkVerifier"),
+            "model_class": config.get("model_class", "CompactAdvantageVerifier"),
             "obs_dim": config["obs_dim"], "action_dim": config.get("action_dim", ADIM),
             "horizon": config.get("horizon", 50), "prefix_length": config.get("prefix_length"),
             "checkpoint_path": ckpt_path, "split_path": split_path,

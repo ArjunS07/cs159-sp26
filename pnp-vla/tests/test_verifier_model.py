@@ -1,45 +1,11 @@
+import numpy as np
 import torch
 
-from pnp.verifier.model import CleanChunkVerifier, CompactAdvantageVerifier
-from pnp.verifier.train import summarize_candidate_records
-
-
-def test_candidate_scoring_shape_and_permutation_equivariance():
-    torch.manual_seed(0)
-    model = CleanChunkVerifier(obs_dim=16, dropout=0).eval()
-    obs = torch.randn(2, 16)
-    position = torch.tensor([0.0, 0.5])
-    actions = torch.randn(2, 4, 50, 7)
-    mask = torch.ones(2, 4, 50, dtype=torch.bool)
-    context = model.encode_context(obs, position)
-    score = model.score_candidates(context, actions, mask, 10)
-    permutation = torch.tensor([2, 0, 3, 1])
-    permuted = model.score_candidates(context, actions[:, permutation], mask[:, permutation], 10)
-    assert score.shape == (2, 4)
-    assert torch.allclose(permuted, score[:, permutation], atol=1e-6)
-
-
-def test_masked_padding_does_not_change_score():
-    torch.manual_seed(1)
-    model = CleanChunkVerifier(obs_dim=16, dropout=0).eval()
-    obs, position = torch.randn(2, 16), torch.zeros(2)
-    actions = torch.randn(2, 50, 7)
-    mask = torch.zeros(2, 50, dtype=torch.bool)
-    mask[:, :10] = True
-    changed = actions.clone()
-    changed[:, 10:] = torch.randn_like(changed[:, 10:]) * 100
-    a = model(obs, actions, mask, position, 10).joint_logit
-    b = model(obs, changed, mask, position, 10).joint_logit
-    assert torch.allclose(a, b, atol=1e-6)
-
-
-def test_state_head_is_action_independent():
-    model = CleanChunkVerifier(obs_dim=16, dropout=0).eval()
-    obs, position = torch.randn(2, 16), torch.zeros(2)
-    mask = torch.ones(2, 50, dtype=torch.bool)
-    a = model(obs, torch.randn(2, 50, 7), mask, position).state_logit
-    b = model(obs, torch.randn(2, 50, 7), mask, position).state_logit
-    assert torch.allclose(a, b)
+from pnp.verifier.data import CleanChunkExample
+from pnp.verifier.model import CompactAdvantageVerifier
+from pnp.verifier.train import (
+    AdvantageTrainConfig, _loader, dataset_hash, summarize_candidate_records,
+)
 
 
 def test_compact_ranker_is_permutation_equivariant_and_prefix_only():
@@ -85,3 +51,35 @@ def test_candidate_metrics_average_pairs_at_the_group_level():
     assert metrics["group_macro_ranking_accuracy"] == 0.5
     assert metrics["n_pairwise_comparisons"] == 5
     assert metrics["top1_success"] == 0.5
+
+
+def test_weighted_sampler_changes_draws_across_epochs_reproducibly():
+    examples = [
+        CleanChunkExample(
+            rollout_id=f"r{i}", experiment="e", benchmark="libero", suite="s",
+            task_idx=0, episode_idx=i, chunk_idx=0, chunk_position=0,
+            obs_enc=np.full(4, i, np.float32),
+            actions=np.zeros((50, 7), np.float32),
+            action_mask=np.ones(50, bool), success=i % 2)
+        for i in range(20)
+    ]
+    config = AdvantageTrainConfig(seed=11, batch_rollouts=20)
+    draws = [
+        next(iter(_loader(examples, config, train=True, seed_offset=epoch)))["rollout_id"]
+        for epoch in (0, 1, 0)
+    ]
+    assert draws[0] != draws[1]
+    assert draws[0] == draws[2]
+
+
+def test_dataset_hash_detects_label_and_artifact_changes():
+    example = CleanChunkExample(
+        rollout_id="r", experiment="e", benchmark="libero", suite="s",
+        task_idx=0, episode_idx=0, chunk_idx=0, chunk_position=0,
+        obs_enc=np.zeros(4, np.float32), actions=np.zeros((50, 7), np.float32),
+        action_mask=np.ones(50, bool), success=0)
+    changed_label = CleanChunkExample(**{**example.__dict__, "success": 1})
+    changed_actions = CleanChunkExample(**{
+        **example.__dict__, "actions": np.ones((50, 7), np.float32)})
+    assert dataset_hash([example]) != dataset_hash([changed_label])
+    assert dataset_hash([example]) != dataset_hash([changed_actions])

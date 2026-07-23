@@ -1,14 +1,11 @@
 import numpy as np
-import pandas as pd
 from dataclasses import replace
 
 from pnp.verifier.data import (
     CleanChunkExample, build_clean_chunk_examples, candidate_cv_splits,
-    candidate_group_split, exclude_candidate_identities, hard_task_keys,
-    heldout_task_split, known_task_split, locked_candidate_split, select_examples,
-    shuffle_candidate_actions_within_group,
+    exclude_candidate_identities, known_task_split, locked_candidate_split, select_examples,
+    shuffle_candidate_actions_within_group, validate_candidate_groups,
 )
-from pnp.verifier.train import DiscordantPairDataset
 
 
 def _example(task, episode, success, chunk=0):
@@ -20,6 +17,8 @@ def _example(task, episode, success, chunk=0):
 
 
 def test_build_clean_chunks_preserves_terminal_partial_mask():
+    import pandas as pd
+
     row = {"rollout_id": "r", "experiment": "e", "benchmark": "libero", "suite": "s",
            "task_idx": 0, "episode_idx": 0, "success": True}
     frame = pd.DataFrame([
@@ -32,15 +31,6 @@ def test_build_clean_chunks_preserves_terminal_partial_mask():
     assert examples[0].action_mask.sum() == 50
     assert examples[1].action_mask.sum() == 10
     assert np.all(examples[1].actions[10:] == 0)
-
-
-def test_hard_tasks_count_each_rollout_once_not_each_chunk():
-    examples = []
-    for episode in range(10):
-        examples.extend([_example(0, episode, episode < 5, chunk=0),
-                         _example(0, episode, episode < 5, chunk=1)])
-        examples.append(_example(1, episode, True))
-    assert hard_task_keys(examples) == {("libero", "suite", 0)}
 
 
 def test_known_split_keeps_rollout_chunks_together_and_disjoint():
@@ -68,46 +58,6 @@ def test_known_split_keeps_a_single_failure_in_training():
     label = {e.rollout_id: e.success for e in examples}
     assert sum(not label[rid] for rid in split["train"]) == 1
     assert all(label[rid] for name in ("val", "cal", "test") for rid in split[name])
-
-
-def test_heldout_split_has_disjoint_tasks():
-    examples = [_example(task, episode, episode % 2) for task in range(40) for episode in range(10)]
-    split = heldout_task_split(examples)
-    task_of = {e.rollout_id: e.task_idx for e in examples}
-    task_sets = {name: {task_of[rid] for rid in ids} for name, ids in split.items()}
-    assert len(task_sets["test"]) == 8
-    assert len(task_sets["val"]) == len(task_sets["cal"]) == 4
-    assert not any(a & b for i, a in enumerate(task_sets.values())
-                   for b in list(task_sets.values())[i + 1:])
-
-
-def test_discordant_pairs_include_initial_state_fallback_groups():
-    base = _example(0, 0, True)
-    fallback = [
-        replace(base, rollout_id="candidate-positive", candidate_group_id="group",
-                pairing_mode="paired_full_episode", success=True),
-        replace(base, rollout_id="candidate-negative", candidate_group_id="group",
-                pairing_mode="paired_full_episode", success=False),
-    ]
-    assert len(DiscordantPairDataset(fallback)) == 1
-
-    replay = [replace(example, pairing_mode="deterministic_replay") for example in fallback]
-    assert len(DiscordantPairDataset(replay)) == 1
-
-
-def test_candidate_split_stratifies_discordant_groups():
-    examples = []
-    for group_index in range(20):
-        base = _example(group_index, 0, True)
-        for success in (True, False):
-            examples.append(replace(
-                base, rollout_id=f"g{group_index}-{success}",
-                candidate_group_id=f"g{group_index}", pairing_mode="paired_full_episode",
-                success=success))
-    split = candidate_group_split(examples)
-    assert {name: len(DiscordantPairDataset(
-        [e for e in examples if e.rollout_id in ids])) for name, ids in split.items()} == {
-        "train": 12, "val": 2, "cal": 2, "test": 4}
 
 
 def _candidate_examples(n_groups=20):
@@ -159,3 +109,15 @@ def test_identity_exclusion_and_within_group_shuffle():
         assert all(not np.array_equal(a.actions, b.actions) for a, b in zip(before, after))
         assert sorted(float(e.actions[0, 0]) for e in before) == sorted(
             float(e.actions[0, 0]) for e in after)
+
+
+def test_candidate_group_validation_rejects_partial_and_state_mismatch():
+    examples = _candidate_examples(2)
+    assert validate_candidate_groups(examples, expected_candidates=4) == {
+        "groups": 2, "candidates": 8, "discordant_groups": 2}
+    with np.testing.assert_raises_regex(ValueError, "expected 4 candidates"):
+        validate_candidate_groups(examples[:-1], expected_candidates=4)
+    mismatched = list(examples)
+    mismatched[1] = replace(mismatched[1], chunk_idx=9)
+    with np.testing.assert_raises_regex(ValueError, "do not share one observation/state"):
+        validate_candidate_groups(mismatched, expected_candidates=4)

@@ -48,202 +48,6 @@ import pnp
 print("Loaded pnp from:", pnp.__file__)'''
 
 
-LEGACY_EXPERIMENT_CELLS = [
-    md("# 03 — Clean t=1 verifier experiments\n\nEach section is an explicit experiment. Run setup and data cells once; run model cells independently."),
-    md("## 1. Environment setup"), code(BOOTSTRAP),
-    md("## 2. Configuration and reproducibility"),
-    code(r'''from pathlib import Path
-import json, pickle
-import numpy as np
-import pandas as pd
-import torch
-from tqdm.auto import tqdm
-import wandb
-
-from pnp.store import SupabaseStore
-from pnp.verifier import *
-
-EXPERIMENTS = ("libero-hybrid-schedules-k3-v1", "libero-pro-canonical-core-k3-v1")
-OUTPUT = Path(package_dir) / "analysis_outputs" / "verifier"
-OUTPUT.mkdir(parents=True, exist_ok=True)
-SEEDS = (42, 43, 44)
-PREFIXES = (5, 10, 25, 50)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-USE_WANDB = bool(os.getenv("WANDB_API_KEY"))
-store = SupabaseStore()
-print({"device": str(DEVICE), "output": str(OUTPUT), "wandb": USE_WANDB})'''),
-    md("## 3. Download and reconstruct clean environment-space chunks"),
-    code(r'''CACHE = OUTPUT / "clean_examples.pkl"
-if CACHE.exists():
-    with CACHE.open("rb") as handle:
-        examples = pickle.load(handle)
-else:
-    examples = load_clean_chunk_examples(store, EXPERIMENTS, progress=tqdm)
-    with CACHE.open("wb") as handle:
-        pickle.dump(examples, handle)
-print(f"{len(examples):,} chunks from {len({e.rollout_id for e in examples}):,} rollouts")'''),
-    md("## 4. Dataset audit: outcomes, masks, benchmarks, and task balance"),
-    code(r'''audit = pd.DataFrame([{
-    "rollout_id": e.rollout_id, "benchmark": e.benchmark, "suite": e.suite,
-    "task_idx": e.task_idx, "chunk_idx": e.chunk_idx, "success": e.success,
-    "valid_actions": int(e.action_mask.sum()),
-} for e in examples])
-display(audit.groupby("benchmark").agg(
-    chunks=("chunk_idx", "size"), rollouts=("rollout_id", "nunique"),
-    success_rate=("success", "mean"), partial_chunks=("valid_actions", lambda x: int((x < 50).sum()))))
-display(audit.groupby(["benchmark", "suite", "task_idx"])["success"].mean().describe())'''),
-    md("## 5. Primary mixed-outcome cohort and deterministic split manifests"),
-    code(r'''hard = hard_task_keys(examples)
-hard_examples = [e for e in examples if e.task_key in hard]
-known_split = known_task_split(hard_examples, seed=42)
-heldout_split = heldout_task_split(hard_examples, fold=0, seed=42)
-manifests = {"known": known_split, "heldout_fold0": heldout_split}
-(OUTPUT / "splits.json").write_text(json.dumps(manifests, indent=2, sort_keys=True))
-print(f"hard tasks={len(hard)} chunks={len(hard_examples)}")
-print({kind: {k: len(v) for k, v in split.items()} for kind, split in manifests.items()})'''),
-    md("## 6. Reusable logged experiment runner"),
-    code(r'''def run_experiment(name, model_factory, split, cfg, dataset=hard_examples,
-                   paired_dataset=None, paired_split=None):
-    parts = {key: select_examples(dataset, ids) for key, ids in split.items()}
-    paired_split = paired_split or split
-    paired_parts = ({key: select_examples(paired_dataset, ids) for key, ids in paired_split.items()}
-                    if paired_dataset else {key: None for key in split})
-    run = wandb.init(project="pnp-clean-verifier", name=name, config=cfg.__dict__,
-                     mode="online" if USE_WANDB else "disabled", reinit=True)
-    model = model_factory()
-    action_mean, action_std = action_statistics(parts["train"])
-    model.set_action_statistics(action_mean, action_std)
-    model, metadata = train_verifier(
-        model, parts["train"], parts["val"], DEVICE, config=cfg, wandb_run=run,
-        paired_train_examples=paired_parts["train"], paired_val_examples=paired_parts["val"])
-    scaler = calibrate_temperature(model, parts["cal"], DEVICE, config=cfg)
-    metrics = evaluate_verifier(model, parts["test"], DEVICE, config=cfg, scaler=scaler,
-                                paired_examples=paired_parts["test"])
-    run.log({f"test/{k}": v for k, v in metrics.items()}); run.finish()
-    result = {"name": name, "model": model, "scaler": scaler, "config": cfg,
-              "metadata": metadata, "metrics": metrics, "split": split}
-    print(name, json.dumps(metrics, indent=2))
-    return result
-
-results = {}'''),
-    md("## 7. Observation-only shortcut baseline"),
-    code(r'''# Empirical task-prior baseline (diagnostic only; task identity is never fed to the model).
-train_records = {e.rollout_id: e for e in select_examples(hard_examples, known_split["train"])}
-test_records = {e.rollout_id: e for e in select_examples(hard_examples, known_split["test"])}
-task_rate = pd.DataFrame([{"task": e.task_key, "success": e.success} for e in train_records.values()]).groupby("task").success.mean()
-prior_labels = [e.success for e in test_records.values()]
-prior_probs = [float(task_rate.get(e.task_key, np.mean(prior_labels))) for e in test_records.values()]
-print("task-prior", classification_metrics(prior_labels, prior_probs,
-      [str(e.task_key) for e in test_records.values()]))
-
-for seed in SEEDS:
-    cfg = VerifierTrainConfig(seed=seed, score_head="state", prefix_length=10)
-    results[f"state_seed{seed}"] = run_experiment(
-        f"state-seed{seed}", lambda: CleanChunkVerifier(), known_split, cfg)'''),
-    md("## 8. Historical flattened-MLP baseline"),
-    code(r'''for seed in SEEDS:
-    cfg = VerifierTrainConfig(seed=seed, prefix_length=50)
-    results[f"flat_seed{seed}"] = run_experiment(
-        f"flat-seed{seed}", lambda: FlattenedVerifier(), known_split, cfg)'''),
-    md("## 9. Temporal ConvNet and 5/10/25/50 prefix sweep"),
-    code(r'''for prefix in PREFIXES:
-    for seed in SEEDS:
-        cfg = VerifierTrainConfig(seed=seed, prefix_length=prefix)
-        key = f"tcn_p{prefix}_seed{seed}"
-        results[key] = run_experiment(key, lambda: CleanChunkVerifier(), known_split, cfg)'''),
-    md("## 10. Action-only diagnostic"),
-    code(r'''for seed in SEEDS:
-    cfg = VerifierTrainConfig(seed=seed, prefix_length=10, zero_observation=True)
-    results[f"action_seed{seed}"] = run_experiment(
-        f"action-seed{seed}", lambda: CleanChunkVerifier(), known_split, cfg)'''),
-    md("## 11. Within-task shuffled-action shortcut test"),
-    code(r'''shuffled = shuffle_actions_within_task(hard_examples, seed=42)
-for seed in SEEDS:
-    cfg = VerifierTrainConfig(seed=seed, prefix_length=10)
-    results[f"shuffled_seed{seed}"] = run_experiment(
-        f"shuffled-seed{seed}", lambda: CleanChunkVerifier(), known_split, cfg,
-        dataset=shuffled)'''),
-    md("## 11b. Zero-action shortcut test"),
-    code(r'''zeroed = zero_actions(hard_examples)
-for seed in SEEDS:
-    cfg = VerifierTrainConfig(seed=seed, prefix_length=10)
-    results[f"zero_action_seed{seed}"] = run_experiment(
-        f"zero-action-seed{seed}", lambda: CleanChunkVerifier(), known_split, cfg,
-        dataset=zeroed)'''),
-    md("## 12. Cohort ablations: all tasks, LIBERO, PRO, and transfer"),
-    code(r'''cohort_results = {}
-for label, cohort in {
-    "all": examples,
-    "libero_hard": [e for e in hard_examples if e.benchmark == "libero"],
-    "pro_hard": [e for e in hard_examples if e.benchmark == "libero_pro"],
-}.items():
-    split = known_task_split(cohort, seed=42)
-    cfg = VerifierTrainConfig(seed=42, prefix_length=10)
-    cohort_results[label] = run_experiment(
-        f"cohort-{label}", lambda: CleanChunkVerifier(), split, cfg, dataset=cohort)
-results.update({f"cohort_{k}": v for k, v in cohort_results.items()})'''),
-    md("## 12b. Cross-benchmark transfer"),
-    code(r'''libero_hard = [e for e in hard_examples if e.benchmark == "libero"]
-pro_hard = [e for e in hard_examples if e.benchmark == "libero_pro"]
-for source, target, trained in (
-    ("libero", pro_hard, cohort_results["libero_hard"]),
-    ("pro", libero_hard, cohort_results["pro_hard"]),
-):
-    transfer = evaluate_verifier(trained["model"], target, DEVICE,
-                                 config=trained["config"], scaler=trained["scaler"])
-    print(source, "transfer", json.dumps(transfer, indent=2))'''),
-    md("## 13. Held-out-task evaluation for the selected prefix"),
-    code(r'''heldout_results = {}
-SELECTED_PREFIX = 10
-for fold in range(5):
-    split = heldout_task_split(hard_examples, fold=fold, seed=42)
-    for seed in SEEDS:
-        cfg = VerifierTrainConfig(seed=seed, prefix_length=SELECTED_PREFIX)
-        key = f"heldout_f{fold}_seed{seed}"
-        heldout_results[key] = run_experiment(
-            key, lambda: CleanChunkVerifier(), split, cfg)
-results.update(heldout_results)'''),
-    md("## 14. Composite eligibility and result table"),
-    code(r'''result_table = pd.DataFrame([
-    {"name": key, **value["metrics"]} for key, value in results.items()
-]).sort_values(["task_macro_pr_auc", "brier"], ascending=[False, True])
-display(result_table)
-result_table.to_csv(OUTPUT / "experiment_results.csv", index=False)
-print("Eligibility requires joint > state and shuffled controls in at least 2/3 seeds;")
-print("after paired data, rank eligible configurations equally by PR-AUC, pair accuracy, and -Brier.")'''),
-    md("## 15. Register one selected calibrated checkpoint"),
-    code(r'''SELECTED_KEY = None  # Set explicitly after reviewing the table; e.g. "tcn_p10_seed42"
-if SELECTED_KEY:
-    selected = results[SELECTED_KEY]
-    verifier_id = new_verifier_id()
-    config = {"model_class": type(selected["model"]).__name__, "obs_dim": 2048,
-              "action_dim": 7, "horizon": 50,
-              "prefix_length": selected["config"].prefix_length,
-              "train": selected["config"].__dict__}
-    store.start_run("verifier_train", "libero+libero_pro", "clean-verifier-v1")
-    store.register_verifier(
-        verifier_id, verifier_checkpoint_bytes(selected["model"], selected["scaler"], config),
-        config, selected["metrics"], selected["split"], dataset_hash=dataset_hash(hard_examples))
-    store.finish_run(n_rollouts=0)
-    print("registered", verifier_id)
-else:
-    print("Set SELECTED_KEY only after reviewing shortcut controls and held-out results.")'''),
-    md("## 16. Paired-data retraining (run after notebook 04)"),
-    code(r'''paired_examples = load_candidate_examples(
-    store, ("verifier-clean-pairs-v1", "verifier-clean-pairs-v2",
-            "verifier-clean-pairs-v3"))
-if paired_examples:
-    paired_split = candidate_group_split(paired_examples, seed=42)
-    cfg = VerifierTrainConfig(seed=42, prefix_length=10)
-    results["tcn_with_pairs"] = run_experiment(
-        "tcn-with-pairs", lambda: CleanChunkVerifier(), known_split, cfg,
-        paired_dataset=paired_examples, paired_split=paired_split)
-    print("paired examples:", len(paired_examples))
-else:
-    print("No paired candidate artifacts yet; run notebook 04 first.")'''),
-]
-
-
 EXPERIMENT_CELLS = [
     md("""# 03 — Same-state action-advantage verifier
 
@@ -294,6 +98,8 @@ else:
 
 primary = load_candidate_examples(store, PRIMARY_CANDIDATES)
 auxiliary = load_candidate_examples(store, AUXILIARY_CANDIDATES)
+print("primary integrity", validate_candidate_groups(primary, expected_candidates=4))
+print("auxiliary integrity", validate_candidate_groups(auxiliary))
 
 def candidate_audit(examples):
     frame = pd.DataFrame([{
@@ -358,8 +164,11 @@ for fold_index, fold in enumerate(folds):
     protected = fold_val + locked_test
     fold_historical = exclude_candidate_identities(historical, protected)
     historical_split = known_task_split(fold_historical, seed=42 + fold_index)
-    value_train = select_examples(fold_historical, historical_split["train"])
     value_val = select_examples(fold_historical, historical_split["val"])
+    value_val_ids = set(historical_split["val"])
+    value_train = [
+        example for example in fold_historical
+        if example.rollout_id not in value_val_ids]
     clean_aux = exclude_candidate_identities(auxiliary, protected)
 
     for seed in SEEDS:
@@ -444,8 +253,11 @@ print("selected:", SELECTED_CONFIG)'''),
     code(r'''selected_knobs = CONFIGS[SELECTED_CONFIG]
 final_historical = exclude_candidate_identities(historical, locked_test)
 final_hist_split = known_task_split(final_historical, seed=42)
-final_value_train = select_examples(final_historical, final_hist_split["train"])
 final_value_val = select_examples(final_historical, final_hist_split["val"])
+final_value_val_ids = set(final_hist_split["val"])
+final_value_train = [
+    example for example in final_historical
+    if example.rollout_id not in final_value_val_ids]
 final_candidates = list(development)
 if selected_knobs.get("include_aux"):
     final_candidates += exclude_candidate_identities(auxiliary, locked_test)

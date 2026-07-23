@@ -125,7 +125,13 @@ def load_candidate_examples(store, experiment="verifier-clean-pairs-v1"):
     groups = pages("verifier_candidate_groups", lambda query: (
         query.eq("experiment", experiments[0]) if len(experiments) == 1
         else query.in_("experiment", experiments)))
-    candidates = pages("verifier_candidates", lambda query: query)
+    group_ids = [group["candidate_group_id"] for group in groups]
+    candidates = []
+    for start in range(0, len(group_ids), 100):
+        batch_ids = group_ids[start:start + 100]
+        candidates.extend(pages(
+            "verifier_candidates",
+            lambda query, ids=batch_ids: query.in_("candidate_group_id", ids)))
     candidate_counts = Counter(row["candidate_group_id"] for row in candidates)
     # Old fallback IDs included a requested mid-rollout chunk even though the
     # actual branch was always episode-initial. Keep only the richest group per
@@ -176,25 +182,6 @@ def load_candidate_examples(store, experiment="verifier-clean-pairs-v1"):
 
 def _rollout_records(examples: Iterable[CleanChunkExample]) -> dict[str, CleanChunkExample]:
     return {example.rollout_id: example for example in examples}
-
-
-def hard_task_keys(examples: Iterable[CleanChunkExample], lo: float = 0.10,
-                   hi: float = 0.90) -> set[tuple[str, str, int]]:
-    """Return mixed-outcome tasks, computing rates once per rollout rather than per chunk."""
-    outcomes: dict[tuple[str, str, int], list[int]] = defaultdict(list)
-    for example in _rollout_records(examples).values():
-        outcomes[example.task_key].append(example.success)
-    return {key for key, values in outcomes.items() if lo < np.mean(values) < hi}
-
-
-def action_statistics(examples: Sequence[CleanChunkExample]):
-    """Training-only per-dimension statistics over valid environment actions."""
-    valid = [example.actions[example.action_mask] for example in examples
-             if example.action_mask.any()]
-    if not valid:
-        raise ValueError("cannot compute action statistics from an empty dataset")
-    actions = np.concatenate(valid, axis=0).astype(np.float64)
-    return actions.mean(0).astype(np.float32), actions.std(0).clip(min=1e-6).astype(np.float32)
 
 
 def _stable_order(values, seed: int):
@@ -257,60 +244,51 @@ def known_task_split(examples: Sequence[CleanChunkExample], seed: int = 42) -> d
     return split
 
 
-def heldout_task_split(examples: Sequence[CleanChunkExample], fold: int = 0,
-                       n_folds: int = 5, seed: int = 42) -> dict[str, list[str]]:
-    """Task-disjoint 24/4/4/8 split for the canonical 40-task hard cohort."""
-    records = _rollout_records(examples)
-    strata: dict[tuple[str, str], list[tuple[str, str, int]]] = defaultdict(list)
-    task_to_ids: dict[tuple[str, str, int], list[str]] = defaultdict(list)
-    for record in records.values():
-        task_to_ids[record.task_key].append(record.rollout_id)
-    for task in task_to_ids:
-        strata[task[:2]].append(task)
-    test_tasks: set[tuple[str, str, int]] = set()
-    remaining: list[tuple[str, str, int]] = []
-    for stratum, tasks in sorted(strata.items()):
-        ordered = _stable_order(tasks, seed + int(hashlib.md5(str(stratum).encode()).hexdigest()[:6], 16))
-        test_tasks.update(task for i, task in enumerate(ordered) if i % n_folds == fold)
-        remaining.extend(task for i, task in enumerate(ordered) if i % n_folds != fold)
-    remaining = _stable_order(remaining, seed + 1000 + fold)
-    n_aux = max(1, len(test_tasks) // 2)
-    val_tasks, cal_tasks = set(remaining[:n_aux]), set(remaining[n_aux:2 * n_aux])
-    train_tasks = set(remaining[2 * n_aux:])
-    split_tasks = {"train": train_tasks, "val": val_tasks, "cal": cal_tasks, "test": test_tasks}
-    return {name: [rid for task in sorted(tasks) for rid in sorted(task_to_ids[task])]
-            for name, tasks in split_tasks.items()}
-
-
-def candidate_group_split(examples: Sequence[CleanChunkExample], seed: int = 42):
-    """Group-safe 60/10/10/20 split stratified by outcome discordance."""
-    grouped, group_task = defaultdict(list), {}
-    for example in examples:
-        if example.candidate_group_id:
-            grouped[example.candidate_group_id].append(example.rollout_id)
-            group_task[example.candidate_group_id] = example.task_key
-    labels = {gid: {example.success for example in examples
-                    if example.candidate_group_id == gid} for gid in grouped}
-    assignments = {name: [] for name in ("train", "val", "cal", "test")}
-    for discordant in (False, True):
-        ordered = _stable_order([gid for gid in grouped if (len(labels[gid]) > 1) == discordant],
-                                seed + int(discordant))
-        n = len(ordered)
-        a, b, c = round(.6 * n), round(.7 * n), round(.8 * n)
-        for name, ids in zip(assignments, (ordered[:a], ordered[a:b], ordered[b:c], ordered[c:])):
-            assignments[name].extend(ids)
-    output = {name: [] for name in ("train", "val", "cal", "test")}
-    for name, ids in assignments.items():
-        output[name].extend(candidate_id for gid in ids for candidate_id in grouped[gid])
-    return output
-
-
 def _candidate_groups(examples: Sequence[CleanChunkExample]):
     groups: dict[str, list[CleanChunkExample]] = defaultdict(list)
     for example in examples:
         if example.candidate_group_id:
             groups[example.candidate_group_id].append(example)
     return groups
+
+
+def validate_candidate_groups(examples: Sequence[CleanChunkExample], *,
+                              expected_candidates: int | None = None):
+    """Reject partial, duplicated, or non-same-state candidate groups."""
+    groups = _candidate_groups(examples)
+    if not groups:
+        raise ValueError("candidate dataset contains no groups")
+    errors = []
+    for gid, members in groups.items():
+        if expected_candidates is not None and len(members) != expected_candidates:
+            errors.append(f"{gid}: expected {expected_candidates} candidates, got {len(members)}")
+        ids = [member.rollout_id for member in members]
+        if len(ids) != len(set(ids)):
+            errors.append(f"{gid}: duplicate candidate IDs")
+        if sum(member.candidate_kind == "default" for member in members) != 1:
+            errors.append(f"{gid}: expected exactly one default candidate")
+        first = members[0]
+        state_key = (
+            first.benchmark, first.suite, first.task_idx, first.episode_idx,
+            first.chunk_idx, first.chunk_position,
+        )
+        for member in members[1:]:
+            member_key = (
+                member.benchmark, member.suite, member.task_idx, member.episode_idx,
+                member.chunk_idx, member.chunk_position,
+            )
+            if member_key != state_key or not np.array_equal(member.obs_enc, first.obs_enc):
+                errors.append(f"{gid}: candidates do not share one observation/state")
+                break
+    if errors:
+        raise ValueError("invalid candidate groups:\n" + "\n".join(errors[:20]))
+    return {
+        "groups": len(groups),
+        "candidates": sum(map(len, groups.values())),
+        "discordant_groups": sum(
+            len({member.success for member in members}) > 1
+            for members in groups.values()),
+    }
 
 
 def _candidate_ids(groups, group_ids):
@@ -337,6 +315,8 @@ def _balanced_group_order(groups, group_ids, seed):
 def locked_candidate_split(examples: Sequence[CleanChunkExample], test_fraction: float = .20,
                            seed: int = 42):
     """Lock a group-safe test set while preserving discordance and coarse cohort balance."""
+    if not 0 < test_fraction < 1:
+        raise ValueError("test_fraction must be between zero and one")
     groups = _candidate_groups(examples)
     discordant = {
         gid: len({example.success for example in members}) > 1
@@ -359,12 +339,17 @@ def candidate_cv_splits(examples: Sequence[CleanChunkExample],
                         development_ids: Iterable[str], n_folds: int = 4,
                         seed: int = 42):
     """Return deterministic group-safe folds over a locked development partition."""
+    if n_folds < 2:
+        raise ValueError("n_folds must be at least two")
     development = select_examples(examples, development_ids)
     groups = _candidate_groups(development)
     discordant = {
         gid: len({example.success for example in members}) > 1
         for gid, members in groups.items()
     }
+    if sum(discordant.values()) < n_folds:
+        raise ValueError(
+            f"need at least {n_folds} discordant development groups for {n_folds}-fold CV")
     fold_groups = [[] for _ in range(n_folds)]
     for status in (False, True):
         ids = [gid for gid in groups if discordant[gid] == status]
@@ -430,27 +415,3 @@ def shuffle_candidate_actions_within_group(examples: Sequence[CleanChunkExample]
 def select_examples(examples: Sequence[CleanChunkExample], rollout_ids: Iterable[str]):
     wanted = set(rollout_ids)
     return [example for example in examples if example.rollout_id in wanted]
-
-
-def shuffle_actions_within_task(examples: Sequence[CleanChunkExample], seed: int = 42):
-    """Return a shortcut-control copy with actions permuted within task and chunk index."""
-    rng = np.random.default_rng(seed)
-    groups = defaultdict(list)
-    for index, example in enumerate(examples):
-        groups[(example.task_key, example.chunk_idx)].append(index)
-    donors = list(range(len(examples)))
-    for indices in groups.values():
-        permuted = list(indices)
-        if len(permuted) > 1:
-            while any(a == b for a, b in zip(indices, permuted)):
-                rng.shuffle(permuted)
-        for target, donor in zip(indices, permuted):
-            donors[target] = donor
-    return [replace(example, actions=examples[donor].actions.copy(),
-                    action_mask=examples[donor].action_mask.copy())
-            for example, donor in zip(examples, donors)]
-
-
-def zero_actions(examples: Sequence[CleanChunkExample]):
-    """Return an action-ablated copy while preserving masks and every identity field."""
-    return [replace(example, actions=np.zeros_like(example.actions)) for example in examples]

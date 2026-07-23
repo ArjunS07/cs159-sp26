@@ -1,4 +1,4 @@
-"""Training, evaluation, and calibration for clean-chunk verifiers."""
+"""Value pretraining and same-state action-advantage ranking."""
 from __future__ import annotations
 
 from collections import Counter, defaultdict
@@ -14,21 +14,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from .data import CleanChunkExample
-
-
-@dataclass
-class VerifierTrainConfig:
-    seed: int = 42
-    prefix_length: int = 10
-    lr: float = 3e-4
-    weight_decay: float = 1e-3
-    batch_rollouts: int = 32
-    epochs: int = 100
-    patience: int = 15
-    state_loss_weight: float = 0.25
-    ranking_loss_weight: float = 0.50
-    score_head: str = "joint"                 # joint | state
-    zero_observation: bool = False             # action-only diagnostic
 
 
 @dataclass
@@ -66,40 +51,6 @@ class CleanChunkDataset(Dataset):
         }
 
 
-class DiscordantPairDataset(Dataset):
-    def __init__(self, examples):
-        groups = defaultdict(list)
-        for example in examples or []:
-            # All modes hold the scored observation fixed across candidates.
-            # ``snapshot`` branches mid-rollout; ``paired_full_episode`` is the
-            # conservative fallback that branches from the identical episode
-            # initial state when simulator snapshots cannot be restored.
-            if (example.candidate_group_id and
-                    example.pairing_mode in {
-                        "snapshot", "paired_full_episode", "deterministic_replay"}):
-                groups[example.candidate_group_id].append(example)
-        self.pairs = []
-        for members in groups.values():
-            positive = [e for e in members if e.success]
-            negative = [e for e in members if not e.success]
-            self.pairs.extend((p, n) for p in positive for n in negative)
-
-    def __len__(self):
-        return len(self.pairs)
-
-    @staticmethod
-    def _tensor(e):
-        return (torch.from_numpy(e.obs_enc), torch.from_numpy(e.actions),
-                torch.from_numpy(e.action_mask), torch.tensor(e.chunk_position, dtype=torch.float32))
-
-    def __getitem__(self, index):
-        positive, negative = self.pairs[index]
-        po, pa, pm, pp = self._tensor(positive)
-        no, na, nm, np_ = self._tensor(negative)
-        return {"pos_obs": po, "pos_actions": pa, "pos_mask": pm, "pos_position": pp,
-                "neg_obs": no, "neg_actions": na, "neg_mask": nm, "neg_position": np_}
-
-
 def _sample_weights(examples):
     chunks_per_rollout = Counter(e.rollout_id for e in examples)
     rollout_record = {e.rollout_id: e for e in examples}
@@ -109,12 +60,12 @@ def _sample_weights(examples):
     return np.asarray(weights, dtype=np.float64)
 
 
-def _loader(examples, config, train=False):
+def _loader(examples, config, train=False, seed_offset=0):
     dataset = CleanChunkDataset(examples)
     sampler = None
     if train:
         weights = _sample_weights(examples)
-        generator = torch.Generator().manual_seed(config.seed)
+        generator = torch.Generator().manual_seed(config.seed + seed_offset)
         sampler = WeightedRandomSampler(weights, len(weights), replacement=True, generator=generator)
     return DataLoader(dataset, batch_size=config.batch_rollouts, sampler=sampler,
                       shuffle=False, num_workers=0)
@@ -161,129 +112,6 @@ def _metrics(labels, probabilities, task_keys):
     }
 
 
-def classification_metrics(labels, probabilities, task_keys):
-    """Public metric helper for empirical-prior and other non-neural baselines."""
-    return _metrics(labels, probabilities, task_keys)
-
-
-def _forward(model, batch, device, config):
-    obs = batch["obs"].to(device)
-    if config.zero_observation:
-        obs = torch.zeros_like(obs)
-    return model(obs, batch["actions"].to(device), batch["mask"].to(device),
-                 batch["position"].to(device), config.prefix_length)
-
-
-def _chosen_logit(output, config):
-    if config.score_head == "state":
-        return output.state_logit
-    if config.score_head != "joint":
-        raise ValueError("score_head must be 'joint' or 'state'")
-    return output.joint_logit
-
-
-@torch.no_grad()
-def evaluate_verifier(model, examples, device, *, config=None, scaler=None, paired_examples=None):
-    config = config or VerifierTrainConfig()
-    model.eval()
-    labels, probs, tasks, suites = [], [], [], []
-    for batch in _loader(examples, config):
-        output = _forward(model, batch, device, config)
-        logits = _chosen_logit(output, config)
-        if scaler is not None:
-            logits = scaler(logits)
-        probs.extend(torch.sigmoid(logits).cpu().numpy().tolist())
-        labels.extend(batch["label"].numpy().tolist())
-        tasks.extend(batch["task_key"])
-        suites.extend(batch["suite"])
-    metrics = _metrics(labels, probs, tasks)
-    metrics["per_suite"] = {
-        suite: _metrics([labels[i] for i in indices], [probs[i] for i in indices],
-                        [tasks[i] for i in indices])
-        for suite in sorted(set(suites))
-        for indices in [[i for i, value in enumerate(suites) if value == suite]]
-    }
-    pair_dataset = DiscordantPairDataset(paired_examples)
-    if len(pair_dataset):
-        correct, total = 0, 0
-        for batch in DataLoader(pair_dataset, batch_size=config.batch_rollouts):
-            def score(prefix):
-                output = model(batch[f"{prefix}_obs"].to(device),
-                               batch[f"{prefix}_actions"].to(device),
-                               batch[f"{prefix}_mask"].to(device),
-                               batch[f"{prefix}_position"].to(device), config.prefix_length)
-                return output.joint_logit
-            correct += int((score("pos") > score("neg")).sum())
-            total += len(batch["pos_obs"])
-        metrics["paired_ranking_accuracy"] = correct / total
-        metrics["n_discordant_pairs"] = total
-    return metrics
-
-
-def train_verifier(model, train_examples, val_examples, device, *, config=None, wandb_run=None,
-                   paired_train_examples=None, paired_val_examples=None):
-    config = config or VerifierTrainConfig()
-    torch.manual_seed(config.seed)
-    np.random.seed(config.seed)
-    model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr,
-                                  weight_decay=config.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs,
-                                                            eta_min=config.lr / 50)
-    best_score, best_state, bad = -float("inf"), None, 0
-    pair_dataset = DiscordantPairDataset(paired_train_examples)
-    point_train_examples = list(train_examples) + list(paired_train_examples or [])
-    for epoch in range(config.epochs):
-        model.train()
-        epoch_loss = []
-        for batch in _loader(point_train_examples, config, train=True):
-            optimizer.zero_grad()
-            output = _forward(model, batch, device, config)
-            label = batch["label"].to(device)
-            joint = nn.functional.binary_cross_entropy_with_logits(output.joint_logit, label)
-            state = nn.functional.binary_cross_entropy_with_logits(output.state_logit, label)
-            loss = (state if config.score_head == "state" else
-                    joint + config.state_loss_weight * state)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            epoch_loss.append(float(loss.detach()))
-        if len(pair_dataset):
-            for batch in DataLoader(pair_dataset, batch_size=config.batch_rollouts, shuffle=True):
-                optimizer.zero_grad()
-                def score(prefix):
-                    return model(batch[f"{prefix}_obs"].to(device),
-                                 batch[f"{prefix}_actions"].to(device),
-                                 batch[f"{prefix}_mask"].to(device),
-                                 batch[f"{prefix}_position"].to(device),
-                                 config.prefix_length).joint_logit
-                ranking = nn.functional.softplus(-(score("pos") - score("neg"))).mean()
-                loss = config.ranking_loss_weight * ranking
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                epoch_loss.append(float(loss.detach()))
-        scheduler.step()
-        metrics = evaluate_verifier(model, val_examples, device, config=config,
-                                    paired_examples=paired_val_examples)
-        score = metrics["task_macro_pr_auc"]
-        if not np.isfinite(score):
-            score = metrics["pr_auc"]
-        if wandb_run is not None:
-            wandb_run.log({"epoch": epoch, "train/loss": float(np.mean(epoch_loss)),
-                           **{f"val/{k}": v for k, v in metrics.items()}})
-        if score > best_score:
-            best_score, best_state, bad = score, copy.deepcopy(model.state_dict()), 0
-        else:
-            bad += 1
-        if bad >= config.patience:
-            break
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    return model, {"best_task_macro_pr_auc": best_score, "epochs_ran": epoch + 1,
-                   "train_config": asdict(config)}
-
-
 def _value_parameters(model):
     for module in (model.obs_encoder, model.position_encoder, model.state_head):
         yield from module.parameters()
@@ -316,7 +144,7 @@ def pretrain_value(model, train_examples, val_examples, device, *, config=None,
     for epoch in range(config.value_epochs):
         model.train()
         losses = []
-        for batch in _loader(train_examples, config, train=True):
+        for batch in _loader(train_examples, config, train=True, seed_offset=epoch):
             optimizer.zero_grad()
             context = model.encode_context(
                 batch["obs"].to(device), batch["position"].to(device))
@@ -407,10 +235,10 @@ def candidate_rank_records(model, examples, device, *, config=None):
         pair_accuracy = margin = float("nan")
         comparisons = 0
         if len(positive) and len(negative):
+            differences = positive[:, None] - negative[None, :]
             pair_accuracy = float(
-                (positive[:, None] > negative[None, :]).mean())
-            margin = float(
-                (positive[:, None] - negative[None, :]).mean())
+                ((differences > 0) + .5 * (differences == 0)).mean())
+            margin = float(differences.mean())
             comparisons = int(len(positive) * len(negative))
         chosen = int(np.argmax(scores))
         default = next((
@@ -495,6 +323,12 @@ def train_advantage(model, train_examples, val_examples, device, *, config=None,
     optimizer = torch.optim.AdamW(
         parameters, lr=config.rank_lr, weight_decay=config.weight_decay)
     groups = _group_examples(train_examples)
+    discordant_groups = sum(
+        len({member.success for member in members}) > 1
+        for members in groups.values())
+    if not discordant_groups and config.candidate_bce_weight <= 0:
+        raise ValueError("rank-only training requires at least one discordant candidate group")
+    use_validation = bool(val_examples)
     best_score, best_state, bad = -float("inf"), None, 0
     rng = np.random.default_rng(config.seed)
     for epoch in range(config.rank_epochs):
@@ -520,9 +354,10 @@ def train_advantage(model, train_examples, val_examples, device, *, config=None,
             torch.nn.utils.clip_grad_norm_(parameters, 1.0)
             optimizer.step()
             losses.append(float(loss.detach()))
-        metrics = evaluate_candidate_ranker(
+        metrics = (evaluate_candidate_ranker(
             model, val_examples, device, config=config, n_bootstrap=500)
-        score = metrics["group_macro_ranking_accuracy"]
+            if use_validation else {})
+        score = metrics.get("group_macro_ranking_accuracy", float("nan"))
         if wandb_run is not None:
             wandb_run.log({
                 "rank/epoch": epoch,
@@ -530,56 +365,43 @@ def train_advantage(model, train_examples, val_examples, device, *, config=None,
                 **{f"rank/val_{key}": value for key, value in metrics.items()
                    if not isinstance(value, dict)},
             })
-        if np.isfinite(score) and score > best_score:
-            best_score, best_state, bad = score, copy.deepcopy(model.state_dict()), 0
-        else:
-            bad += 1
-        if bad >= config.patience:
-            break
+        if use_validation:
+            if np.isfinite(score) and score > best_score:
+                best_score, best_state, bad = score, copy.deepcopy(model.state_dict()), 0
+            else:
+                bad += 1
+            if bad >= config.patience:
+                break
     if best_state is not None:
         model.load_state_dict(best_state)
     return model, {
-        "best_group_macro_ranking_accuracy": best_score,
+        "best_group_macro_ranking_accuracy": (
+            best_score if use_validation else None),
         "rank_epochs_ran": epoch + 1,
         "train_config": asdict(config),
     }
 
 
-class TemperatureScaler(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.log_temperature = nn.Parameter(torch.zeros(1))
-
-    def forward(self, logits):
-        return logits / self.log_temperature.exp().clamp_min(1e-4)
-
-
-def calibrate_temperature(model, calibration_examples, device, *, config=None):
-    config = config or VerifierTrainConfig()
-    model.eval()
-    logits, labels = [], []
-    with torch.no_grad():
-        for batch in _loader(calibration_examples, config):
-            output = _forward(model, batch, device, config)
-            logits.append(_chosen_logit(output, config).detach())
-            labels.append(batch["label"].to(device))
-    logits, labels = torch.cat(logits), torch.cat(labels)
-    scaler = TemperatureScaler().to(device)
-    optimizer = torch.optim.LBFGS(scaler.parameters(), lr=0.05, max_iter=100)
-
-    def closure():
-        optimizer.zero_grad()
-        loss = nn.functional.binary_cross_entropy_with_logits(scaler(logits), labels)
-        loss.backward()
-        return loss
-
-    optimizer.step(closure)
-    return scaler
-
-
 def dataset_hash(examples):
-    keys = sorted((e.rollout_id, e.chunk_idx, e.candidate_group_id or "") for e in examples)
-    return hashlib.sha256(repr(keys).encode()).hexdigest()[:16]
+    """Hash identities, labels, masks, observations, and actions deterministically."""
+    digest = hashlib.sha256()
+    ordered = sorted(examples, key=lambda example: (
+        example.rollout_id, example.chunk_idx, example.candidate_group_id or ""))
+    for example in ordered:
+        metadata = (
+            example.rollout_id, example.experiment, example.benchmark,
+            example.suite, example.task_idx, example.episode_idx,
+            example.chunk_idx, example.chunk_position, example.success,
+            example.candidate_group_id or "", example.candidate_kind or "",
+            example.pairing_mode or "", example.uncertainty_stratum or "",
+        )
+        digest.update(repr(metadata).encode())
+        for array in (example.obs_enc, example.actions, example.action_mask):
+            contiguous = np.ascontiguousarray(array)
+            digest.update(str(contiguous.dtype).encode())
+            digest.update(repr(contiguous.shape).encode())
+            digest.update(contiguous.tobytes())
+    return digest.hexdigest()[:16]
 
 
 def verifier_checkpoint_bytes(model, scaler, metadata):
