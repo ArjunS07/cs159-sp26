@@ -110,7 +110,7 @@ def candidate_audit(examples):
     return {
         "groups": int(frame.group.nunique()), "outcomes": len(frame),
         "successes": int(frame.success.sum()), "failures": int((1-frame.success).sum()),
-        "discordant_groups": int((group_outcomes.nunique == 2).sum()),
+        "discordant_groups": int((group_outcomes["nunique"] == 2).sum()),
         "pairwise_comparisons": int(frame.groupby("group").success.apply(
             lambda y: int(y.sum()) * int((1-y).sum())).sum()),
     }
