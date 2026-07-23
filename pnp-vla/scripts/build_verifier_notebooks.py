@@ -48,7 +48,7 @@ import pnp
 print("Loaded pnp from:", pnp.__file__)'''
 
 
-EXPERIMENT_CELLS = [
+LEGACY_EXPERIMENT_CELLS = [
     md("# 03 — Clean t=1 verifier experiments\n\nEach section is an explicit experiment. Run setup and data cells once; run model cells independently."),
     md("## 1. Environment setup"), code(BOOTSTRAP),
     md("## 2. Configuration and reproducibility"),
@@ -241,6 +241,283 @@ if paired_examples:
     print("paired examples:", len(paired_examples))
 else:
     print("No paired candidate artifacts yet; run notebook 04 first.")'''),
+]
+
+
+EXPERIMENT_CELLS = [
+    md("""# 03 — Same-state action-advantage verifier
+
+This notebook supersedes the historical classification sweep. It pretrains
+`V(s)` on ordinary LIBERO/LIBERO-PRO rollouts, freezes that pathway, and learns
+`A(s,a)` from deterministic same-state candidate groups. Model selection uses
+grouped out-of-fold ranking; the locked 20% test set is opened once at the end."""),
+    md("## 1. Environment setup"), code(BOOTSTRAP),
+    md("## 2. Configuration"),
+    code(r'''from dataclasses import asdict, replace
+from pathlib import Path
+import copy, json, pickle
+import numpy as np
+import pandas as pd
+import torch
+from tqdm.auto import tqdm
+import wandb
+
+from pnp.store import SupabaseStore
+from pnp.verifier import *
+
+HISTORICAL_EXPERIMENTS = (
+    "libero-hybrid-schedules-k3-v1",
+    "libero-pro-canonical-core-k3-v1",
+)
+PRIMARY_CANDIDATES = "verifier-clean-pairs-v3"
+AUXILIARY_CANDIDATES = ("verifier-clean-pairs-v1", "verifier-clean-pairs-v2")
+SEEDS = (42, 43, 44)
+N_FOLDS = 4
+PREFIX_LENGTH = 10
+OUTPUT = Path(package_dir) / "analysis_outputs" / "verifier"
+OUTPUT.mkdir(parents=True, exist_ok=True)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_WANDB = bool(os.getenv("WANDB_API_KEY"))
+REGISTER_IF_ELIGIBLE = True
+store = SupabaseStore()
+print({"device": str(DEVICE), "output": str(OUTPUT), "wandb": USE_WANDB})'''),
+    md("## 3. Load and audit historical and candidate data"),
+    code(r'''CACHE = OUTPUT / "historical_clean_examples_v2.pkl"
+if CACHE.exists():
+    with CACHE.open("rb") as handle:
+        historical = pickle.load(handle)
+else:
+    historical = load_clean_chunk_examples(
+        store, HISTORICAL_EXPERIMENTS, progress=tqdm)
+    with CACHE.open("wb") as handle:
+        pickle.dump(historical, handle)
+
+primary = load_candidate_examples(store, PRIMARY_CANDIDATES)
+auxiliary = load_candidate_examples(store, AUXILIARY_CANDIDATES)
+
+def candidate_audit(examples):
+    frame = pd.DataFrame([{
+        "group": e.candidate_group_id, "benchmark": e.benchmark,
+        "stratum": e.uncertainty_stratum, "success": e.success,
+    } for e in examples])
+    group_outcomes = frame.groupby("group").success.agg(["size", "nunique"])
+    return {
+        "groups": int(frame.group.nunique()), "outcomes": len(frame),
+        "successes": int(frame.success.sum()), "failures": int((1-frame.success).sum()),
+        "discordant_groups": int((group_outcomes.nunique == 2).sum()),
+        "pairwise_comparisons": int(frame.groupby("group").success.apply(
+            lambda y: int(y.sum()) * int((1-y).sum())).sum()),
+    }
+
+print("historical", {
+    "chunks": len(historical),
+    "rollouts": len({e.rollout_id for e in historical}),
+    "hash": dataset_hash(historical),
+})
+print("primary", candidate_audit(primary))
+print("auxiliary", candidate_audit(auxiliary))
+legacy = OUTPUT / "experiment_results.csv"
+if legacy.exists() and not (OUTPUT / "legacy_experiment_results.csv").exists():
+    (OUTPUT / "legacy_experiment_results.csv").write_bytes(legacy.read_bytes())'''),
+    md("## 4. Lock the test set and write immutable manifests"),
+    code(r'''locked = locked_candidate_split(primary, test_fraction=.20, seed=42)
+development = select_examples(primary, locked["development"])
+locked_test = select_examples(primary, locked["test"])
+folds = candidate_cv_splits(primary, locked["development"], n_folds=N_FOLDS, seed=42)
+
+split_manifest = {
+    "primary_experiment": PRIMARY_CANDIDATES,
+    "primary_dataset_hash": dataset_hash(primary),
+    "historical_dataset_hash": dataset_hash(historical),
+    "development_candidate_ids": sorted(locked["development"]),
+    "locked_test_candidate_ids": sorted(locked["test"]),
+    "folds": folds,
+}
+(OUTPUT / "advantage_splits.json").write_text(
+    json.dumps(split_manifest, indent=2, sort_keys=True))
+print({
+    "development": candidate_audit(development),
+    "locked_test": candidate_audit(locked_test),
+    "manifest": str(OUTPUT / "advantage_splits.json"),
+})'''),
+    md("## 5. Grouped 4-fold CV × 3 seeds"),
+    code(r'''CONFIGS = {
+    "rank_only_v3": {"candidate_bce_weight": 0.0},
+    "rank_plus_bce_v3": {"candidate_bce_weight": 0.1},
+    "rank_plus_initial_pairs": {"candidate_bce_weight": 0.0, "include_aux": True},
+    "action_only_control": {"candidate_bce_weight": 0.0, "zero_context": True},
+    "shuffled_action_control": {"candidate_bce_weight": 0.0, "shuffle": True},
+}
+ELIGIBLE_CONFIGS = {
+    "rank_only_v3", "rank_plus_bce_v3", "rank_plus_initial_pairs"}
+cv_rows, oof_records, epoch_rows = [], [], []
+
+for fold_index, fold in enumerate(folds):
+    fold_train = select_examples(primary, fold["train"])
+    fold_val = select_examples(primary, fold["val"])
+    protected = fold_val + locked_test
+    fold_historical = exclude_candidate_identities(historical, protected)
+    historical_split = known_task_split(fold_historical, seed=42 + fold_index)
+    value_train = select_examples(fold_historical, historical_split["train"])
+    value_val = select_examples(fold_historical, historical_split["val"])
+    clean_aux = exclude_candidate_identities(auxiliary, protected)
+
+    for seed in SEEDS:
+        base_cfg = AdvantageTrainConfig(seed=seed, prefix_length=PREFIX_LENGTH)
+        base = CompactAdvantageVerifier()
+        base, value_meta = pretrain_value(
+            base, value_train, value_val, DEVICE, config=base_cfg)
+
+        for name, knobs in CONFIGS.items():
+            train_candidates = list(fold_train)
+            if knobs.get("include_aux"):
+                train_candidates += clean_aux
+            if knobs.get("shuffle"):
+                train_candidates = shuffle_candidate_actions_within_group(
+                    train_candidates, seed=seed)
+            cfg = replace(
+                base_cfg,
+                candidate_bce_weight=knobs["candidate_bce_weight"],
+                zero_context=knobs.get("zero_context", False),
+            )
+            model = copy.deepcopy(base)
+            mean, std = prefix_action_statistics(
+                train_candidates, PREFIX_LENGTH)
+            model.set_action_statistics(mean, std)
+            run = wandb.init(
+                project="pnp-clean-verifier",
+                name=f"{name}-f{fold_index}-s{seed}",
+                config=asdict(cfg),
+                mode="online" if USE_WANDB else "disabled", reinit=True)
+            model, rank_meta = train_advantage(
+                model, train_candidates, fold_val, DEVICE,
+                config=cfg, wandb_run=run)
+            metrics, records = evaluate_candidate_ranker(
+                model, fold_val, DEVICE, config=cfg, return_records=True)
+            run.log({f"oof/{k}": v for k, v in metrics.items()
+                     if not isinstance(v, dict)})
+            run.finish()
+            cv_rows.append({
+                "config": name, "fold": fold_index, "seed": seed,
+                **{k: v for k, v in metrics.items()
+                   if not isinstance(v, dict)},
+            })
+            epoch_rows.append({
+                "config": name, "fold": fold_index, "seed": seed,
+                **value_meta, **rank_meta,
+            })
+            for record in records:
+                oof_records.append({
+                    "config": name, "fold": fold_index, "seed": seed, **record})
+
+cv_table = pd.DataFrame(cv_rows)
+oof_table = pd.DataFrame(oof_records)
+cv_table.to_csv(OUTPUT / "advantage_cv_folds.csv", index=False)
+oof_table.to_csv(OUTPUT / "advantage_oof_records.csv", index=False)
+display(cv_table.groupby("config").agg(
+    ranking=("group_macro_ranking_accuracy", "mean"),
+    top1=("top1_success", "mean"),
+    default=("default_success", "mean"),
+    random=("random_success", "mean"),
+    discordant=("n_discordant_groups", "sum"),
+))'''),
+    md("## 6. Select using pooled OOF groups (controls are diagnostic only)"),
+    code(r'''oof_summaries = []
+for (name, seed), rows in oof_table.groupby(["config", "seed"]):
+    metrics = summarize_candidate_records(
+        rows.to_dict("records"), seed=int(seed))
+    oof_summaries.append({
+        "config": name, "seed": int(seed),
+        **{k: v for k, v in metrics.items() if not isinstance(v, dict)},
+    })
+oof_summary = pd.DataFrame(oof_summaries)
+selection = (oof_summary[oof_summary.config.isin(ELIGIBLE_CONFIGS)]
+             .groupby("config")
+             .agg(ranking=("group_macro_ranking_accuracy", "mean"),
+                  uplift=("top1_uplift_random", "mean"))
+             .sort_values(["ranking", "uplift"], ascending=False))
+SELECTED_CONFIG = selection.index[0]
+display(oof_summary)
+display(selection)
+print("selected:", SELECTED_CONFIG)'''),
+    md("## 7. Refit on all development groups and open the locked test once"),
+    code(r'''selected_knobs = CONFIGS[SELECTED_CONFIG]
+final_historical = exclude_candidate_identities(historical, locked_test)
+final_hist_split = known_task_split(final_historical, seed=42)
+final_value_train = select_examples(final_historical, final_hist_split["train"])
+final_value_val = select_examples(final_historical, final_hist_split["val"])
+final_candidates = list(development)
+if selected_knobs.get("include_aux"):
+    final_candidates += exclude_candidate_identities(auxiliary, locked_test)
+
+chosen_epochs = pd.DataFrame(epoch_rows)
+chosen_epochs = chosen_epochs[chosen_epochs.config == SELECTED_CONFIG]
+value_epochs = max(1, int(round(chosen_epochs.value_epochs_ran.median())))
+rank_epochs = max(1, int(round(chosen_epochs.rank_epochs_ran.median())))
+final_cfg = AdvantageTrainConfig(
+    seed=42, prefix_length=PREFIX_LENGTH,
+    value_epochs=value_epochs, rank_epochs=rank_epochs,
+    patience=max(value_epochs, rank_epochs) + 1,
+    candidate_bce_weight=selected_knobs["candidate_bce_weight"],
+)
+final_model = CompactAdvantageVerifier()
+final_model, final_value_meta = pretrain_value(
+    final_model, final_value_train, final_value_val, DEVICE, config=final_cfg)
+mean, std = prefix_action_statistics(final_candidates, PREFIX_LENGTH)
+final_model.set_action_statistics(mean, std)
+final_model, final_rank_meta = train_advantage(
+    # Epoch counts are fixed from CV; an empty validation set prevents selecting
+    # an epoch on the same groups used for fitting.
+    final_model, final_candidates, [], DEVICE, config=final_cfg)
+locked_metrics, locked_records = evaluate_candidate_ranker(
+    final_model, locked_test, DEVICE, config=final_cfg, return_records=True)
+(OUTPUT / "advantage_locked_test.json").write_text(
+    json.dumps(locked_metrics, indent=2, sort_keys=True))
+pd.DataFrame(locked_records).to_csv(
+    OUTPUT / "advantage_locked_test_records.csv", index=False)
+print(json.dumps(locked_metrics, indent=2))'''),
+    md("## 8. Eligibility gate and checkpoint registration"),
+    code(r'''selected_oof_records = oof_table[
+    oof_table.config == SELECTED_CONFIG].copy()
+# Average repeated seed predictions at the independent group level.
+pooled = (selected_oof_records.groupby(
+    ["group_id", "benchmark", "uncertainty_stratum"], as_index=False)
+    .agg(pair_accuracy=("pair_accuracy", "mean"),
+         margin=("margin", "mean"), comparisons=("comparisons", "max"),
+         top1=("top1", "mean"), default=("default", "mean"),
+         random=("random", "mean"), oracle=("oracle", "mean")))
+pooled_oof = summarize_candidate_records(pooled.to_dict("records"), seed=42)
+eligible = (
+    pooled_oof["ranking_accuracy_ci95"][0] > .5
+    and locked_metrics["group_macro_ranking_accuracy"] > .5
+    and locked_metrics["top1_success"] >= locked_metrics["default_success"]
+    and locked_metrics["top1_success"] > locked_metrics["random_success"]
+)
+print({"eligible": eligible, "pooled_oof": pooled_oof})
+
+if eligible and REGISTER_IF_ELIGIBLE:
+    verifier_id = new_verifier_id()
+    checkpoint_config = {
+        "model_class": "CompactAdvantageVerifier",
+        "score_type": "raw_advantage",
+        "obs_dim": 2048, "action_dim": 7, "horizon": 50,
+        "prefix_length": PREFIX_LENGTH,
+        "selected_config": SELECTED_CONFIG,
+        "train": asdict(final_cfg),
+    }
+    store.start_run(
+        "verifier_train", "libero+libero_pro", "action-advantage-verifier-v1")
+    store.register_verifier(
+        verifier_id,
+        verifier_checkpoint_bytes(final_model, None, checkpoint_config),
+        checkpoint_config, locked_metrics, split_manifest,
+        dataset_hash=dataset_hash(primary))
+    store.finish_run(n_rollouts=0)
+    print("registered", verifier_id)
+elif eligible:
+    print("Eligible; set REGISTER_IF_ELIGIBLE=True to register.")
+else:
+    print("Not registered: the predeclared ranking/uplift gate was not met.")'''),
 ]
 
 
