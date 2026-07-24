@@ -54,7 +54,7 @@ EXPERIMENT_CELLS = [
 This notebook supersedes the historical classification sweep. It pretrains
 `V(s)` on ordinary LIBERO/LIBERO-PRO rollouts, freezes that pathway, and learns
 `A(s,a)` from deterministic same-state candidate groups. Model selection uses
-grouped out-of-fold ranking; the locked 20% test set is opened once at the end."""),
+episode-grouped out-of-fold ranking; the prospective v4 test is opened once."""),
     md("## 1. Environment setup"), code(BOOTSTRAP),
     md("## 2. Configuration"),
     code(r'''from dataclasses import asdict, replace
@@ -73,7 +73,9 @@ HISTORICAL_EXPERIMENTS = (
     "libero-hybrid-schedules-k3-v1",
     "libero-pro-canonical-core-k3-v1",
 )
-PRIMARY_CANDIDATES = "verifier-clean-pairs-v3"
+V3_CANDIDATES = "verifier-clean-pairs-v3"
+V4_DEVELOPMENT = "verifier-clean-pairs-v4-dev"
+V4_TEST = "verifier-clean-pairs-v4-test"
 AUXILIARY_CANDIDATES = ("verifier-clean-pairs-v1", "verifier-clean-pairs-v2")
 SEEDS = (42, 43, 44)
 N_FOLDS = 4
@@ -97,10 +99,51 @@ else:
     with CACHE.open("wb") as handle:
         pickle.dump(historical, handle)
 
-primary = load_candidate_examples(store, PRIMARY_CANDIDATES)
-auxiliary = load_candidate_examples(store, AUXILIARY_CANDIDATES)
-print("primary integrity", validate_candidate_groups(primary, expected_candidates=4))
+candidate_cache = OUTPUT / "candidate_group_cache_v2"
+v3 = load_candidate_examples(
+    store, V3_CANDIDATES, cache_dir=candidate_cache / "v3")
+v4_development = load_candidate_examples(
+    store, V4_DEVELOPMENT, cache_dir=candidate_cache / "v4_development")
+auxiliary = load_candidate_examples(
+    store, AUXILIARY_CANDIDATES, cache_dir=candidate_cache / "auxiliary")
+
+def collection_groups(experiment):
+    rows=[]; start=0
+    while True:
+        batch = (store.client.table("verifier_candidate_groups")
+                 .select("candidate_group_id,benchmark,suite,task_idx,episode_idx,metadata_json")
+                 .eq("experiment", experiment)
+                 .range(start, start+999).execute().data or [])
+        rows += batch
+        if len(batch) < 1000: break
+        start += 1000
+    return rows
+
+v4_development_groups = collection_groups(V4_DEVELOPMENT)
+prospective_test_groups = collection_groups(V4_TEST)
+v4_development_hashes = {
+    (row.get("metadata_json") or {}).get("collection_manifest_hash")
+    for row in v4_development_groups}
+v4_test_hashes = {
+    (row.get("metadata_json") or {}).get("collection_manifest_hash")
+    for row in prospective_test_groups}
+assert len(v4_development_hashes) == 1 and None not in v4_development_hashes
+assert len(v4_test_hashes) == 1 and None not in v4_test_hashes
+prospective_test_identities = {
+    (row["benchmark"], row["suite"], int(row["task_idx"]), int(row["episode_idx"]))
+    for row in prospective_test_groups}
+assert len(prospective_test_groups) >= 120, len(prospective_test_groups)
+print("v3 integrity", validate_candidate_groups(v3, expected_candidates=4))
+v4_development_integrity = validate_candidate_groups(
+    v4_development, expected_candidates=8)
+assert v4_development_integrity["groups"] >= 360, v4_development_integrity
+print("v4 development integrity", v4_development_integrity)
+print("prospective test sealed", {
+    "groups": len(prospective_test_groups),
+    "manifest_hash": next(iter(v4_test_hashes)),
+})
 print("auxiliary integrity", validate_candidate_groups(auxiliary))
+development = v3 + v4_development
 
 def candidate_audit(examples):
     frame = pd.DataFrame([{
@@ -121,56 +164,65 @@ print("historical", {
     "rollouts": len({e.rollout_id for e in historical}),
     "hash": dataset_hash(historical),
 })
-print("primary", candidate_audit(primary))
+print("development", candidate_audit(development))
 print("auxiliary", candidate_audit(auxiliary))
 legacy = OUTPUT / "experiment_results.csv"
 if legacy.exists() and not (OUTPUT / "legacy_experiment_results.csv").exists():
     (OUTPUT / "legacy_experiment_results.csv").write_bytes(legacy.read_bytes())'''),
-    md("## 4. Lock the test set and write immutable manifests"),
-    code(r'''locked = locked_candidate_split(primary, test_fraction=.20, seed=42)
-development = select_examples(primary, locked["development"])
-locked_test = select_examples(primary, locked["test"])
-folds = candidate_cv_splits(primary, locked["development"], n_folds=N_FOLDS, seed=42)
+    md("## 4. Verify prospective cohorts and write immutable split manifests"),
+    code(r'''development_ids = [example.rollout_id for example in development]
+folds = candidate_cv_splits(
+    development, development_ids, n_folds=N_FOLDS, seed=42)
 
 split_manifest = {
-    "primary_experiment": PRIMARY_CANDIDATES,
-    "primary_dataset_hash": dataset_hash(primary),
+    "development_experiments": [V3_CANDIDATES, V4_DEVELOPMENT],
+    "prospective_test_experiment": V4_TEST,
+    "v4_collection_manifest_hashes": {
+        "development": next(iter(v4_development_hashes)),
+        "test": next(iter(v4_test_hashes)),
+    },
+    "development_dataset_hash": dataset_hash(development),
     "historical_dataset_hash": dataset_hash(historical),
-    "development_candidate_ids": sorted(locked["development"]),
-    "locked_test_candidate_ids": sorted(locked["test"]),
+    "development_candidate_ids": sorted(development_ids),
+    "prospective_test_group_ids": sorted(
+        row["candidate_group_id"] for row in prospective_test_groups),
+    "prospective_test_episode_identities": sorted(
+        list(identity) for identity in prospective_test_identities),
     "folds": folds,
 }
 (OUTPUT / "advantage_splits.json").write_text(
     json.dumps(split_manifest, indent=2, sort_keys=True))
 print({
     "development": candidate_audit(development),
-    "locked_test": candidate_audit(locked_test),
+    "prospective_test_groups_sealed": len(prospective_test_groups),
     "manifest": str(OUTPUT / "advantage_splits.json"),
 })'''),
     md("## 5. Grouped 4-fold CV × 3 seeds"),
     code(r'''CONFIGS = {
-    "rank_only_v3": {"candidate_bce_weight": 0.0},
-    "rank_plus_bce_v3": {"candidate_bce_weight": 0.1},
+    "rank_only": {"candidate_bce_weight": 0.0},
+    "rank_plus_bce": {"candidate_bce_weight": 0.1},
     "rank_plus_initial_pairs": {"candidate_bce_weight": 0.0, "include_aux": True},
     "action_only_control": {"candidate_bce_weight": 0.0, "zero_context": True},
     "shuffled_action_control": {"candidate_bce_weight": 0.0, "shuffle": True},
 }
 ELIGIBLE_CONFIGS = {
-    "rank_only_v3", "rank_plus_bce_v3", "rank_plus_initial_pairs"}
+    "rank_only", "rank_plus_bce", "rank_plus_initial_pairs"}
 cv_rows, oof_records, epoch_rows = [], [], []
 
 for fold_index, fold in enumerate(folds):
-    fold_train = select_examples(primary, fold["train"])
-    fold_val = select_examples(primary, fold["val"])
-    protected = fold_val + locked_test
-    fold_historical = exclude_candidate_identities(historical, protected)
+    fold_train = select_examples(development, fold["train"])
+    fold_val = select_examples(development, fold["val"])
+    protected_identities = (
+        candidate_episode_identities(fold_val) | prospective_test_identities)
+    fold_historical = exclude_episode_identities(
+        historical, protected_identities)
     historical_split = known_task_split(fold_historical, seed=42 + fold_index)
     value_val = select_examples(fold_historical, historical_split["val"])
     value_val_ids = set(historical_split["val"])
     value_train = [
         example for example in fold_historical
         if example.rollout_id not in value_val_ids]
-    clean_aux = exclude_candidate_identities(auxiliary, protected)
+    clean_aux = exclude_episode_identities(auxiliary, protected_identities)
 
     for seed in SEEDS:
         base_cfg = AdvantageTrainConfig(seed=seed, prefix_length=PREFIX_LENGTH)
@@ -252,7 +304,8 @@ display(selection)
 print("selected:", SELECTED_CONFIG)'''),
     md("## 7. Refit on all development groups and open the locked test once"),
     code(r'''selected_knobs = CONFIGS[SELECTED_CONFIG]
-final_historical = exclude_candidate_identities(historical, locked_test)
+final_historical = exclude_episode_identities(
+    historical, prospective_test_identities)
 final_hist_split = known_task_split(final_historical, seed=42)
 final_value_val = select_examples(final_historical, final_hist_split["val"])
 final_value_val_ids = set(final_hist_split["val"])
@@ -261,7 +314,8 @@ final_value_train = [
     if example.rollout_id not in final_value_val_ids]
 final_candidates = list(development)
 if selected_knobs.get("include_aux"):
-    final_candidates += exclude_candidate_identities(auxiliary, locked_test)
+    final_candidates += exclude_episode_identities(
+        auxiliary, prospective_test_identities)
 
 chosen_epochs = pd.DataFrame(epoch_rows)
 chosen_epochs = chosen_epochs[chosen_epochs.config == SELECTED_CONFIG]
@@ -282,6 +336,18 @@ final_model, final_rank_meta = train_advantage(
     # Epoch counts are fixed from CV; an empty validation set prevents selecting
     # an epoch on the same groups used for fitting.
     final_model, final_candidates, [], DEVICE, config=final_cfg)
+
+# This is the first cell that downloads or examines prospective-test outcomes.
+locked_test = load_candidate_examples(
+    store, V4_TEST, cache_dir=candidate_cache / "v4_test")
+locked_integrity = validate_candidate_groups(locked_test, expected_candidates=8)
+assert locked_integrity["groups"] >= 120, locked_integrity
+assert candidate_episode_identities(locked_test) == prospective_test_identities
+split_manifest["prospective_test_dataset_hash"] = dataset_hash(locked_test)
+split_manifest["locked_test_candidate_ids"] = sorted(
+    example.rollout_id for example in locked_test)
+(OUTPUT / "advantage_splits.json").write_text(
+    json.dumps(split_manifest, indent=2, sort_keys=True))
 locked_metrics, locked_records = evaluate_candidate_ranker(
     final_model, locked_test, DEVICE, config=final_cfg, return_records=True)
 (OUTPUT / "advantage_locked_test.json").write_text(
@@ -324,7 +390,7 @@ if eligible and REGISTER_IF_ELIGIBLE:
         verifier_id,
         verifier_checkpoint_bytes(final_model, None, checkpoint_config),
         checkpoint_config, locked_metrics, split_manifest,
-        dataset_hash=dataset_hash(primary))
+        dataset_hash=dataset_hash(development + locked_test))
     store.finish_run(n_rollouts=0)
     print("registered", verifier_id)
 elif eligible:
@@ -479,10 +545,287 @@ print({"groups": len(groups), "outcomes": len(candidates),
 ]
 
 
+TARGETED_COLLECTION_CELLS = [
+    md("""# 05 — Targeted v4 verifier collection
+
+Collect fixed best-of-8 groups at high-uncertainty states. The development
+cohort oversamples failed source rollouts; the separately named prospective
+test cohort is assigned before candidate outcomes and is never rebalanced."""),
+    md("## 1. Environment setup"),
+    code(BOOTSTRAP.replace('"[analysis]"', '"[sim,analysis]"')),
+    md("## 2. Load policy, store, and episode manifests"),
+    code(r'''import json
+from tqdm.auto import tqdm
+from pnp import libero_env, libero_pro, models
+from pnp.experiments import _prepare_libero_pro_episodes
+from pnp.store import SupabaseStore
+from pnp.verifier import *
+
+benchmark_dict = libero_env.init_libero_benchmark()
+libero_pro.patch_torch_load()
+policy, preprocess, postprocess = models.load_pi05()
+device = models.default_device()
+store = SupabaseStore()
+
+suites = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+tasks = [(suite, task) for suite in suites
+         for task in range(benchmark_dict[suite]().n_tasks)]
+standard = libero_env.build_final_episodes(benchmark_dict, tasks=tasks)
+for ep in standard: ep["benchmark"] = "libero"
+pro = _prepare_libero_pro_episodes()
+for ep in pro: ep["benchmark"] = "libero_pro"
+episode_lookup = {
+    (e["benchmark"], e["suite"], e["task_idx"],
+     e.get("ep_idx", e.get("episode_idx"))): e
+    for e in standard + pro
+}
+print(len(standard), len(pro), len(episode_lookup))'''),
+    md("## 3. Build and persist outcome-blind v4 manifests"),
+    code(r'''DEVELOPMENT_EXPERIMENT = "verifier-clean-pairs-v4-dev"
+TEST_EXPERIMENT = "verifier-clean-pairs-v4-test"
+DEVELOPMENT_TARGETS = {"libero": 180, "libero_pro": 270}
+TEST_TARGETS = {"libero": 60, "libero_pro": 90}
+CANDIDATE_COUNT = 8
+PREFIX_LENGTH = 10
+SHARD_COUNT = 1   # Use the generated workers for three-way collection.
+SHARD_INDEX = 0
+assert 0 <= SHARD_INDEX < SHARD_COUNT
+
+def pages(table, columns, configure):
+    rows=[]; start=0
+    while True:
+        q = configure(store.client.table(table).select(columns)).range(start, start+999)
+        batch = q.execute().data or []; rows += batch
+        if len(batch) < 1000: return rows
+        start += 1000
+
+source_experiments = (
+    "libero-hybrid-schedules-k3-v1",
+    "libero-pro-canonical-core-k3-v1",
+)
+rollouts = []
+for experiment in source_experiments:
+    rollouts += pages(
+        "rollouts",
+        "rollout_id,benchmark,suite,task_idx,episode_idx,success",
+        lambda q, experiment=experiment: q.eq(
+            "experiment", experiment).eq(
+            "method", "pnp_uncertainty_only").eq("status", "completed"))
+
+rollout_ids = sorted({row["rollout_id"] for row in rollouts})
+euler = []
+for start in range(0, len(rollout_ids), 100):
+    batch_ids = rollout_ids[start:start+100]
+    euler += pages(
+        "pnp_euler_steps", "rollout_id,chunk_idx,u_mean",
+        lambda q, ids=batch_ids: q.in_("rollout_id", ids))
+
+v3_groups = pages(
+    "verifier_candidate_groups",
+    "benchmark,suite,task_idx,episode_idx",
+    lambda q: q.eq("experiment", "verifier-clean-pairs-v3"))
+excluded = {
+    (row["benchmark"], row["suite"], int(row["task_idx"]), int(row["episode_idx"]))
+    for row in v3_groups
+}
+manifests = build_targeted_manifests(
+    rollouts, euler, excluded,
+    development_targets=DEVELOPMENT_TARGETS,
+    test_targets=TEST_TARGETS,
+    development_failure_fraction=.70,
+    seed=42,
+)
+manifest_hashes = {
+    cohort: collection_manifest_hash(rows) for cohort, rows in manifests.items()}
+manifest_document = {
+    "version": 1,
+    "candidate_count": CANDIDATE_COUNT,
+    "prefix_length": PREFIX_LENGTH,
+    "development_experiment": DEVELOPMENT_EXPERIMENT,
+    "test_experiment": TEST_EXPERIMENT,
+    "development_targets": DEVELOPMENT_TARGETS,
+    "test_targets": TEST_TARGETS,
+    "excluded_v3_episode_count": len(excluded),
+    "hashes": manifest_hashes,
+    "manifests": manifests,
+}
+manifest_bytes = json.dumps(
+    manifest_document, sort_keys=True, separators=(",", ":")).encode()
+manifest_path = (
+    f"verifier_manifests/v4-targeted-"
+    f"{manifest_hashes['development']}-{manifest_hashes['test']}.json")
+store._upload(manifest_path, manifest_bytes)
+
+full_manifest = [
+    {**row, "cohort": cohort,
+     "experiment": (DEVELOPMENT_EXPERIMENT if cohort == "development"
+                    else TEST_EXPERIMENT)}
+    for cohort in ("test", "development")
+    for row in manifests[cohort]
+]
+manifest = full_manifest[SHARD_INDEX::SHARD_COUNT]
+print({
+    "hashes": manifest_hashes,
+    "manifest_path": manifest_path,
+    "development": len(manifests["development"]),
+    "test": len(manifests["test"]),
+    "worker_groups": len(manifest),
+    "development_source_failures": sum(
+        not row["success"] for row in manifests["development"]),
+    "test_source_failures": sum(not row["success"] for row in manifests["test"]),
+})'''),
+    md("## 4. Dry-run identity, disjointness, and schema checks"),
+    code(r'''development_identities = {
+    (r["benchmark"], r["suite"], r["task_idx"], r["episode_idx"])
+    for r in manifests["development"]}
+test_identities = {
+    (r["benchmark"], r["suite"], r["task_idx"], r["episode_idx"])
+    for r in manifests["test"]}
+assert development_identities.isdisjoint(test_identities)
+assert (development_identities | test_identities).isdisjoint(excluded)
+missing = [
+    row for row in full_manifest
+    if (row["benchmark"], row["suite"], row["task_idx"], row["episode_idx"])
+       not in episode_lookup]
+assert not missing, missing[:3]
+store.client.table("verifier_candidate_groups").select(
+    "candidate_group_id").limit(1).execute()
+print("v4 manifests, identities, and verifier tables are ready")'''),
+    md("## 5. Collect fixed-eight deterministic-replay groups"),
+    code(r'''experiment_names = (DEVELOPMENT_EXPERIMENT, TEST_EXPERIMENT)
+existing_group_rows = pages(
+    "verifier_candidate_groups", "candidate_group_id,experiment",
+    lambda q: q.in_("experiment", experiment_names))
+existing_group_ids = {row["candidate_group_id"] for row in existing_group_rows}
+candidate_rows = []
+existing_id_list = sorted(existing_group_ids)
+for start in range(0, len(existing_id_list), 100):
+    ids = existing_id_list[start:start+100]
+    candidate_rows += pages(
+        "verifier_candidates", "candidate_group_id",
+        lambda q, ids=ids: q.in_("candidate_group_id", ids))
+candidate_counts = {}
+for row in candidate_rows:
+    gid = row["candidate_group_id"]
+    candidate_counts[gid] = candidate_counts.get(gid, 0) + 1
+existing = {
+    gid for gid in existing_group_ids
+    if candidate_counts.get(gid, 0) == CANDIDATE_COUNT}
+print({
+    "complete_existing_groups": len(existing),
+    "partial_groups_to_repair": len(existing_group_ids - existing),
+})
+
+store.start_run(
+    "verifier_pair_collection", "libero+libero_pro", "verifier-clean-pairs-v4",
+    config={
+        "groups": len(full_manifest),
+        "outcomes": len(full_manifest) * CANDIDATE_COUNT,
+        "candidate_count": CANDIDATE_COUNT,
+        "prefix_length": PREFIX_LENGTH,
+        "manifest_hashes": manifest_hashes,
+        "manifest_path": manifest_path,
+        "shard_count": SHARD_COUNT,
+        "shard_index": SHARD_INDEX,
+    })
+completed_outcomes = skipped = 0
+for item in tqdm(manifest, desc="v4 candidate groups"):
+    expected_id = candidate_group_id(
+        item["benchmark"], item["suite"], item["task_idx"],
+        item["episode_idx"], item["chunk_idx"], namespace=item["experiment"])
+    if expected_id in existing:
+        continue
+    ep = episode_lookup[(
+        item["benchmark"], item["suite"], item["task_idx"], item["episode_idx"])]
+    env = libero_env.make_env(ep["bddl_path"])
+    try:
+        try:
+            collected = collect_replay_candidate_group(
+                env, ep, policy, preprocess, postprocess, device,
+                chunk_idx=item["chunk_idx"], uncertainty_stratum="high",
+                prefix_length=PREFIX_LENGTH, candidate_count=CANDIDATE_COUNT,
+                experiment=item["experiment"])
+        except Exception as error:
+            print("v4 group skipped:", type(error).__name__, error)
+            collected = None
+        if collected is None:
+            skipped += 1
+            continue
+        group, candidates = collected
+        group["metadata_json"].update({
+            "cohort": item["cohort"],
+            "collection_manifest_hash": manifest_hashes[item["cohort"]],
+            "collection_manifest_path": manifest_path,
+            "source_rollout_id": item["rollout_id"],
+            "source_success": bool(item["success"]),
+            "source_u_mean": float(item["u_mean"]),
+        })
+        store.register_candidate_group(group, candidates)
+        existing.add(group["candidate_group_id"])
+        completed_outcomes += len(candidates)
+    finally:
+        env.close()
+store.finish_run(n_rollouts=completed_outcomes)
+print({
+    "new_outcomes": completed_outcomes,
+    "skipped_unreachable": skipped,
+    "complete_groups_seen": len(existing),
+})'''),
+    md("## 6. Cohort integrity and balance report"),
+    code(r'''for cohort, experiment in (
+    ("development", DEVELOPMENT_EXPERIMENT),
+    ("test", TEST_EXPERIMENT),
+):
+    groups = pages(
+        "verifier_candidate_groups", "*",
+        lambda q, experiment=experiment: q.eq("experiment", experiment))
+    group_ids = {group["candidate_group_id"] for group in groups}
+    candidates = []
+    group_id_list = sorted(group_ids)
+    for start in range(0, len(group_id_list), 100):
+        ids = group_id_list[start:start+100]
+        candidates += pages(
+            "verifier_candidates",
+            "candidate_id,candidate_group_id,candidate_kind,success",
+            lambda q, ids=ids: q.in_("candidate_group_id", ids))
+    by_group = {}
+    for candidate in candidates:
+        by_group.setdefault(candidate["candidate_group_id"], []).append(candidate)
+    complete = {
+        gid for gid in group_ids
+        if len(by_group.get(gid, [])) == CANDIDATE_COUNT}
+    expected_hash = manifest_hashes[cohort]
+    hash_matches = sum(
+        (group.get("metadata_json") or {}).get("collection_manifest_hash")
+        == expected_hash for group in groups)
+    print(cohort, {
+        "manifest_target": len(manifests[cohort]),
+        "groups": len(groups),
+        "complete_groups": len(complete),
+        "partial_groups": len(group_ids - complete),
+        "manifest_hash_matches": hash_matches,
+        "successes": sum(candidate["success"] for candidate in candidates),
+        "failures": sum(not candidate["success"] for candidate in candidates),
+        "discordant_groups": sum(
+            len({candidate["success"] for candidate in by_group.get(gid, [])}) == 2
+            for gid in complete),
+        "pairwise_comparisons": sum(
+            sum(candidate["success"] for candidate in by_group.get(gid, []))
+            * sum(not candidate["success"] for candidate in by_group.get(gid, []))
+            for gid in complete),
+        "source_failures": sum(
+            not bool((group.get("metadata_json") or {}).get("source_success"))
+            for group in groups),
+    })'''),
+]
+
+
 def main():
     outputs = {
         ROOT / "notebooks" / "03_verifier_experiments.ipynb": notebook(EXPERIMENT_CELLS),
         ROOT / "notebooks" / "04_collect_verifier_pairs.ipynb": notebook(COLLECTION_CELLS),
+        ROOT / "notebooks" / "05_collect_targeted_verifier_groups.ipynb": notebook(
+            TARGETED_COLLECTION_CELLS),
     }
     for path, value in outputs.items():
         path.write_text(json.dumps(value, indent=1) + "\n")
@@ -493,6 +836,13 @@ def main():
         ROOT / "notebooks" / "04_collect_verifier_pairs.ipynb",
         ROOT / "notebooks" / "workers",
         shard_count=3,
+        worker_prefix="04_verifier_pairs_worker",
+    )
+    generate_workers(
+        ROOT / "notebooks" / "05_collect_targeted_verifier_groups.ipynb",
+        ROOT / "notebooks" / "workers",
+        shard_count=3,
+        worker_prefix="05_targeted_verifier_worker",
     )
 
 

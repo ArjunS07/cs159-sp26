@@ -13,7 +13,8 @@ DEFAULT_SOURCE = ROOT / "notebooks" / "04_collect_verifier_pairs.ipynb"
 DEFAULT_OUTPUT = ROOT / "notebooks" / "workers"
 
 
-def _patch_worker(master: dict, shard_count: int, shard_index: int) -> dict:
+def _patch_worker(master: dict, shard_count: int, shard_index: int, *,
+                  source_name: str, worker_prefix: str) -> dict:
     worker = copy.deepcopy(master)
     patched = 0
     for cell in worker.get("cells", []):
@@ -42,7 +43,7 @@ def _patch_worker(master: dict, shard_count: int, shard_index: int) -> dict:
     if patched != 1:
         raise RuntimeError(f"expected one shard configuration cell, patched {patched}")
 
-    filename = f"04_verifier_pairs_worker_{shard_index}.ipynb"
+    filename = f"{worker_prefix}_{shard_index}.ipynb"
     worker.setdefault("metadata", {}).setdefault("colab", {})["name"] = filename
     for cell in worker.get("cells", []):
         if cell.get("cell_type") == "code":
@@ -54,7 +55,7 @@ def _patch_worker(master: dict, shard_count: int, shard_index: int) -> dict:
         "source": [
             f"# Generated collection worker {shard_index}/{shard_count}\n",
             "\n",
-            "Generated from `04_collect_verifier_pairs.ipynb`; edit the canonical notebook, "
+            f"Generated from `{source_name}`; edit the canonical notebook, "
             "not this copy.\n",
         ],
     })
@@ -62,16 +63,22 @@ def _patch_worker(master: dict, shard_count: int, shard_index: int) -> dict:
 
 
 def generate_workers(source: Path = DEFAULT_SOURCE, output: Path = DEFAULT_OUTPUT,
-                     shard_count: int = 3) -> list[Path]:
+                     shard_count: int = 3, worker_prefix: str | None = None) -> list[Path]:
     if shard_count < 1:
         raise ValueError("shard_count must be positive")
     master = json.loads(source.read_text())
     output.mkdir(parents=True, exist_ok=True)
+    worker_prefix = worker_prefix or (
+        "04_verifier_pairs_worker"
+        if source.name == DEFAULT_SOURCE.name else f"{source.stem}_worker")
     paths = []
     for shard_index in range(shard_count):
-        path = output / f"04_verifier_pairs_worker_{shard_index}.ipynb"
+        path = output / f"{worker_prefix}_{shard_index}.ipynb"
         path.write_text(json.dumps(
-            _patch_worker(master, shard_count, shard_index), indent=1) + "\n")
+            _patch_worker(
+                master, shard_count, shard_index,
+                source_name=source.name, worker_prefix=worker_prefix),
+            indent=1) + "\n")
         paths.append(path)
         print(path.relative_to(ROOT))
     return paths
