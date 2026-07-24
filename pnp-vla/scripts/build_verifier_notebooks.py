@@ -92,7 +92,8 @@ if CACHE.exists():
         historical = pickle.load(handle)
 else:
     historical = load_clean_chunk_examples(
-        store, HISTORICAL_EXPERIMENTS, progress=tqdm)
+        store, HISTORICAL_EXPERIMENTS, progress=tqdm,
+        cache_dir=OUTPUT / "historical_rollout_cache_v2")
     with CACHE.open("wb") as handle:
         pickle.dump(historical, handle)
 

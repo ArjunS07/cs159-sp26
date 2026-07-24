@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from dataclasses import replace
 import hashlib
 import io
+import json
+from pathlib import Path
+import pickle
 import time
 from typing import Iterable, Sequence
 
@@ -55,7 +58,7 @@ def _download_with_retry(store, path: str, attempts: int = 5):
     for attempt in range(attempts):
         try:
             return store._download(path)
-        except (httpx.TransportError, httpx.TimeoutException):
+        except (httpx.TransportError, httpx.TimeoutException, json.JSONDecodeError):
             if attempt + 1 == attempts:
                 raise
             time.sleep(2 ** attempt)
@@ -108,20 +111,37 @@ def build_clean_chunk_examples(row: dict, pcp_frame, trajectory: dict, *,
 
 
 def load_clean_chunk_examples(store, experiments: Sequence[str], *, horizon: int = 50,
-                              action_dim: int = 7, progress=None) -> list[CleanChunkExample]:
+                              action_dim: int = 7, progress=None,
+                              cache_dir: str | Path | None = None
+                              ) -> list[CleanChunkExample]:
     """Download and reconstruct clean examples for one or more rollout experiments."""
     import pandas as pd
 
     rows = _paged_rollouts(store, tuple(experiments))
     iterator = progress(rows) if progress else rows
+    cache_dir = Path(cache_dir) if cache_dir is not None else None
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
     examples: list[CleanChunkExample] = []
     for row in iterator:
+        cache_path = (
+            cache_dir / f"{row['rollout_id']}.pkl" if cache_dir is not None else None)
+        if cache_path is not None and cache_path.exists():
+            with cache_path.open("rb") as handle:
+                examples.extend(pickle.load(handle))
+            continue
         pcp = pd.read_parquet(io.BytesIO(
             _download_with_retry(store, row["pcp_chunks_path"])))
         with np.load(io.BytesIO(
                 _download_with_retry(store, row["trajectory_path"]))) as trajectory:
-            examples.extend(build_clean_chunk_examples(
-                row, pcp, trajectory, horizon=horizon, action_dim=action_dim))
+            rollout_examples = build_clean_chunk_examples(
+                row, pcp, trajectory, horizon=horizon, action_dim=action_dim)
+        if cache_path is not None:
+            temporary = cache_path.with_suffix(".tmp")
+            with temporary.open("wb") as handle:
+                pickle.dump(rollout_examples, handle)
+            temporary.replace(cache_path)
+        examples.extend(rollout_examples)
     return examples
 
 
