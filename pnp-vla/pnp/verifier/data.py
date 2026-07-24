@@ -145,7 +145,8 @@ def load_clean_chunk_examples(store, experiments: Sequence[str], *, horizon: int
     return examples
 
 
-def load_candidate_examples(store, experiment="verifier-clean-pairs-v1"):
+def load_candidate_examples(store, experiment="verifier-clean-pairs-v1", *,
+                            cache_dir: str | Path | None = None):
     """Load exact/fallback candidate artifacts into the common verifier example type."""
     experiments = [experiment] if isinstance(experiment, str) else list(experiment)
     def pages(table, configure):
@@ -185,41 +186,59 @@ def load_candidate_examples(store, experiment="verifier-clean-pairs-v1"):
             candidate_counts[g["candidate_group_id"]],
             experiments.index(g["experiment"]), g["candidate_group_id"])))
     groups = retained
-    group_by_id = {row["candidate_group_id"]: row for row in groups}
-    observation_cache = {}
+    candidates_by_group = defaultdict(list)
+    for candidate in candidates:
+        candidates_by_group[candidate["candidate_group_id"]].append(candidate)
+    cache_dir = Path(cache_dir) if cache_dir is not None else None
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
     examples = []
-    for row in candidates:
-        group = group_by_id.get(row["candidate_group_id"])
-        if group is None:
+    for group in groups:
+        group_id = group["candidate_group_id"]
+        rows = candidates_by_group[group_id]
+        candidate_hash = hashlib.sha256("|".join(sorted(
+            row["candidate_id"] for row in rows)).encode()).hexdigest()[:8]
+        cache_path = (
+            cache_dir / f"{group_id}-{candidate_hash}.pkl"
+            if cache_dir is not None else None)
+        if cache_path is not None and cache_path.exists():
+            with cache_path.open("rb") as handle:
+                examples.extend(pickle.load(handle))
+            continue
+        if not rows:
             continue
         with np.load(io.BytesIO(
-                _download_with_retry(store, row["env_chunk_path"]))) as artifact:
-            actions = np.asarray(artifact["actions"], dtype=np.float32)[:, :7]
-            mask = (np.asarray(artifact["mask"], dtype=np.bool_) if "mask" in artifact
-                    else np.ones(len(actions), dtype=np.bool_))
-        group_id = row["candidate_group_id"]
-        if group_id not in observation_cache:
+                _download_with_retry(store, rows[0]["observation_path"]))) as artifact:
+            obs_enc = np.asarray(artifact["obs_enc"], dtype=np.float32).reshape(-1)
+        group_examples = []
+        for row in rows:
             with np.load(io.BytesIO(
-                    _download_with_retry(store, row["observation_path"]))) as artifact:
-                observation_cache[group_id] = np.asarray(
-                    artifact["obs_enc"], dtype=np.float32).reshape(-1)
-        obs_enc = observation_cache[group_id]
-        padded = np.zeros((50, 7), dtype=np.float32)
-        padded_mask = np.zeros(50, dtype=np.bool_)
-        n = min(50, len(actions))
-        padded[:n], padded_mask[:n] = actions[:n], mask[:n]
-        examples.append(CleanChunkExample(
-            rollout_id=row["candidate_id"], experiment=group["experiment"],
-            benchmark=group["benchmark"], suite=group["suite"],
-            task_idx=int(group["task_idx"]), episode_idx=int(group["episode_idx"]),
-            chunk_idx=int(group["chunk_idx"]),
-            chunk_position=float((group.get("metadata_json") or {}).get(
-                "chunk_position", group["chunk_idx"])),
-            obs_enc=obs_enc, actions=padded, action_mask=padded_mask,
-            success=int(bool(row["success"])), candidate_group_id=row["candidate_group_id"],
-            candidate_kind=row["candidate_kind"], pairing_mode=group["pairing_mode"],
-            uncertainty_stratum=group.get("uncertainty_stratum"),
-        ))
+                    _download_with_retry(store, row["env_chunk_path"]))) as artifact:
+                actions = np.asarray(artifact["actions"], dtype=np.float32)[:, :7]
+                mask = (np.asarray(artifact["mask"], dtype=np.bool_) if "mask" in artifact
+                        else np.ones(len(actions), dtype=np.bool_))
+            padded = np.zeros((50, 7), dtype=np.float32)
+            padded_mask = np.zeros(50, dtype=np.bool_)
+            n = min(50, len(actions))
+            padded[:n], padded_mask[:n] = actions[:n], mask[:n]
+            group_examples.append(CleanChunkExample(
+                rollout_id=row["candidate_id"], experiment=group["experiment"],
+                benchmark=group["benchmark"], suite=group["suite"],
+                task_idx=int(group["task_idx"]), episode_idx=int(group["episode_idx"]),
+                chunk_idx=int(group["chunk_idx"]),
+                chunk_position=float((group.get("metadata_json") or {}).get(
+                    "chunk_position", group["chunk_idx"])),
+                obs_enc=obs_enc, actions=padded, action_mask=padded_mask,
+                success=int(bool(row["success"])), candidate_group_id=group_id,
+                candidate_kind=row["candidate_kind"], pairing_mode=group["pairing_mode"],
+                uncertainty_stratum=group.get("uncertainty_stratum"),
+            ))
+        if cache_path is not None:
+            temporary = cache_path.with_suffix(".tmp")
+            with temporary.open("wb") as handle:
+                pickle.dump(group_examples, handle)
+            temporary.replace(cache_path)
+        examples.extend(group_examples)
     return examples
 
 
@@ -381,29 +400,46 @@ def locked_candidate_split(examples: Sequence[CleanChunkExample], test_fraction:
 def candidate_cv_splits(examples: Sequence[CleanChunkExample],
                         development_ids: Iterable[str], n_folds: int = 4,
                         seed: int = 42):
-    """Return deterministic group-safe folds over a locked development partition."""
+    """Return deterministic episode-safe folds over a development partition."""
     if n_folds < 2:
         raise ValueError("n_folds must be at least two")
     development = select_examples(examples, development_ids)
     groups = _candidate_groups(development)
-    discordant = {
+    group_discordant = {
         gid: len({example.success for example in members}) > 1
         for gid, members in groups.items()
     }
-    if sum(discordant.values()) < n_folds:
+    if sum(group_discordant.values()) < n_folds:
         raise ValueError(
             f"need at least {n_folds} discordant development groups for {n_folds}-fold CV")
-    fold_groups = [[] for _ in range(n_folds)]
+
+    episode_groups = defaultdict(list)
+    for gid, members in groups.items():
+        first = members[0]
+        episode_groups[(
+            first.benchmark, first.suite, first.task_idx, first.episode_idx
+        )].append(gid)
+    episode_discordant = {
+        identity: any(group_discordant[gid] for gid in gids)
+        for identity, gids in episode_groups.items()
+    }
+    fold_episodes = [[] for _ in range(n_folds)]
     for status in (False, True):
-        ids = [gid for gid in groups if discordant[gid] == status]
-        ordered = _balanced_group_order(groups, ids, seed + int(status))
-        for index, gid in enumerate(ordered):
-            fold_groups[index % n_folds].append(gid)
-    all_groups = set(groups)
+        identities = [
+            identity for identity in episode_groups
+            if episode_discordant[identity] == status]
+        ordered = _stable_order(identities, seed + int(status))
+        for index, identity in enumerate(ordered):
+            fold_episodes[index % n_folds].append(identity)
+    all_episodes = set(episode_groups)
     return [{
-        "train": _candidate_ids(groups, sorted(all_groups - set(validation))),
-        "val": _candidate_ids(groups, validation),
-    } for validation in fold_groups]
+        "train": _candidate_ids(
+            groups, sorted(gid for identity in all_episodes - set(validation)
+                           for gid in episode_groups[identity])),
+        "val": _candidate_ids(
+            groups, sorted(gid for identity in validation
+                           for gid in episode_groups[identity])),
+    } for validation in fold_episodes]
 
 
 def candidate_episode_identities(examples: Sequence[CleanChunkExample]):
@@ -415,8 +451,15 @@ def candidate_episode_identities(examples: Sequence[CleanChunkExample]):
 
 def exclude_candidate_identities(historical: Sequence[CleanChunkExample],
                                  candidates: Sequence[CleanChunkExample]):
-    held_out = candidate_episode_identities(candidates)
-    return [example for example in historical if (
+    return exclude_episode_identities(
+        historical, candidate_episode_identities(candidates))
+
+
+def exclude_episode_identities(
+        examples: Sequence[CleanChunkExample],
+        held_out: Iterable[tuple[str, str, int, int]]):
+    held_out = set(held_out)
+    return [example for example in examples if (
         example.benchmark, example.suite, example.task_idx, example.episode_idx
     ) not in held_out]
 

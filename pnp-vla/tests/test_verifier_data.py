@@ -97,6 +97,26 @@ def test_locked_split_and_cv_are_group_safe_and_cover_development_once():
     assert sorted(validation) == sorted({e.candidate_group_id for e in development})
 
 
+def test_candidate_cv_keeps_multiple_groups_from_one_episode_together():
+    examples = _candidate_examples(20)
+    second_group = [
+        replace(
+            example, rollout_id=example.rollout_id.replace("g0", "g-extra"),
+            candidate_group_id="g-extra")
+        for example in examples if example.candidate_group_id == "g0"
+    ]
+    examples += second_group
+    ids = [example.rollout_id for example in examples]
+    folds = candidate_cv_splits(examples, ids, seed=9)
+    locations = {}
+    for fold_index, fold in enumerate(folds):
+        for group in {
+                example.candidate_group_id
+                for example in select_examples(examples, fold["val"])}:
+            locations[group] = fold_index
+    assert locations["g0"] == locations["g-extra"]
+
+
 def test_identity_exclusion_and_within_group_shuffle():
     candidates = _candidate_examples(2)
     historical = [_example(0, 0, True), _example(9, 9, False)]

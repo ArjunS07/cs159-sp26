@@ -1,5 +1,6 @@
 from pnp.verifier.collection import (
-    build_stratified_manifest, candidate_group_id,
+    build_stratified_manifest, build_targeted_manifests, candidate_group_id,
+    collection_manifest_hash,
 )
 
 
@@ -26,3 +27,45 @@ def test_manifest_uses_mixed_tasks_and_one_state_per_rollout():
     assert {row["task_idx"] for row in manifest} == {0}
     assert len({row["rollout_id"] for row in manifest}) == 6
     assert {row["uncertainty_stratum"] for row in manifest} == {"low", "mid", "high"}
+
+
+def test_targeted_manifests_are_deterministic_disjoint_and_failure_enriched():
+    rollouts, steps = [], []
+    for benchmark in ("libero", "libero_pro"):
+        for episode in range(30):
+            rollout_id = f"{benchmark}-{episode}"
+            rollouts.append({
+                "rollout_id": rollout_id, "benchmark": benchmark, "suite": "s",
+                "task_idx": episode % 3, "episode_idx": episode,
+                "success": episode % 4 != 0,
+            })
+            for chunk in range(3):
+                steps.append({
+                    "rollout_id": rollout_id, "chunk_idx": chunk,
+                    "u_mean": episode + chunk / 10,
+                })
+    excluded = {("libero", "s", 0, 0), ("libero_pro", "s", 0, 0)}
+    kwargs = {
+        "development_targets": {"libero": 6, "libero_pro": 6},
+        "test_targets": {"libero": 3, "libero_pro": 3},
+        "development_failure_fraction": .75,
+        "seed": 9,
+    }
+    first = build_targeted_manifests(rollouts, steps, excluded, **kwargs)
+    second = build_targeted_manifests(
+        list(reversed(rollouts)), list(reversed(steps)), excluded, **kwargs)
+    assert first == second
+    assert collection_manifest_hash(first["development"]) == collection_manifest_hash(
+        second["development"])
+    development_ids = {
+        (row["benchmark"], row["suite"], row["task_idx"], row["episode_idx"])
+        for row in first["development"]}
+    test_ids = {
+        (row["benchmark"], row["suite"], row["task_idx"], row["episode_idx"])
+        for row in first["test"]}
+    assert len(development_ids) == 12
+    assert len(test_ids) == 6
+    assert development_ids.isdisjoint(test_ids | excluded)
+    assert sum(not row["success"] for row in first["development"]) >= 4
+    assert all(row["uncertainty_stratum"] == "high"
+               for rows in first.values() for row in rows)

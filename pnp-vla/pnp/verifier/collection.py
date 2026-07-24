@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import hashlib
+import json
 
 import numpy as np
 import torch
@@ -86,6 +87,118 @@ def build_stratified_manifest(rollout_rows, euler_rows, targets=None, seed=42):
                        for r in selected) >= per[stratum]:
                     break
     return selected
+
+
+def collection_manifest_hash(rows) -> str:
+    """Hash a collection manifest independently of row/query ordering."""
+    fields = (
+        "benchmark", "suite", "task_idx", "episode_idx", "rollout_id",
+        "chunk_idx", "u_mean", "uncertainty_stratum", "success",
+    )
+    canonical = [
+        {field: row.get(field) for field in fields}
+        for row in sorted(rows, key=lambda row: (
+            row["benchmark"], row["suite"], int(row["task_idx"]),
+            int(row["episode_idx"]), int(row["chunk_idx"])))
+    ]
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def build_targeted_manifests(
+        rollout_rows, euler_rows, excluded_identities, *,
+        development_targets=None, test_targets=None,
+        development_failure_fraction=.70, seed=42):
+    """Build outcome-blind prospective-test and failure-enriched development manifests.
+
+    One high-uncertainty state is selected per previously unused episode. Test
+    membership is assigned before development enrichment and never depends on
+    candidate outcomes.
+    """
+    development_targets = development_targets or {"libero": 180, "libero_pro": 270}
+    test_targets = test_targets or {"libero": 60, "libero_pro": 90}
+    if not 0 <= development_failure_fraction <= 1:
+        raise ValueError("development_failure_fraction must be in [0, 1]")
+    excluded = {tuple(identity) for identity in excluded_identities}
+    by_id = {row["rollout_id"]: row for row in rollout_rows}
+    uncertainty = defaultdict(list)
+    for row in euler_rows:
+        uncertainty[(row["rollout_id"], int(row["chunk_idx"]))].append(
+            float(row["u_mean"]))
+
+    candidates = []
+    for (rollout_id, chunk_idx), values in uncertainty.items():
+        rollout = by_id.get(rollout_id)
+        if rollout is None:
+            continue
+        identity = (
+            rollout["benchmark"], rollout["suite"], int(rollout["task_idx"]),
+            int(rollout["episode_idx"]),
+        )
+        if identity in excluded:
+            continue
+        candidates.append({
+            **rollout, "chunk_idx": chunk_idx,
+            "u_mean": float(np.mean(values)), "uncertainty_stratum": "high",
+        })
+
+    thresholds = {
+        benchmark: float(np.quantile(
+            [row["u_mean"] for row in candidates if row["benchmark"] == benchmark],
+            2 / 3))
+        for benchmark in {row["benchmark"] for row in candidates}
+    }
+    episode_best = {}
+    for candidate in candidates:
+        if candidate["u_mean"] < thresholds[candidate["benchmark"]]:
+            continue
+        identity = (
+            candidate["benchmark"], candidate["suite"], int(candidate["task_idx"]),
+            int(candidate["episode_idx"]),
+        )
+        previous = episode_best.get(identity)
+        if previous is None or (
+                candidate["u_mean"], -int(candidate["chunk_idx"])) > (
+                previous["u_mean"], -previous["chunk_idx"]):
+            episode_best[identity] = candidate
+
+    result = {"development": [], "test": []}
+    for benchmark in sorted(set(development_targets) | set(test_targets)):
+        pool = [row for row in episode_best.values() if row["benchmark"] == benchmark]
+        pool.sort(key=lambda row: hashlib.sha256(
+            f"{seed}|test|{row['rollout_id']}|{row['chunk_idx']}".encode()
+        ).hexdigest())
+        n_test = test_targets.get(benchmark, 0)
+        test = pool[:n_test]
+        if len(test) != n_test:
+            raise ValueError(f"{benchmark}: requested {n_test} test states, found {len(test)}")
+        result["test"].extend(test)
+
+        used = {
+            (row["benchmark"], row["suite"], int(row["task_idx"]), int(row["episode_idx"]))
+            for row in test
+        }
+        available = [row for row in pool if (
+            row["benchmark"], row["suite"], int(row["task_idx"]), int(row["episode_idx"])
+        ) not in used]
+        target = development_targets.get(benchmark, 0)
+        failure_target = round(target * development_failure_fraction)
+        failures = [row for row in available if not bool(row["success"])]
+        successes = [row for row in available if bool(row["success"])]
+        for label, rows in (("failure", failures), ("success", successes)):
+            rows.sort(key=lambda row: hashlib.sha256(
+                f"{seed}|development|{label}|{row['rollout_id']}|{row['chunk_idx']}".encode()
+            ).hexdigest())
+        development = failures[:failure_target]
+        development.extend(successes[:target - len(development)])
+        if len(development) < target:
+            development.extend(
+                failures[failure_target:failure_target + target - len(development)])
+        if len(development) != target:
+            raise ValueError(
+                f"{benchmark}: requested {target} development states, found {len(development)}")
+        result["development"].extend(development)
+    return result
 
 
 class _ContextCapture:
