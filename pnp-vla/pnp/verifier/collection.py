@@ -142,16 +142,8 @@ def build_targeted_manifests(
             "u_mean": float(np.mean(values)), "uncertainty_stratum": "high",
         })
 
-    thresholds = {
-        benchmark: float(np.quantile(
-            [row["u_mean"] for row in candidates if row["benchmark"] == benchmark],
-            2 / 3))
-        for benchmark in {row["benchmark"] for row in candidates}
-    }
     episode_best = {}
     for candidate in candidates:
-        if candidate["u_mean"] < thresholds[candidate["benchmark"]]:
-            continue
         identity = (
             candidate["benchmark"], candidate["suite"], int(candidate["task_idx"]),
             int(candidate["episode_idx"]),
@@ -186,9 +178,12 @@ def build_targeted_manifests(
         failures = [row for row in available if not bool(row["success"])]
         successes = [row for row in available if bool(row["success"])]
         for label, rows in (("failure", failures), ("success", successes)):
-            rows.sort(key=lambda row: hashlib.sha256(
-                f"{seed}|development|{label}|{row['rollout_id']}|{row['chunk_idx']}".encode()
-            ).hexdigest())
+            rows.sort(key=lambda row: (
+                -row["u_mean"],
+                hashlib.sha256(
+                    f"{seed}|development|{label}|{row['rollout_id']}|"
+                    f"{row['chunk_idx']}".encode()).hexdigest(),
+            ))
         development = failures[:failure_target]
         development.extend(successes[:target - len(development)])
         if len(development) < target:

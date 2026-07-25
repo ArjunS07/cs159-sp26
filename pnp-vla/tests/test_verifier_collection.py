@@ -69,3 +69,24 @@ def test_targeted_manifests_are_deterministic_disjoint_and_failure_enriched():
     assert sum(not row["success"] for row in first["development"]) >= 4
     assert all(row["uncertainty_stratum"] == "high"
                for rows in first.values() for row in rows)
+
+
+def test_targeted_manifest_uses_each_episodes_highest_uncertainty_state():
+    rollouts = [{
+        "rollout_id": f"r{episode}", "benchmark": "libero", "suite": "s",
+        "task_idx": 0, "episode_idx": episode, "success": episode % 2 == 0,
+    } for episode in range(20)]
+    steps = [{
+        "rollout_id": f"r{episode}", "chunk_idx": chunk,
+        "u_mean": episode + chunk / 10,
+    } for episode in range(20) for chunk in range(3)]
+    manifests = build_targeted_manifests(
+        rollouts, steps, set(),
+        development_targets={"libero": 10},
+        test_targets={"libero": 5},
+        development_failure_fraction=.5,
+    )
+    selected = manifests["development"] + manifests["test"]
+    assert len(selected) == 15
+    assert len({row["episode_idx"] for row in selected}) == 15
+    assert {row["chunk_idx"] for row in selected} == {2}
