@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import copy
 import hashlib
 import json
 
@@ -307,7 +308,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                 return None
 
     _, canonical_sim = _unwrap_sim(env)
-    canonical_state = np.asarray(canonical_sim.get_state().flatten()).copy()
+    canonical_sim_state = copy.deepcopy(canonical_sim.get_state())
+    canonical_state = np.asarray(canonical_sim_state.flatten()).copy()
     chunk_size = policy.config.chunk_size
     est_chunks = max(1, round(ep["max_steps"] / chunk_size))
     policy.model._pnp.chunk_pos = min(chunk_idx / est_chunks, 1.0)
@@ -329,17 +331,30 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
     group_id = candidate_group_id(
         ep.get("benchmark", "libero"), ep["suite"], ep["task_idx"],
         ep.get("ep_idx", ep.get("episode_idx", 0)), chunk_idx, namespace=experiment)
-    candidates, state_errors = [], []
+    candidates, replay_state_errors = [], []
     for kind in policy_chunks:
         branch_obs = _reset_and_replay_actions(env, ep, policy, replay_actions)
         if branch_obs is None:
             raise RuntimeError("fixed replay terminated before the branch state")
         _, branch_sim = _unwrap_sim(env)
         branch_state = np.asarray(branch_sim.get_state().flatten())
-        state_error = float(np.max(np.abs(branch_state - canonical_state)))
-        state_errors.append(state_error)
-        if not np.allclose(branch_state, canonical_state, atol=state_atol, rtol=0):
-            raise RuntimeError(f"fixed replay state mismatch (max_abs={state_error:.3g})")
+        replay_state_error = float(np.max(np.abs(branch_state - canonical_state)))
+        replay_state_errors.append(replay_state_error)
+        state_corrected = not np.allclose(
+            branch_state, canonical_state, atol=state_atol, rtol=0)
+        if state_corrected:
+            # Replay reconstructs wrapper/controller state and clocks. Correct
+            # only MuJoCo's physical state so all interventions start from the
+            # exact same qpos/qvel/act/time state. The stale pre-prefix
+            # observation is never consumed: _run_continuation steps the
+            # intervention prefix before its first policy query.
+            branch_sim.set_state(copy.deepcopy(canonical_sim_state))
+            branch_sim.forward()
+            corrected = np.asarray(branch_sim.get_state().flatten())
+            if not np.allclose(corrected, canonical_state, atol=state_atol, rtol=0):
+                corrected_error = float(np.max(np.abs(corrected - canonical_state)))
+                raise RuntimeError(
+                    f"sim state correction failed (max_abs={corrected_error:.3g})")
         success, n_steps = _run_continuation(
             env, branch_obs, ep, policy, preprocess, postprocess, device,
             prefix=env_chunks[kind][:prefix_length], branch_seed=seed ^ 0x51A7,
@@ -348,8 +363,11 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         candidates.append({
             "candidate_id": candidate_id, "candidate_kind": kind, "success": success,
             "n_steps": n_steps, "rollout_id": None,
-            "metadata_json": {"source_episode_seed": seed, "chunk_idx": chunk_idx,
-                              "replay_state_max_abs": state_error},
+            "metadata_json": {
+                "source_episode_seed": seed, "chunk_idx": chunk_idx,
+                "replay_state_max_abs_before_correction": replay_state_error,
+                "sim_state_corrected": state_corrected,
+            },
             "blobs": {
                 "policy_chunk": {"actions": policy_chunks[kind]},
                 "env_chunk": {"actions": env_chunks[kind],
@@ -364,8 +382,18 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         "chunk_idx": chunk_idx, "uncertainty_stratum": uncertainty_stratum,
         "pairing_mode": "deterministic_replay", "prefix_length": prefix_length,
         "snapshot_validated": False,
-        "metadata_json": {"replay_validated": True,
-                          "replay_state_max_abs": max(state_errors, default=0.0),
+        "metadata_json": {
+                          "replay_validated": not any(
+                              error > state_atol for error in replay_state_errors),
+                          "exact_sim_state_validated": True,
+                          "state_initialization": (
+                              "replay_plus_sim_correction" if any(
+                                  error > state_atol for error in replay_state_errors)
+                              else "exact_replay"),
+                          "sim_state_corrected": any(
+                              error > state_atol for error in replay_state_errors),
+                          "replay_state_max_abs_before_correction": max(
+                              replay_state_errors, default=0.0),
                           "replay_action_count": len(replay_actions),
                           "chunk_position": float(policy.model._pnp.chunk_pos)},
     }
