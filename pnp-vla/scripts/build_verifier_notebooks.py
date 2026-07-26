@@ -591,11 +591,13 @@ SHARD_COUNT = 1   # Use the generated workers for three-way collection.
 SHARD_INDEX = 0
 assert 0 <= SHARD_INDEX < SHARD_COUNT
 
-def pages(table, columns, configure):
+def pages(table, columns, configure, order_by):
     rows=[]; start=0
     while True:
-        q = configure(store.client.table(table).select(columns)).range(start, start+999)
-        batch = q.execute().data or []; rows += batch
+        q = configure(store.client.table(table).select(columns))
+        for column in order_by:
+            q = q.order(column)
+        batch = q.range(start, start+999).execute().data or []; rows += batch
         if len(batch) < 1000: return rows
         start += 1000
 
@@ -610,20 +612,23 @@ for experiment in source_experiments:
         "rollout_id,benchmark,suite,task_idx,episode_idx,success",
         lambda q, experiment=experiment: q.eq(
             "experiment", experiment).eq(
-            "method", "pnp_uncertainty_only").eq("status", "completed"))
+            "method", "pnp_uncertainty_only").eq("status", "completed"),
+        ("rollout_id",))
 
 rollout_ids = sorted({row["rollout_id"] for row in rollouts})
 euler = []
 for start in range(0, len(rollout_ids), 100):
     batch_ids = rollout_ids[start:start+100]
     euler += pages(
-        "pnp_euler_steps", "rollout_id,chunk_idx,u_mean",
-        lambda q, ids=batch_ids: q.in_("rollout_id", ids))
+        "pnp_euler_steps", "rollout_id,chunk_idx,euler_step,u_mean",
+        lambda q, ids=batch_ids: q.in_("rollout_id", ids),
+        ("rollout_id", "chunk_idx", "euler_step"))
 
 v3_groups = pages(
     "verifier_candidate_groups",
-    "benchmark,suite,task_idx,episode_idx",
-    lambda q: q.eq("experiment", "verifier-clean-pairs-v3"))
+    "candidate_group_id,benchmark,suite,task_idx,episode_idx",
+    lambda q: q.eq("experiment", "verifier-clean-pairs-v3"),
+    ("candidate_group_id",))
 excluded = {
     (row["benchmark"], row["suite"], int(row["task_idx"]), int(row["episode_idx"]))
     for row in v3_groups
@@ -638,7 +643,7 @@ manifests = build_targeted_manifests(
 manifest_hashes = {
     cohort: collection_manifest_hash(rows) for cohort, rows in manifests.items()}
 manifest_document = {
-    "version": 1,
+    "version": 2,
     "candidate_count": CANDIDATE_COUNT,
     "prefix_length": PREFIX_LENGTH,
     "development_experiment": DEVELOPMENT_EXPERIMENT,
@@ -694,16 +699,61 @@ print("v4 manifests, identities, and verifier tables are ready")'''),
     md("## 5. Collect fixed-eight deterministic-replay groups"),
     code(r'''experiment_names = (DEVELOPMENT_EXPERIMENT, TEST_EXPERIMENT)
 existing_group_rows = pages(
-    "verifier_candidate_groups", "candidate_group_id,experiment",
-    lambda q: q.in_("experiment", experiment_names))
-existing_group_ids = {row["candidate_group_id"] for row in existing_group_rows}
+    "verifier_candidate_groups",
+    "candidate_group_id,experiment,metadata_json",
+    lambda q: q.in_("experiment", experiment_names),
+    ("candidate_group_id",))
+canonical_by_id = {}
+for item in full_manifest:
+    gid = candidate_group_id(
+        item["benchmark"], item["suite"], item["task_idx"],
+        item["episode_idx"], item["chunk_idx"], namespace=item["experiment"])
+    canonical_by_id[gid] = item
+canonical_ids = set(canonical_by_id)
+
+# Older workers could build overlapping shards because their paginated source
+# queries had no stable ordering. Preserve those artifacts under an explicitly
+# excluded experiment name instead of deleting them.
+noncanonical_rows = [
+    row for row in existing_group_rows
+    if row["candidate_group_id"] not in canonical_ids]
+for row in noncanonical_rows:
+    metadata = dict(row.get("metadata_json") or {})
+    metadata["quarantined_from_experiment"] = row["experiment"]
+    metadata["quarantine_reason"] = "noncanonical_v4_manifest"
+    (store.client.table("verifier_candidate_groups")
+     .update({
+         "experiment": row["experiment"] + "-orphan",
+         "metadata_json": metadata,
+     }).eq("candidate_group_id", row["candidate_group_id"]).execute())
+
+canonical_rows = [
+    row for row in existing_group_rows
+    if row["candidate_group_id"] in canonical_ids]
+for row in canonical_rows:
+    item = canonical_by_id[row["candidate_group_id"]]
+    metadata = dict(row.get("metadata_json") or {})
+    metadata.update({
+        "cohort": item["cohort"],
+        "collection_manifest_hash": manifest_hashes[item["cohort"]],
+        "collection_manifest_path": manifest_path,
+        "source_rollout_id": item["rollout_id"],
+        "source_success": bool(item["success"]),
+        "source_u_mean": float(item["u_mean"]),
+    })
+    (store.client.table("verifier_candidate_groups")
+     .update({"metadata_json": metadata})
+     .eq("candidate_group_id", row["candidate_group_id"]).execute())
+
+existing_group_ids = {row["candidate_group_id"] for row in canonical_rows}
 candidate_rows = []
 existing_id_list = sorted(existing_group_ids)
 for start in range(0, len(existing_id_list), 100):
     ids = existing_id_list[start:start+100]
     candidate_rows += pages(
-        "verifier_candidates", "candidate_group_id",
-        lambda q, ids=ids: q.in_("candidate_group_id", ids))
+        "verifier_candidates", "candidate_id,candidate_group_id",
+        lambda q, ids=ids: q.in_("candidate_group_id", ids),
+        ("candidate_id",))
 candidate_counts = {}
 for row in candidate_rows:
     gid = row["candidate_group_id"]
@@ -712,6 +762,7 @@ existing = {
     gid for gid in existing_group_ids
     if candidate_counts.get(gid, 0) == CANDIDATE_COUNT}
 print({
+    "quarantined_noncanonical_groups": len(noncanonical_rows),
     "complete_existing_groups": len(existing),
     "partial_groups_to_repair": len(existing_group_ids - existing),
 })
@@ -778,7 +829,8 @@ print({
 ):
     groups = pages(
         "verifier_candidate_groups", "*",
-        lambda q, experiment=experiment: q.eq("experiment", experiment))
+        lambda q, experiment=experiment: q.eq("experiment", experiment),
+        ("candidate_group_id",))
     group_ids = {group["candidate_group_id"] for group in groups}
     candidates = []
     group_id_list = sorted(group_ids)
@@ -787,7 +839,8 @@ print({
         candidates += pages(
             "verifier_candidates",
             "candidate_id,candidate_group_id,candidate_kind,success",
-            lambda q, ids=ids: q.in_("candidate_group_id", ids))
+            lambda q, ids=ids: q.in_("candidate_group_id", ids),
+            ("candidate_id",))
     by_group = {}
     for candidate in candidates:
         by_group.setdefault(candidate["candidate_group_id"], []).append(candidate)

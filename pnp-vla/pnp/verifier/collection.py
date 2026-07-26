@@ -149,9 +149,13 @@ def build_targeted_manifests(
             int(candidate["episode_idx"]),
         )
         previous = episode_best.get(identity)
-        if previous is None or (
-                candidate["u_mean"], -int(candidate["chunk_idx"])) > (
-                previous["u_mean"], -previous["chunk_idx"]):
+        candidate_rank = (
+            -candidate["u_mean"], int(candidate["chunk_idx"]),
+            candidate["rollout_id"])
+        previous_rank = (
+            -previous["u_mean"], int(previous["chunk_idx"]),
+            previous["rollout_id"]) if previous is not None else None
+        if previous_rank is None or candidate_rank < previous_rank:
             episode_best[identity] = candidate
 
     result = {"development": [], "test": []}
