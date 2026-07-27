@@ -14,11 +14,13 @@ import io
 import json
 import os
 import subprocess
+import time
 import uuid
 from collections import OrderedDict
 from typing import Any, Iterable
 
 import numpy as np
+import httpx
 
 from .config import SCHEMA_VERSION, SAMPLER_ALGO_VERSION, PI05_REPO_ID, ADIM
 
@@ -530,10 +532,18 @@ class SupabaseStore:
             self._enc_lru.popitem(last=False)
 
     # ── Storage primitives ─────────────────────────────────────────────────
-    def _upload(self, key: str, data: bytes) -> None:
-        self.client.storage.from_(self.bucket).upload(
-            key, data, {"content-type": "application/octet-stream", "upsert": "true"})
-        self._bytes_written += len(data)
+    def _upload(self, key: str, data: bytes, attempts: int = 5) -> None:
+        for attempt in range(attempts):
+            try:
+                self.client.storage.from_(self.bucket).upload(
+                    key, data,
+                    {"content-type": "application/octet-stream", "upsert": "true"})
+                self._bytes_written += len(data)
+                return
+            except (httpx.TransportError, httpx.TimeoutException):
+                if attempt + 1 == attempts:
+                    raise
+                time.sleep(2 ** attempt)
 
     def _download(self, key: str) -> bytes:
         return self.client.storage.from_(self.bucket).download(key)
