@@ -90,3 +90,16 @@ def test_targeted_manifest_uses_each_episodes_highest_uncertainty_state():
     assert len(selected) == 15
     assert len({row["episode_idx"] for row in selected}) == 15
     assert {row["chunk_idx"] for row in selected} == {2}
+
+
+def test_targeted_manifest_can_accept_a_prospective_shortfall():
+    rollouts = [{
+        "rollout_id": f"r{i}", "benchmark": "libero", "suite": "s",
+        "task_idx": 0, "episode_idx": i, "success": True,
+    } for i in range(3)]
+    steps = [{"rollout_id": f"r{i}", "chunk_idx": 0, "u_mean": i}
+             for i in range(3)]
+    manifests = build_targeted_manifests(
+        rollouts, steps, set(), development_targets={"libero": 0},
+        test_targets={"libero": 10}, allow_shortfall=True)
+    assert len(manifests["test"]) == 3

@@ -873,12 +873,253 @@ print({
 ]
 
 
+ONLINE_EVALUATION_CELLS = [
+    md("""# 06 — Fresh online verifier selection evaluation
+
+Freeze verifier `3add05c827424c4a` and evaluate best-of-8 selection on episode
+identities unused by every V1–V4 candidate dataset. All eight outcomes are
+rolled out for evaluation; the verifier score never uses those outcomes."""),
+    md("## 1. Setup and load the frozen policy/verifier"),
+    code(BOOTSTRAP.replace('"[analysis]"', '"[sim,analysis]"')),
+    code(r'''import json
+from pathlib import Path
+import numpy as np
+import torch
+from tqdm.auto import tqdm
+
+from pnp import libero_env, libero_pro, models
+from pnp.experiments import _prepare_libero_pro_episodes
+from pnp.store import SupabaseStore
+from pnp.verifier import *
+
+VERIFIER_ID = "3add05c827424c4a"
+EXPERIMENT = "verifier-online-selection-v1"
+TARGETS = {"libero": 50, "libero_pro": 75}
+CANDIDATE_COUNT = 8
+PREFIX_LENGTH = 10
+
+benchmark_dict = libero_env.init_libero_benchmark()
+libero_pro.patch_torch_load()
+policy, preprocess, postprocess = models.load_pi05()
+device = models.default_device()
+store = SupabaseStore()
+checkpoint, verifier_row = store.load_verifier(VERIFIER_ID)
+verifier = CompactAdvantageVerifier(
+    obs_dim=int(verifier_row["obs_dim"]),
+    action_dim=int(verifier_row["action_dim"]))
+verifier.load_state_dict(checkpoint["model"])
+verifier.to(device).eval()
+
+suites = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+tasks = [(suite, task) for suite in suites
+         for task in range(benchmark_dict[suite]().n_tasks)]
+standard = libero_env.build_final_episodes(benchmark_dict, tasks=tasks)
+for ep in standard: ep["benchmark"] = "libero"
+pro = _prepare_libero_pro_episodes()
+for ep in pro: ep["benchmark"] = "libero_pro"
+episode_lookup = {
+    (e["benchmark"], e["suite"], e["task_idx"],
+     e.get("ep_idx", e.get("episode_idx"))): e
+    for e in standard + pro}
+print({"verifier": VERIFIER_ID, "episodes": len(episode_lookup)})'''),
+    md("## 2. Freeze a fresh, outcome-blind manifest"),
+    code(r'''def pages(table, columns, configure, order_by):
+    rows=[]; start=0
+    while True:
+        query = configure(store.client.table(table).select(columns))
+        for column in order_by:
+            query = query.order(column)
+        batch = query.range(start, start+999).execute().data or []
+        rows += batch
+        if len(batch) < 1000: return rows
+        start += 1000
+
+source_experiments = (
+    "libero-hybrid-schedules-k3-v1",
+    "libero-pro-canonical-core-k3-v1",
+)
+rollouts=[]
+for experiment in source_experiments:
+    rollouts += pages(
+        "rollouts", "rollout_id,benchmark,suite,task_idx,episode_idx,success",
+        lambda q, experiment=experiment: q.eq("experiment", experiment).eq(
+            "method", "pnp_uncertainty_only").eq("status", "completed"),
+        ("rollout_id",))
+rollout_ids = sorted({row["rollout_id"] for row in rollouts})
+euler=[]
+for start in range(0, len(rollout_ids), 100):
+    ids = rollout_ids[start:start+100]
+    euler += pages(
+        "pnp_euler_steps", "rollout_id,chunk_idx,euler_step,u_mean",
+        lambda q, ids=ids: q.in_("rollout_id", ids),
+        ("rollout_id", "chunk_idx", "euler_step"))
+
+prior_groups = pages(
+    "verifier_candidate_groups",
+    "candidate_group_id,benchmark,suite,task_idx,episode_idx",
+    lambda q: q.like("experiment", "verifier-clean-pairs-v%"),
+    ("candidate_group_id",))
+excluded = {
+    (row["benchmark"], row["suite"], int(row["task_idx"]), int(row["episode_idx"]))
+    for row in prior_groups}
+manifests = build_targeted_manifests(
+    rollouts, euler, excluded,
+    development_targets={"libero": 0, "libero_pro": 0},
+    test_targets=TARGETS, seed=159, allow_shortfall=True)
+manifest = [{**row, "experiment": EXPERIMENT}
+            for row in manifests["test"]]
+manifest_hash = collection_manifest_hash(manifest)
+manifest_path = f"verifier_manifests/online-eval-{manifest_hash}.json"
+store._upload(manifest_path, json.dumps({
+    "version": 1, "verifier_id": VERIFIER_ID, "experiment": EXPERIMENT,
+    "targets": TARGETS, "excluded_episode_count": len(excluded),
+    "manifest_hash": manifest_hash, "manifest": manifest,
+}, sort_keys=True, separators=(",", ":")).encode())
+assert len({(r["benchmark"], r["suite"], r["task_idx"], r["episode_idx"])
+            for r in manifest}) == len(manifest)
+assert all((r["benchmark"], r["suite"], r["task_idx"], r["episode_idx"])
+           not in excluded for r in manifest)
+print({
+    "manifest_hash": manifest_hash, "groups": len(manifest),
+    "by_benchmark": {b: sum(r["benchmark"] == b for r in manifest) for b in TARGETS},
+    "path": manifest_path,
+})'''),
+    md("## 3. Score eight candidates and collect all counterfactual outcomes"),
+    code(r'''def verifier_scores(group, candidates):
+    obs = np.asarray(candidates[0]["blobs"]["observation"]["obs_enc"], np.float32)
+    actions = np.zeros((len(candidates), 50, 7), np.float32)
+    masks = np.zeros((len(candidates), 50), bool)
+    for index, candidate in enumerate(candidates):
+        chunk = np.asarray(candidate["blobs"]["env_chunk"]["actions"], np.float32)[:, :7]
+        n = min(50, len(chunk)); actions[index, :n] = chunk[:n]; masks[index, :n] = True
+    with torch.no_grad():
+        context = verifier.encode_context(
+            torch.from_numpy(obs).reshape(1, -1).to(device),
+            torch.tensor([group["metadata_json"]["chunk_position"]], device=device))
+        scores = verifier.rank_candidates(
+            context, torch.from_numpy(actions).unsqueeze(0).to(device),
+            torch.from_numpy(masks).unsqueeze(0).to(device),
+            PREFIX_LENGTH).squeeze(0).cpu().numpy()
+    return scores
+
+existing_groups = pages(
+    "verifier_candidate_groups", "candidate_group_id",
+    lambda q: q.eq("experiment", EXPERIMENT), ("candidate_group_id",))
+existing_ids = {row["candidate_group_id"] for row in existing_groups}
+candidate_rows=[]
+for start in range(0, len(existing_ids), 100):
+    ids = sorted(existing_ids)[start:start+100]
+    candidate_rows += pages(
+        "verifier_candidates", "candidate_id,candidate_group_id",
+        lambda q, ids=ids: q.in_("candidate_group_id", ids), ("candidate_id",))
+counts={}
+for row in candidate_rows:
+    counts[row["candidate_group_id"]] = counts.get(row["candidate_group_id"], 0) + 1
+complete = {gid for gid in existing_ids if counts.get(gid) == CANDIDATE_COUNT}
+
+store.start_run("verifier_online_evaluation", "libero+libero_pro", EXPERIMENT,
+                config={"verifier_id": VERIFIER_ID, "groups": len(manifest),
+                        "candidate_count": CANDIDATE_COUNT,
+                        "prefix_length": PREFIX_LENGTH,
+                        "manifest_hash": manifest_hash})
+new_outcomes = skipped = 0
+for item in tqdm(manifest, desc="fresh verifier groups"):
+    gid = candidate_group_id(
+        item["benchmark"], item["suite"], item["task_idx"], item["episode_idx"],
+        item["chunk_idx"], namespace=EXPERIMENT)
+    if gid in complete: continue
+    ep = episode_lookup[(item["benchmark"], item["suite"],
+                         item["task_idx"], item["episode_idx"])]
+    env = libero_env.make_env(ep["bddl_path"])
+    try:
+        try:
+            collected = collect_replay_candidate_group(
+                env, ep, policy, preprocess, postprocess, device,
+                chunk_idx=item["chunk_idx"], uncertainty_stratum="high",
+                prefix_length=PREFIX_LENGTH, candidate_count=CANDIDATE_COUNT,
+                experiment=EXPERIMENT)
+        except Exception as error:
+            print("evaluation group skipped:", type(error).__name__, error)
+            collected = None
+        if collected is None:
+            skipped += 1; continue
+        group, candidates = collected
+        scores = verifier_scores(group, candidates)
+        selected = int(np.argmax(scores))
+        for index, (candidate, score) in enumerate(zip(candidates, scores)):
+            candidate["metadata_json"].update({
+                "verifier_id": VERIFIER_ID, "verifier_score": float(score),
+                "verifier_selected": index == selected,
+            })
+        group["metadata_json"].update({
+            "verifier_id": VERIFIER_ID,
+            "selected_candidate_id": candidates[selected]["candidate_id"],
+            "manifest_hash": manifest_hash, "manifest_path": manifest_path,
+            "source_rollout_id": item["rollout_id"],
+            "source_u_mean": float(item["u_mean"]),
+        })
+        store.register_candidate_group(group, candidates)
+        complete.add(group["candidate_group_id"])
+        new_outcomes += len(candidates)
+    finally:
+        env.close()
+store.finish_run(n_rollouts=new_outcomes)
+print({"new_outcomes": new_outcomes, "skipped": skipped,
+       "complete_groups_seen": len(complete)})'''),
+    md("## 4. Fresh selection report"),
+    code(r'''groups = pages(
+    "verifier_candidate_groups", "candidate_group_id,benchmark,metadata_json",
+    lambda q: q.eq("experiment", EXPERIMENT), ("candidate_group_id",))
+group_ids = {row["candidate_group_id"] for row in groups}
+candidates=[]
+for start in range(0, len(group_ids), 100):
+    ids = sorted(group_ids)[start:start+100]
+    candidates += pages(
+        "verifier_candidates",
+        "candidate_id,candidate_group_id,candidate_kind,success,metadata_json",
+        lambda q, ids=ids: q.in_("candidate_group_id", ids), ("candidate_id",))
+by_group={}
+for candidate in candidates:
+    by_group.setdefault(candidate["candidate_group_id"], []).append(candidate)
+benchmark_by_group = {row["candidate_group_id"]: row["benchmark"] for row in groups}
+records=[]
+for gid, members in sorted(by_group.items()):
+    if len(members) != CANDIDATE_COUNT: continue
+    outcomes = np.asarray([bool(row["success"]) for row in members])
+    scores = np.asarray([
+        float((row.get("metadata_json") or {})["verifier_score"]) for row in members])
+    positive, negative = scores[outcomes], scores[~outcomes]
+    pair_accuracy = margin = float("nan"); comparisons = 0
+    if len(positive) and len(negative):
+        differences = positive[:, None] - negative[None, :]
+        pair_accuracy = float(((differences > 0) + .5*(differences == 0)).mean())
+        margin = float(differences.mean()); comparisons = int(differences.size)
+    chosen = int(np.argmax(scores))
+    default = next((i for i, row in enumerate(members)
+                    if row["candidate_kind"] == "default"), 0)
+    records.append({
+        "group_id": gid, "benchmark": benchmark_by_group[gid],
+        "uncertainty_stratum": "high", "pair_accuracy": pair_accuracy,
+        "margin": margin, "comparisons": comparisons,
+        "top1": float(outcomes[chosen]), "default": float(outcomes[default]),
+        "random": float(outcomes.mean()), "oracle": float(outcomes.max()),
+    })
+report = summarize_candidate_records(records, seed=159)
+output = Path(package_dir) / "analysis_outputs" / "verifier_online_selection.json"
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(report, indent=2, sort_keys=True))
+print(json.dumps(report, indent=2))'''),
+]
+
+
 def main():
     outputs = {
         ROOT / "notebooks" / "03_verifier_experiments.ipynb": notebook(EXPERIMENT_CELLS),
         ROOT / "notebooks" / "04_collect_verifier_pairs.ipynb": notebook(COLLECTION_CELLS),
         ROOT / "notebooks" / "05_collect_targeted_verifier_groups.ipynb": notebook(
             TARGETED_COLLECTION_CELLS),
+        ROOT / "notebooks" / "06_evaluate_online_verifier_selection.ipynb": notebook(
+            ONLINE_EVALUATION_CELLS),
     }
     for path, value in outputs.items():
         path.write_text(json.dumps(value, indent=1) + "\n")

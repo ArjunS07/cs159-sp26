@@ -109,7 +109,7 @@ def collection_manifest_hash(rows) -> str:
 def build_targeted_manifests(
         rollout_rows, euler_rows, excluded_identities, *,
         development_targets=None, test_targets=None,
-        development_failure_fraction=.70, seed=42):
+        development_failure_fraction=.70, seed=42, allow_shortfall=False):
     """Build outcome-blind prospective-test and failure-enriched development manifests.
 
     One high-uncertainty state is selected per previously unused episode. Test
@@ -166,6 +166,8 @@ def build_targeted_manifests(
             f"{seed}|test|{row['rollout_id']}|{row['chunk_idx']}".encode()
         ).hexdigest())
         n_test = test_targets.get(benchmark, 0)
+        if allow_shortfall:
+            n_test = min(n_test, len(pool))
         test = pool[:n_test]
         if len(test) != n_test:
             raise ValueError(f"{benchmark}: requested {n_test} test states, found {len(test)}")
@@ -179,6 +181,8 @@ def build_targeted_manifests(
             row["benchmark"], row["suite"], int(row["task_idx"]), int(row["episode_idx"])
         ) not in used]
         target = development_targets.get(benchmark, 0)
+        if allow_shortfall:
+            target = min(target, len(available))
         failure_target = round(target * development_failure_fraction)
         failures = [row for row in available if not bool(row["success"])]
         successes = [row for row in available if bool(row["success"])]
