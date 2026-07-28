@@ -69,6 +69,16 @@ def test_action_only_architecture_is_invariant_to_context():
     assert torch.allclose(scores[0], scores[1], atol=1e-6)
 
 
+def test_legacy_checkpoint_can_omit_v2_conditioning_modules():
+    model = CompactAdvantageVerifier(obs_dim=16)
+    legacy = {key: value for key, value in model.state_dict().items()
+              if not key.startswith(("film_", "cross_"))}
+    restored = CompactAdvantageVerifier(obs_dim=16)
+    result = restored.load_state_dict(legacy)
+    assert result.unexpected_keys == []
+    assert result.missing_keys
+
+
 def test_candidate_metrics_average_pairs_at_the_group_level():
     records = [
         {"group_id": "a", "benchmark": "libero", "uncertainty_stratum": "high",

@@ -37,9 +37,9 @@ def _unwrap_sim(env):
 
 def candidate_group_id(benchmark, suite, task_idx, episode_idx, chunk_idx, *, namespace="",
                        trajectory_seed=None) -> str:
-    identity = (
-        f"{benchmark}|{suite}|{task_idx}|{episode_idx}|{chunk_idx}|"
-        f"trajectory={trajectory_seed if trajectory_seed is not None else 'legacy'}")
+    identity = f"{benchmark}|{suite}|{task_idx}|{episode_idx}|{chunk_idx}"
+    if trajectory_seed is not None:
+        identity += f"|trajectory={trajectory_seed}"
     raw = (f"{namespace}|{identity}" if namespace else identity).encode()
     return hashlib.sha256(raw).hexdigest()[:24]
 
@@ -139,11 +139,27 @@ def build_seeded_pro_manifest(rows, *, development_target=240, test_target=160,
                 "trajectory_seed": int(hashlib.sha256(raw).hexdigest()[:8], 16),
                 "collection_split": split}
 
-    base.sort(key=lambda row: hashlib.sha256(
-        f"{seed}|test|{row['suite']}|{row['task_idx']}|{row['episode_idx']}".encode()
-    ).hexdigest())
-    test = [with_seed(row, "confirmatory_test") for row in base[:test_target]]
-    available = base[test_target:]
+    test_buckets = defaultdict(list)
+    for row in base:
+        test_buckets[row["suite"]].append(row)
+    for suite in test_buckets:
+        test_buckets[suite].sort(key=lambda row: hashlib.sha256(
+            f"{seed}|test|{row['suite']}|{row['task_idx']}|{row['episode_idx']}".encode()
+        ).hexdigest())
+    test_base = []
+    while len(test_base) < test_target:
+        progressed = False
+        for suite in sorted(test_buckets):
+            if test_buckets[suite] and len(test_base) < test_target:
+                test_base.append(test_buckets[suite].pop())
+                progressed = True
+        if not progressed:
+            break
+    test = [with_seed(row, "confirmatory_test") for row in test_base]
+    test_identities = {(row["suite"], row["task_idx"], row["episode_idx"])
+                       for row in test_base}
+    available = [row for row in base if (
+        row["suite"], row["task_idx"], row["episode_idx"]) not in test_identities]
     # Interleave source failures and successes, then suites, to avoid an easy cohort.
     buckets = defaultdict(list)
     for row in available:

@@ -95,3 +95,17 @@ def test_six_pro_launchers_have_fixed_unique_indices():
         assert f"SHARD_INDEX = {index}" in source
         assert "run_libero_pro_worker" in source
         assert "sys.path.insert(0, package_dir)" in source
+
+
+def test_three_verifier_v2_launchers_have_fixed_unique_indices():
+    worker_dir = Path(__file__).parents[1] / "notebooks" / "workers"
+    launchers = sorted(worker_dir.glob("08_collect_verifier_v2_pro_worker_*.ipynb"))
+    assert len(launchers) == 3
+    for index, path in enumerate(launchers):
+        notebook = json.loads(path.read_text())
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"])
+        assert "SHARD_COUNT = 3" in source
+        assert f"SHARD_INDEX = {index}" in source
+        assert "trajectory_seed=item" in source
+        assert "CANDIDATE_COUNT = 12" in source

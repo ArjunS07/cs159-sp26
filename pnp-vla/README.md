@@ -62,3 +62,16 @@ python -m analysis.run_analysis --experiment <label>
 
 Required env vars: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` (+ Hugging Face credentials,
 `WANDB_API_KEY`, and `GH_PAT` in Colab).
+
+## State-conditioned verifier V2
+
+Apply `supabase/migrations/003_verifier_v2.sql`, then run the three generated
+`notebooks/workers/08_collect_verifier_v2_pro_worker_{0,1,2}.ipynb` notebooks. Collection
+is hash-addressed and resume-safe. The 240-group development cohort may be inspected; the
+160-group confirmatory cohort stays sealed.
+
+After collection, run `09_train_state_conditioned_verifier_v2.ipynb`. It restores the best
+cross-validation epoch, compares multiplicative, FiLM, cross-attention, action-only, and
+deranged-action controls, and registers one checkpoint bundle in Supabase. Finally, run
+`10_confirm_verifier_v2.ipynb` once to open the confirmatory outcomes and apply the
+predeclared bootstrap registration gate.

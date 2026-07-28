@@ -108,6 +108,19 @@ class CompactAdvantageVerifier(nn.Module):
         position = self.position_encoder(chunk_position.reshape(-1, 1).float())
         return obs, position
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load legacy multiplicative checkpoints while enforcing all old keys."""
+        result = super().load_state_dict(state_dict, strict=False, assign=assign)
+        allowed = ("film_temporal.", "film_head.", "cross_query.",
+                   "cross_attention.", "cross_head.")
+        invalid_missing = [key for key in result.missing_keys
+                           if not key.startswith(allowed)]
+        if strict and (invalid_missing or result.unexpected_keys):
+            raise RuntimeError(
+                "incompatible verifier state_dict: "
+                f"missing={invalid_missing}, unexpected={result.unexpected_keys}")
+        return result
+
     def set_action_statistics(self, mean, std):
         self.action_mean.copy_(torch.as_tensor(mean, dtype=self.action_mean.dtype))
         self.action_std.copy_(

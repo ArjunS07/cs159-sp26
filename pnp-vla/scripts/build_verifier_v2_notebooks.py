@@ -225,6 +225,7 @@ import copy, json, pickle
 import numpy as np
 import pandas as pd
 import torch
+import wandb
 from tqdm.auto import tqdm
 from pnp.store import SupabaseStore
 from pnp.verifier import *
@@ -241,7 +242,13 @@ SEEDS=(42,43,44); N_FOLDS=4; PREFIX_LENGTH=10
 
 historical=load_clean_chunk_examples(
     store, HISTORICAL, progress=tqdm, cache_dir=OUTPUT/"historical_cache")
-development=load_candidate_examples(store, PRIMARY, cache_dir=OUTPUT/"candidate_cache")
+existing_development=load_candidate_examples(
+    store, PRIMARY[:-1], cache_dir=OUTPUT/"candidate_cache_existing")
+new_development=load_candidate_examples(
+    store, PRIMARY[-1], cache_dir=OUTPUT/"candidate_cache_v2")
+new_audit=validate_candidate_groups(new_development,expected_candidates=12)
+assert new_audit["groups"] >= 220, new_audit
+development=existing_development+new_development
 audit=validate_candidate_groups(development)
 assert audit["discordant_groups"] >= 100, audit
 # Seal IDs only. Do not query verifier_candidates for this experiment here.
@@ -250,6 +257,7 @@ sealed=(store.client.table("verifier_candidate_groups").select("candidate_group_
 assert len(sealed) >= 120, len(sealed)
 folds=candidate_cv_splits(development, [e.rollout_id for e in development], N_FOLDS, 42)
 print({"historical_chunks":len(historical), "development":audit,
+       "new_PRO_development":new_audit,
        "sealed_confirmatory_groups":len(sealed), "device":str(DEVICE)})'''),
     md("## 3. Fixed sweep runner"),
     code(r'''def historical_fold(candidate_validation, fold_index):
@@ -300,7 +308,7 @@ SHUFFLED={"name":"shuffled-actions","architecture":"film","dropout":.2,
           "rank_lr":3e-4,"shuffle":True}
 print({"stage1_configs":len(STAGE1),"folds":N_FOLDS})'''),
     md("## 4. Stage 1: all architectures, one seed"),
-    code(r'''stage1_rows=[]; stage1_records={}
+    code(r'''stage1_rows=[]; stage1_records={}; history_rows=[]
 for spec in STAGE1+[ACTION,SHUFFLED]:
     all_records=[]
     for fold_index in range(N_FOLDS):
@@ -308,7 +316,11 @@ for spec in STAGE1+[ACTION,SHUFFLED]:
         stage1_rows.append({"name":spec["name"],"fold":fold_index,
                             "ranking":metrics["group_macro_ranking_accuracy"],
                             "uplift":metrics["top1_uplift_default"],
+                            "margin":metrics["mean_score_margin"],
                             "best_epoch":meta["best_rank_epoch"]})
+        history_rows += [{**point,"stage":1,"name":spec["name"],
+                          "fold":fold_index,"seed":42}
+                         for point in meta["rank_history"]]
         all_records += records
     stage1_records[spec["name"]]=all_records
 stage1=pd.DataFrame(stage1_rows)
@@ -324,36 +336,56 @@ stage1.to_csv(OUTPUT/"stage1_results.csv",index=False)
 print(summary.sort_values("ranking",ascending=False)); print("shortlist",shortlist)'''),
     md("## 5. Stage 2: shortlisted configurations × three seeds"),
     code(r'''spec_by_name={spec["name"]:spec for spec in STAGE1}
-stage2_rows=[]; pooled={name:[] for name in shortlist}
-for name in shortlist:
-    spec=spec_by_name[name]
+stage2_specs=[spec_by_name[name] for name in shortlist]+[ACTION,SHUFFLED]
+stage2_rows=[]; pooled={spec["name"]:[] for spec in stage2_specs}
+for spec in stage2_specs:
+    name=spec["name"]
     for seed in SEEDS:
         for fold_index in range(N_FOLDS):
             _,_,meta,metrics,records=fit_one(spec,fold_index,seed,50,7)
             stage2_rows.append({"name":name,"seed":seed,"fold":fold_index,
                                 "ranking":metrics["group_macro_ranking_accuracy"],
                                 "uplift":metrics["top1_uplift_default"],
+                                "margin":metrics["mean_score_margin"],
                                 "best_epoch":meta["best_rank_epoch"]})
+            history_rows += [{**point,"stage":2,"name":name,
+                              "fold":fold_index,"seed":seed}
+                             for point in meta["rank_history"]]
             pooled[name] += records
 stage2=pd.DataFrame(stage2_rows)
 stage2_summary=stage2.groupby("name").agg(
     ranking=("ranking","mean"),ranking_std=("ranking","std"),
     uplift=("uplift","mean"),best_epoch=("best_epoch","median"))
-stage2_summary["control_gap"]=stage2_summary.ranking-max(action_ranking,shuffled_ranking)
-selected=stage2_summary.sort_values(
+stage2_action=stage2_summary.loc[ACTION["name"],"ranking"]
+stage2_shuffled=stage2_summary.loc[SHUFFLED["name"],"ranking"]
+stage2_summary["control_gap"]=stage2_summary.ranking-max(stage2_action,stage2_shuffled)
+selected=stage2_summary.loc[shortlist].sort_values(
     ["control_gap","ranking","uplift"],ascending=False).index[0]
 stage2.to_csv(OUTPUT/"stage2_results.csv",index=False)
+pd.DataFrame(history_rows).to_csv(OUTPUT/"training_curves.csv",index=False)
+if os.getenv("WANDB_API_KEY"):
+    run=wandb.init(project="pnp-state-conditioned-verifier-v2",name="architecture-sweep")
+    for name,row in stage2_summary.iterrows():
+        run.log({f"summary/{name}/ranking":row.ranking,
+                 f"summary/{name}/uplift":row.uplift,
+                 f"summary/{name}/control_gap":row.control_gap})
+    artifact=wandb.Artifact("verifier-v2-sweep","evaluation")
+    for filename in ("stage1_results.csv","stage2_results.csv","training_curves.csv"):
+        artifact.add_file(str(OUTPUT/filename))
+    run.log_artifact(artifact); run.finish()
 print(stage2_summary); print("selected",selected)'''),
     md("## 6. Final refits and single checkpoint bundle"),
     code(r'''selected_spec=spec_by_name[selected]
-final_epochs=max(1,int(stage2.loc[stage2.name==selected,"best_epoch"].median())+1)
+epoch_by_name={name:max(1,int(rows.best_epoch.median())+1)
+               for name,rows in stage2.groupby("name")}
+final_epochs=epoch_by_name[selected]
 split=known_task_split(historical,seed=159)
 value_val=select_examples(historical,split["val"]); value_val_ids=set(split["val"])
 value_train=[e for e in historical if e.rollout_id not in value_val_ids]
 
-def final_fit(spec, train_examples):
+def final_fit(spec, train_examples, rank_epochs):
     cfg=AdvantageTrainConfig(seed=159,prefix_length=10,value_epochs=60,
-        rank_epochs=final_epochs,patience=100,rank_lr=spec["rank_lr"],weight_decay=1e-2,
+        rank_epochs=rank_epochs,patience=100,rank_lr=spec["rank_lr"],weight_decay=1e-2,
         context_lr_multiplier=.1,zero_context=spec.get("action_only",False))
     model=CompactAdvantageVerifier(action_width=64,dropout=spec["dropout"],
                                    conditioning=spec["architecture"])
@@ -361,10 +393,11 @@ def final_fit(spec, train_examples):
     model,_=train_advantage(model,train_examples,[],DEVICE,config=cfg)
     return model,cfg
 
-selected_model,selected_cfg=final_fit(selected_spec,development)
-action_model,action_cfg=final_fit(ACTION,development)
+selected_model,selected_cfg=final_fit(selected_spec,development,epoch_by_name[selected])
+action_model,action_cfg=final_fit(ACTION,development,epoch_by_name[ACTION["name"]])
 shuffled_model,shuffled_cfg=final_fit(
-    SHUFFLED,shuffle_candidate_actions_within_group(development,159))
+    SHUFFLED,shuffle_candidate_actions_within_group(development,159),
+    epoch_by_name[SHUFFLED["name"]])
 bundle={"model":selected_model.state_dict(),"controls":{
     "action_only":{"model":action_model.state_dict(),"spec":ACTION},
     "shuffled_actions":{"model":shuffled_model.state_dict(),"spec":SHUFFLED}},
@@ -405,9 +438,14 @@ from pnp.store import SupabaseStore
 from pnp.verifier import *
 
 DEVICE=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT=Path(package_dir)/"analysis_outputs"/"verifier_v2"
-registration=json.loads((OUTPUT/"registered_verifier.json").read_text())
-store=SupabaseStore(); checkpoint,row=store.load_verifier(registration["verifier_id"])
+OUTPUT=Path(package_dir)/"analysis_outputs"/"verifier_v2"; OUTPUT.mkdir(parents=True,exist_ok=True)
+store=SupabaseStore()
+registered=(store.client.table("verifier_models").select("verifier_id,created_at")
+            .eq("experiment","state-conditioned-verifier-v2")
+            .order("created_at",desc=True).limit(1).execute().data or [])
+assert registered,"no state-conditioned-verifier-v2 checkpoint is registered"
+verifier_id=registered[0]["verifier_id"]
+checkpoint,row=store.load_verifier(verifier_id)
 examples=load_candidate_examples(
     store,"verifier-v2-pro-confirmatory",cache_dir=OUTPUT/"confirmatory_cache")
 audit=validate_candidate_groups(examples,expected_candidates=12)
@@ -424,7 +462,7 @@ action=load_model(checkpoint["controls"]["action_only"]["spec"],
                   checkpoint["controls"]["action_only"]["model"])
 shuffled=load_model(checkpoint["controls"]["shuffled_actions"]["spec"],
                     checkpoint["controls"]["shuffled_actions"]["model"])
-print({"verifier":registration["verifier_id"],"integrity":audit})'''),
+print({"verifier":verifier_id,"integrity":audit})'''),
     md("## 3. Predeclared paired-bootstrap gate"),
     code(r'''config=AdvantageTrainConfig(seed=20260728,prefix_length=10)
 metrics,selected_records=evaluate_candidate_ranker(
@@ -437,12 +475,12 @@ action_comparison=paired_candidate_comparison(selected_records,action_records,se
 shuffled_comparison=paired_candidate_comparison(
     selected_records,shuffled_records,seed=20260729)
 gate=verifier_registration_eligibility(metrics,action_comparison,shuffled_comparison)
-report={"verifier_id":registration["verifier_id"],"metrics":metrics,
+report={"verifier_id":verifier_id,"metrics":metrics,
         "vs_action_only":action_comparison,"vs_shuffled_actions":shuffled_comparison,
         "registration_gate":gate}
 (OUTPUT/"confirmatory_report.json").write_text(json.dumps(report,indent=2,sort_keys=True))
 (store.client.table("verifier_models").update({"metrics_json":report})
- .eq("verifier_id",registration["verifier_id"]).execute())
+ .eq("verifier_id",verifier_id).execute())
 print(json.dumps(report,indent=2))
 print("REGISTERED" if gate["eligible"] else "EXPLORATORY ONLY — gate not met")'''),
 ], "10_confirm_verifier_v2.ipynb")

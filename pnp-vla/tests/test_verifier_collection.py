@@ -6,6 +6,7 @@ from pnp.verifier.collection import (
 
 def test_candidate_group_id_is_stable_and_identity_sensitive():
     a = candidate_group_id("libero", "s", 1, 2, 3)
+    assert a == "db118fe14552782aa0419a80"  # Legacy resume compatibility.
     assert a == candidate_group_id("libero", "s", 1, 2, 3)
     assert a != candidate_group_id("libero", "s", 1, 2, 4)
     assert a != candidate_group_id("libero", "s", 1, 2, 3, namespace="round-2")
@@ -33,6 +34,10 @@ def test_seeded_pro_manifest_is_deterministic_and_split_disjoint():
     assert development.isdisjoint(test)
     assert {row["collection_split"] for row in first["development"]} == {
         "development"}
+    test_suite_counts = {
+        suite: sum(row["suite"] == suite for row in first["confirmatory_test"])
+        for suite in {row["suite"] for row in first["confirmatory_test"]}}
+    assert max(test_suite_counts.values()) - min(test_suite_counts.values()) <= 1
 
 
 def test_manifest_uses_mixed_tasks_and_one_state_per_rollout():
