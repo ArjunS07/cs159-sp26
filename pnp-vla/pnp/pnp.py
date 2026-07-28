@@ -103,7 +103,7 @@ class ProbeResult:
 
 
 def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
-              compute_multimodal: bool = False) -> ProbeResult:
+              compute_multimodal: bool = False, generators=None) -> ProbeResult:
     """Run K predict-and-perturb iterations at fixed noise level s and measure uncertainty.
 
         predict:  a_hat = x - s * v(x, s)
@@ -120,7 +120,13 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         a_hat = x_acc - s * v
         a_hats.append(a_hat[..., :adim])
         a_hats_full.append(a_hat)
-        last_eps = torch.empty_like(x_acc).normal_(generator=gen)   # dedicated stream, not global
+        if generators is None:
+            last_eps = torch.empty_like(x_acc).normal_(generator=gen)
+        else:
+            last_eps = torch.cat([
+                torch.empty_like(x_acc[i:i + 1]).normal_(generator=generators[i])
+                for i in range(x_acc.shape[0])
+            ], dim=0)
         x_acc = (1.0 - s) * a_hat + s * last_eps
 
     A = torch.stack(a_hats, dim=0)                     # (K, B, chunk, adim)
@@ -140,13 +146,33 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         "a_std_vec": a_std.mean(dim=(0, 1)).detach().float().cpu().numpy(),
         "a_mean_vec": A.mean(dim=(0, 1, 2)).detach().float().cpu().numpy(),
     }
+    lane_recs = []
+    for i in range(A.shape[1]):
+        Ai = A[:, i]
+        ui = ((Ai[1:] - Ai[:-1]).abs().mean(dim=0)
+              if Ai.shape[0] >= 2 else torch.zeros_like(Ai[0]))
+        si = Ai.std(dim=0) if Ai.shape[0] >= 2 else torch.zeros_like(Ai[0])
+        lane_recs.append({
+            "s": float(s), "u_mean": float(ui.mean()), "u_max": float(ui.max()),
+            "a_std_mean": float(si.mean()),
+            "u_vec": ui.mean(dim=0).detach().float().cpu().numpy(),
+            "a_std_vec": si.mean(dim=0).detach().float().cpu().numpy(),
+            "a_mean_vec": Ai.mean(dim=(0, 1)).detach().float().cpu().numpy(),
+        })
+        if compute_multimodal and Ai.shape[0] >= 4:
+            bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(
+                Ai.detach().float().cpu().numpy())
+            lane_recs[-1].update(bc_vec=bc_vec, mm_pc1_frac=float(pc1_frac),
+                                 mm_bc_pc1=float(bc_pc1))
     if compute_multimodal and A.shape[0] >= 4:
         bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(A.detach().float().cpu().numpy()[:, 0])
         rec["bc_vec"] = bc_vec
         rec["mm_pc1_frac"] = float(pc1_frac)
         rec["mm_bc_pc1"] = float(bc_pc1)
-    return ProbeResult(a_hats=A, z_hat_full=z_hat_full, x_acc=x_acc,
-                       last_eps=last_eps, s=float(s), rec=rec)
+    result = ProbeResult(a_hats=A, z_hat_full=z_hat_full, x_acc=x_acc,
+                         last_eps=last_eps, s=float(s), rec=rec)
+    result.lane_recs = lane_recs
+    return result
 
 
 def apply_refine(pr: ProbeResult, average: bool) -> torch.Tensor:

@@ -16,6 +16,8 @@ from __future__ import annotations
 from .config import RolloutConfig
 from .pnp import run_probe, apply_refine, PnPRecorder
 from .pcp import apply_correct, CorrectTelemetry
+from .config import PERTURB_SEED_MASK
+import torch
 
 
 class RolloutTap:
@@ -81,7 +83,7 @@ class RolloutTap:
         if self.save_pcp:
             self._pcp_chunks.append({
                 "chunk_idx": len(self._pcp_chunks),
-                "obs_enc": ctx.obs_enc.detach().float().cpu().numpy(),
+                "obs_enc": ctx.obs_enc[0].detach().float().cpu().numpy(),
                 "chunk_pos": ctx.chunk_pos,
                 "steps": list(self._pcp_buf),
             })
@@ -95,3 +97,50 @@ class RolloutTap:
     @property
     def pcp_telemetry(self):
         return self._corr.telemetry() if self._corr is not None else None
+
+
+class BatchedRolloutTap:
+    """Probe/refinement strategy with independent sinks and perturbation RNG per lane."""
+    def __init__(self, config, recorders, seeds, device, adim):
+        self.config, self.recorders, self.adim = config, recorders, adim
+        self.invasive = config.refine
+        self.save_pcp = config.save_pcp_features
+        self.records_uncertainty = config.records_uncertainty or config.compute_multimodal
+        self.pcp_chunks = [[] for _ in recorders]
+        self._pcp_buf = [[] for _ in recorders]
+        self.generators = []
+        for seed in seeds:
+            if isinstance(seed, torch.Generator):
+                self.generators.append(seed)
+                continue
+            gen = torch.Generator(device=torch.device(device))
+            gen.manual_seed(int(seed) ^ PERTURB_SEED_MASK)
+            self.generators.append(gen)
+
+    def selected(self, step, s):
+        return self.config.probe_selected(step, s)
+
+    def step(self, x_t, s, vf, ctx):
+        pr = run_probe(x_t, s, vf, k=self.config.pnp_k, adim=self.config.action_dim,
+                       compute_multimodal=self.config.compute_multimodal,
+                       generators=self.generators)
+        for i, rec in enumerate(pr.lane_recs):
+            rec = dict(rec); rec["step"] = ctx.step
+            if self.config.save_ahats:
+                rec["a_hats"] = pr.a_hats[:, i].detach().float().cpu().numpy()
+            if self.records_uncertainty:
+                ctx.records[i].append(rec)
+            if self.save_pcp:
+                self._pcp_buf[i].append({"step_idx": ctx.step, "s": float(s),
+                    "z_hat": pr.z_hat_full[i, :, :self.adim].detach().float().cpu().numpy()})
+        return apply_refine(pr, self.config.refine_average) if self.config.refine else x_t
+
+    def finish(self, ctx):
+        for i, recorder in enumerate(self.recorders):
+            if self.records_uncertainty:
+                recorder.log_chunk({"num_steps": ctx.num_steps, "steps": ctx.records[i]})
+            if self.save_pcp:
+                self.pcp_chunks[i].append({"chunk_idx": len(self.pcp_chunks[i]),
+                    "obs_enc": ctx.obs_enc[i].detach().float().cpu().numpy(),
+                    "chunk_pos": float(ctx.chunk_positions[i]), "steps": list(self._pcp_buf[i])})
+                self._pcp_buf[i] = []

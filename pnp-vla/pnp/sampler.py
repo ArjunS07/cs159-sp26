@@ -78,6 +78,7 @@ class ChunkContext:
     chunk_pos: float = 0.0       # chunk_idx / est_chunks (set by the rollout engine)
     device: Any = None
     records: list = field(default_factory=list)
+    chunk_positions: Any = None
 
 
 @dataclass
@@ -163,9 +164,13 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
         attention_mask=prefix_att_2d_masks_4d, position_ids=prefix_position_ids,
         past_key_values=None, inputs_embeds=[prefix_embs, None], use_cache=True)
 
+    positions = self._pnp.chunk_pos
     ctx = ChunkContext(num_steps=num_steps, device=device,
-                       obs_enc=prefix_embs.mean(dim=1)[0].detach(),
-                       chunk_pos=float(self._pnp.chunk_pos))
+                       obs_enc=prefix_embs.mean(dim=1).detach(),
+                       chunk_pos=float(positions) if not isinstance(positions, (list, tuple)) else 0.0,
+                       chunk_positions=positions)
+    if hasattr(strat, "recorders"):
+        ctx.records = [[] for _ in range(bsize)]
 
     dt = -1.0 / num_steps
     x_t = noise
