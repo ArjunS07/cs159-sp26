@@ -1,6 +1,6 @@
 from pnp.verifier.collection import (
     build_stratified_manifest, build_targeted_manifests, candidate_group_id,
-    collection_manifest_hash,
+    build_seeded_pro_manifest, collection_manifest_hash,
 )
 
 
@@ -9,6 +9,30 @@ def test_candidate_group_id_is_stable_and_identity_sensitive():
     assert a == candidate_group_id("libero", "s", 1, 2, 3)
     assert a != candidate_group_id("libero", "s", 1, 2, 4)
     assert a != candidate_group_id("libero", "s", 1, 2, 3, namespace="round-2")
+    assert a != candidate_group_id(
+        "libero", "s", 1, 2, 3, trajectory_seed=123)
+
+
+def test_seeded_pro_manifest_is_deterministic_and_split_disjoint():
+    rows = [{
+        "rollout_id": f"r-{episode}", "benchmark": "libero_pro",
+        "suite": f"suite-{episode % 2}", "task_idx": episode % 5,
+        "episode_idx": episode, "chunk_idx": 2, "u_mean": episode,
+        "success": episode % 3 != 0, "uncertainty_stratum": "high",
+    } for episode in range(20)]
+    first = build_seeded_pro_manifest(
+        rows, development_target=24, test_target=16, seed=4)
+    second = build_seeded_pro_manifest(
+        list(reversed(rows)), development_target=24, test_target=16, seed=4)
+    assert first == second
+    development = {(row["suite"], row["task_idx"], row["episode_idx"],
+                    row["trajectory_seed"]) for row in first["development"]}
+    test = {(row["suite"], row["task_idx"], row["episode_idx"],
+             row["trajectory_seed"]) for row in first["confirmatory_test"]}
+    assert len(development) == 24 and len(test) == 16
+    assert development.isdisjoint(test)
+    assert {row["collection_split"] for row in first["development"]} == {
+        "development"}
 
 
 def test_manifest_uses_mixed_tasks_and_one_state_per_rollout():

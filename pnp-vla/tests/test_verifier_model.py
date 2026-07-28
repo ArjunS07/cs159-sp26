@@ -38,6 +38,36 @@ def test_compact_freeze_value_pathway_leaves_only_advantage_trainable():
     ) for parameter in module.parameters())
 
 
+def test_conditioned_architectures_are_candidate_equivariant_and_state_sensitive():
+    torch.manual_seed(7)
+    actions = torch.randn(2, 3, 50, 7)
+    mask = torch.ones(2, 3, 50, dtype=torch.bool)
+    observations = torch.stack([torch.zeros(16), torch.ones(16)])
+    for architecture in ("film", "cross_attention"):
+        model = CompactAdvantageVerifier(
+            obs_dim=16, action_width=32, dropout=0,
+            conditioning=architecture).eval()
+        context = model.encode_context(observations, torch.zeros(2))
+        scores = model.rank_candidates(context, actions, mask, 10)
+        permutation = torch.tensor([2, 0, 1])
+        permuted = model.rank_candidates(
+            context, actions[:, permutation], mask[:, permutation], 10)
+        assert torch.allclose(permuted, scores[:, permutation], atol=1e-6)
+        assert not torch.allclose(scores[0], scores[1])
+
+
+def test_action_only_architecture_is_invariant_to_context():
+    torch.manual_seed(9)
+    model = CompactAdvantageVerifier(
+        obs_dim=16, conditioning="action_only", dropout=0).eval()
+    actions = torch.randn(1, 4, 50, 7).expand(2, -1, -1, -1)
+    mask = torch.ones(2, 4, 50, dtype=torch.bool)
+    context = model.encode_context(
+        torch.stack([torch.zeros(16), torch.ones(16)]), torch.tensor([0., 1.]))
+    scores = model.rank_candidates(context, actions, mask, 10)
+    assert torch.allclose(scores[0], scores[1], atol=1e-6)
+
+
 def test_candidate_metrics_average_pairs_at_the_group_level():
     records = [
         {"group_id": "a", "benchmark": "libero", "uncertainty_stratum": "high",

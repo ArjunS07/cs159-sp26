@@ -39,6 +39,8 @@ class CleanChunkExample:
     candidate_kind: str | None = None
     pairing_mode: str | None = None
     uncertainty_stratum: str | None = None
+    trajectory_seed: int | None = None
+    collection_split: str | None = None
 
     @property
     def task_key(self) -> tuple[str, str, int]:
@@ -232,6 +234,12 @@ def load_candidate_examples(store, experiment="verifier-clean-pairs-v1", *,
                 success=int(bool(row["success"])), candidate_group_id=group_id,
                 candidate_kind=row["candidate_kind"], pairing_mode=group["pairing_mode"],
                 uncertainty_stratum=group.get("uncertainty_stratum"),
+                trajectory_seed=(group.get("trajectory_seed") if group.get("trajectory_seed")
+                                 is not None else (group.get("metadata_json") or {}).get(
+                                     "trajectory_seed")),
+                collection_split=(group.get("collection_split") or
+                                  (group.get("metadata_json") or {}).get(
+                                      "collection_split")),
             ))
         if cache_path is not None:
             temporary = cache_path.with_suffix(".tmp")
@@ -479,7 +487,7 @@ def prefix_action_statistics(examples: Sequence[CleanChunkExample], prefix_lengt
 
 def shuffle_candidate_actions_within_group(examples: Sequence[CleanChunkExample],
                                            seed: int = 42):
-    """Permute action chunks within each state while preserving outcomes and identities."""
+    """Apply a uniformly sampled derangement within each candidate state."""
     rng = np.random.default_rng(seed)
     output = list(examples)
     index_groups = defaultdict(list)
@@ -487,10 +495,15 @@ def shuffle_candidate_actions_within_group(examples: Sequence[CleanChunkExample]
         if example.candidate_group_id:
             index_groups[example.candidate_group_id].append(index)
     for indices in index_groups.values():
-        donors = list(indices)
+        donors = np.asarray(indices)
         if len(donors) > 1:
-            shift = int(rng.integers(1, len(donors)))
-            donors = donors[shift:] + donors[:shift]
+            for _ in range(100):
+                candidate = rng.permutation(donors)
+                if np.all(candidate != donors):
+                    donors = candidate
+                    break
+            else:
+                donors = np.roll(donors, 1)
         for target, donor in zip(indices, donors):
             output[target] = replace(
                 examples[target], actions=examples[donor].actions.copy(),

@@ -35,8 +35,11 @@ def _unwrap_sim(env):
     raise TypeError("environment does not expose a MuJoCo sim")
 
 
-def candidate_group_id(benchmark, suite, task_idx, episode_idx, chunk_idx, *, namespace="") -> str:
-    identity = f"{benchmark}|{suite}|{task_idx}|{episode_idx}|{chunk_idx}"
+def candidate_group_id(benchmark, suite, task_idx, episode_idx, chunk_idx, *, namespace="",
+                       trajectory_seed=None) -> str:
+    identity = (
+        f"{benchmark}|{suite}|{task_idx}|{episode_idx}|{chunk_idx}|"
+        f"trajectory={trajectory_seed if trajectory_seed is not None else 'legacy'}")
     raw = (f"{namespace}|{identity}" if namespace else identity).encode()
     return hashlib.sha256(raw).hexdigest()[:24]
 
@@ -95,6 +98,7 @@ def collection_manifest_hash(rows) -> str:
     fields = (
         "benchmark", "suite", "task_idx", "episode_idx", "rollout_id",
         "chunk_idx", "u_mean", "uncertainty_stratum", "success",
+        "trajectory_seed", "collection_split",
     )
     canonical = [
         {field: row.get(field) for field in fields}
@@ -104,6 +108,62 @@ def collection_manifest_hash(rows) -> str:
     ]
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def build_seeded_pro_manifest(rows, *, development_target=240, test_target=160,
+                              seed=20260728):
+    """Create deterministic, disjoint trajectory-seeded PRO development/test cohorts.
+
+    Source candidate outcomes are used only to balance the development cohort.
+    Test membership is assigned first and is independent of future candidate outcomes.
+    """
+    pro = [dict(row) for row in rows if row.get("benchmark") == "libero_pro"]
+    if not pro:
+        raise ValueError("seeded PRO manifest requires LIBERO-PRO source rows")
+    by_identity = {}
+    for row in pro:
+        identity = (row["suite"], int(row["task_idx"]), int(row["episode_idx"]))
+        previous = by_identity.get(identity)
+        rank = (-float(row.get("u_mean", 0)), int(row["chunk_idx"]), row["rollout_id"])
+        if previous is None or rank < previous[0]:
+            by_identity[identity] = (rank, row)
+    base = [value[1] for value in by_identity.values()]
+    # Multiple deterministic policy-noise trajectories may originate from one
+    # fixed LIBERO initialization. They remain grouped by base identity in CV.
+    expanded = []
+    replicas = max(1, int(np.ceil((development_target + test_target) / len(base))))
+    for replica in range(replicas + 1):
+        for row in base:
+            raw = (f"{seed}|{replica}|{row['suite']}|{row['task_idx']}|"
+                   f"{row['episode_idx']}").encode()
+            trajectory_seed = int(hashlib.sha256(raw).hexdigest()[:8], 16)
+            expanded.append({**row, "trajectory_seed": trajectory_seed})
+    expanded.sort(key=lambda row: hashlib.sha256(
+        f"{seed}|test|{row['suite']}|{row['task_idx']}|{row['episode_idx']}|"
+        f"{row['trajectory_seed']}".encode()).hexdigest())
+    test = [{**row, "collection_split": "confirmatory_test"}
+            for row in expanded[:test_target]]
+    test_keys = {(row["suite"], row["task_idx"], row["episode_idx"],
+                  row["trajectory_seed"]) for row in test}
+    available = [row for row in expanded if (
+        row["suite"], row["task_idx"], row["episode_idx"], row["trajectory_seed"]
+    ) not in test_keys]
+    # Interleave source failures and successes, then suites, to avoid an easy cohort.
+    buckets = defaultdict(list)
+    for row in available:
+        buckets[(row["suite"], bool(row.get("success")))].append(row)
+    for key in buckets:
+        buckets[key].sort(key=lambda row: hashlib.sha256(
+            f"{seed}|development|{row['trajectory_seed']}".encode()).hexdigest())
+    development = []
+    while len(development) < development_target and any(buckets.values()):
+        for key in sorted(buckets, key=str):
+            if buckets[key] and len(development) < development_target:
+                development.append({**buckets[key].pop(),
+                                    "collection_split": "development"})
+    if len(development) != development_target or len(test) != test_target:
+        raise ValueError("insufficient source identities for requested seeded PRO manifest")
+    return {"development": development, "confirmatory_test": test}
 
 
 def build_targeted_manifests(
@@ -288,7 +348,11 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                                    chunk_idx: int, uncertainty_stratum: str,
                                    prefix_length: int = 10, candidate_count: int = 4,
                                    experiment: str = "verifier-clean-pairs-v3",
-                                   state_atol: float = 1e-6):
+                                   state_atol: float = 1e-6,
+                                   trajectory_seed: int | None = None,
+                                   collection_split: str = "development",
+                                   manifest_hash: str = "",
+                                   model_revision: str = ""):
     """Collect candidates at a mid-rollout state by deterministic action replay.
 
     Unlike simulator snapshots, replay reconstructs wrapper state, contacts, and
@@ -296,7 +360,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
     once at the canonical replay state; each outcome branch independently
     replays the exact same environment-space action prefix before intervention.
     """
-    seed = episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
+    seed = (int(trajectory_seed) if trajectory_seed is not None else
+            episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0))))
     obs = _reset_and_replay_actions(env, ep, policy, [])
     replay_actions = []
     steps = 0
@@ -334,7 +399,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
 
     group_id = candidate_group_id(
         ep.get("benchmark", "libero"), ep["suite"], ep["task_idx"],
-        ep.get("ep_idx", ep.get("episode_idx", 0)), chunk_idx, namespace=experiment)
+        ep.get("ep_idx", ep.get("episode_idx", 0)), chunk_idx, namespace=experiment,
+        trajectory_seed=trajectory_seed)
     candidates, replay_state_errors = [], []
     for kind in policy_chunks:
         branch_obs = _reset_and_replay_actions(env, ep, policy, replay_actions)
@@ -386,6 +452,10 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         "chunk_idx": chunk_idx, "uncertainty_stratum": uncertainty_stratum,
         "pairing_mode": "deterministic_replay", "prefix_length": prefix_length,
         "snapshot_validated": False,
+        "trajectory_seed": trajectory_seed,
+        "collection_split": collection_split,
+        "manifest_hash": manifest_hash,
+        "model_revision": model_revision,
         "metadata_json": {
                           "replay_validated": not any(
                               error > state_atol for error in replay_state_errors),
@@ -399,6 +469,11 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                           "replay_state_max_abs_before_correction": max(
                               replay_state_errors, default=0.0),
                           "replay_action_count": len(replay_actions),
-                          "chunk_position": float(policy.model._pnp.chunk_pos)},
+                          "chunk_position": float(policy.model._pnp.chunk_pos),
+                          "trajectory_seed": trajectory_seed,
+                          "collection_split": collection_split,
+                          "collection_manifest_hash": manifest_hash,
+                          "model_revision": model_revision,
+                          "candidate_count": candidate_count},
     }
     return group, candidates

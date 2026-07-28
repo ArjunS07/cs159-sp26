@@ -29,6 +29,7 @@ class AdvantageTrainConfig:
     patience: int = 20
     candidate_bce_weight: float = 0.0
     zero_context: bool = False
+    context_lr_multiplier: float = 0.1
 
 
 class CleanChunkDataset(Dataset):
@@ -140,7 +141,7 @@ def pretrain_value(model, train_examples, val_examples, device, *, config=None,
     model.to(device)
     optimizer = torch.optim.AdamW(
         _value_parameters(model), lr=config.value_lr, weight_decay=config.weight_decay)
-    best_score, best_state, bad = -float("inf"), None, 0
+    best_score, best_state, best_epoch, bad = -float("inf"), None, None, 0
     for epoch in range(config.value_epochs):
         model.train()
         losses = []
@@ -164,7 +165,8 @@ def pretrain_value(model, train_examples, val_examples, device, *, config=None,
                 **{f"value/val_{key}": value for key, value in metrics.items()},
             })
         if score > best_score:
-            best_score, best_state, bad = score, copy.deepcopy(model.state_dict()), 0
+            best_score, best_state, best_epoch, bad = (
+                score, copy.deepcopy(model.state_dict()), epoch, 0)
         else:
             bad += 1
         if bad >= config.patience:
@@ -173,6 +175,7 @@ def pretrain_value(model, train_examples, val_examples, device, *, config=None,
         model.load_state_dict(best_state)
     return model, {
         "best_value_task_macro_pr_auc": best_score,
+        "best_value_epoch": best_epoch,
         "value_epochs_ran": epoch + 1,
     }
 
@@ -301,6 +304,39 @@ def summarize_candidate_records(records, *, seed=42, n_bootstrap=10_000):
     return metrics
 
 
+def paired_candidate_comparison(conditioned_records, control_records, *, seed=42,
+                                n_bootstrap=10_000):
+    """Cluster-bootstrap conditioned-minus-control differences by state group."""
+    control = {row["group_id"]: row for row in control_records}
+    paired = [(row, control[row["group_id"]]) for row in conditioned_records
+              if row["group_id"] in control]
+    rank_differences = [a["pair_accuracy"] - b["pair_accuracy"] for a, b in paired
+                        if np.isfinite(a["pair_accuracy"]) and
+                        np.isfinite(b["pair_accuracy"])]
+    top1_differences = [a["top1"] - b["top1"] for a, b in paired]
+    return {
+        "n_paired_groups": len(paired),
+        "ranking_gap": float(np.mean(rank_differences)) if rank_differences else float("nan"),
+        "ranking_gap_ci95": _bootstrap_interval(
+            rank_differences, seed, n_bootstrap),
+        "top1_gap": float(np.mean(top1_differences)) if top1_differences else float("nan"),
+        "top1_gap_ci95": _bootstrap_interval(
+            top1_differences, seed + 1, n_bootstrap),
+    }
+
+
+def verifier_registration_eligibility(metrics, action_control_comparison,
+                                      shuffled_control_comparison):
+    """Apply the predeclared V2 causal-selection registration gate."""
+    checks = {
+        "ranking_above_chance": metrics["ranking_accuracy_ci95"][0] > .5,
+        "positive_default_uplift": metrics["top1_uplift_default_ci95"][0] > 0,
+        "beats_action_only": action_control_comparison["ranking_gap_ci95"][0] > 0,
+        "beats_shuffled_actions": shuffled_control_comparison["ranking_gap_ci95"][0] > 0,
+    }
+    return {"eligible": all(checks.values()), "checks": checks}
+
+
 def evaluate_candidate_ranker(model, examples, device, *, config=None,
                               n_bootstrap=10_000, return_records=False):
     """Evaluate independent state groups; correlated pairs are averaged within group."""
@@ -319,9 +355,16 @@ def train_advantage(model, train_examples, val_examples, device, *, config=None,
     np.random.seed(config.seed)
     model.to(device)
     model.freeze_value_pathway()
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    context_parameters = list(model.context_rank.parameters())
+    context_ids = {id(parameter) for parameter in context_parameters}
+    action_parameters = [parameter for parameter in model.parameters()
+                         if parameter.requires_grad and id(parameter) not in context_ids]
+    parameters = action_parameters + context_parameters
     optimizer = torch.optim.AdamW(
-        parameters, lr=config.rank_lr, weight_decay=config.weight_decay)
+        [{"params": action_parameters, "lr": config.rank_lr},
+         {"params": context_parameters,
+          "lr": config.rank_lr * config.context_lr_multiplier}],
+        weight_decay=config.weight_decay)
     groups = _group_examples(train_examples)
     discordant_groups = sum(
         len({member.success for member in members}) > 1
@@ -329,7 +372,8 @@ def train_advantage(model, train_examples, val_examples, device, *, config=None,
     if not discordant_groups and config.candidate_bce_weight <= 0:
         raise ValueError("rank-only training requires at least one discordant candidate group")
     use_validation = bool(val_examples)
-    best_score, best_state, bad = -float("inf"), None, 0
+    best_score, best_state, best_epoch, bad = -float("inf"), None, None, 0
+    history = []
     rng = np.random.default_rng(config.seed)
     for epoch in range(config.rank_epochs):
         model.train()
@@ -351,7 +395,7 @@ def train_advantage(model, train_examples, val_examples, device, *, config=None,
                 loss = loss + config.candidate_bce_weight * bce
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0)
             optimizer.step()
             losses.append(float(loss.detach()))
         metrics = (evaluate_candidate_ranker(
@@ -365,9 +409,16 @@ def train_advantage(model, train_examples, val_examples, device, *, config=None,
                 **{f"rank/val_{key}": value for key, value in metrics.items()
                    if not isinstance(value, dict)},
             })
+        history.append({
+            "epoch": epoch,
+            "train_loss": float(np.mean(losses)) if losses else float("nan"),
+            "validation_ranking": score,
+            "gradient_norm": float(grad_norm) if losses else float("nan"),
+        })
         if use_validation:
             if np.isfinite(score) and score > best_score:
-                best_score, best_state, bad = score, copy.deepcopy(model.state_dict()), 0
+                best_score, best_state, best_epoch, bad = (
+                    score, copy.deepcopy(model.state_dict()), epoch, 0)
             else:
                 bad += 1
             if bad >= config.patience:
@@ -377,7 +428,9 @@ def train_advantage(model, train_examples, val_examples, device, *, config=None,
     return model, {
         "best_group_macro_ranking_accuracy": (
             best_score if use_validation else None),
+        "best_rank_epoch": best_epoch,
         "rank_epochs_ran": epoch + 1,
+        "rank_history": history,
         "train_config": asdict(config),
     }
 
@@ -394,6 +447,7 @@ def dataset_hash(examples):
             example.chunk_idx, example.chunk_position, example.success,
             example.candidate_group_id or "", example.candidate_kind or "",
             example.pairing_mode or "", example.uncertainty_stratum or "",
+            example.trajectory_seed, example.collection_split or "",
         )
         digest.update(repr(metadata).encode())
         for array in (example.obs_enc, example.actions, example.action_mask):
