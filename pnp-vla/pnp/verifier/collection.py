@@ -128,39 +128,35 @@ def build_seeded_pro_manifest(rows, *, development_target=240, test_target=160,
         if previous is None or rank < previous[0]:
             by_identity[identity] = (rank, row)
     base = [value[1] for value in by_identity.values()]
-    # Multiple deterministic policy-noise trajectories may originate from one
-    # fixed LIBERO initialization. They remain grouped by base identity in CV.
-    expanded = []
-    replicas = max(1, int(np.ceil((development_target + test_target) / len(base))))
-    for replica in range(replicas + 1):
-        for row in base:
-            raw = (f"{seed}|{replica}|{row['suite']}|{row['task_idx']}|"
-                   f"{row['episode_idx']}").encode()
-            trajectory_seed = int(hashlib.sha256(raw).hexdigest()[:8], 16)
-            expanded.append({**row, "trajectory_seed": trajectory_seed})
-    expanded.sort(key=lambda row: hashlib.sha256(
-        f"{seed}|test|{row['suite']}|{row['task_idx']}|{row['episode_idx']}|"
-        f"{row['trajectory_seed']}".encode()).hexdigest())
-    test = [{**row, "collection_split": "confirmatory_test"}
-            for row in expanded[:test_target]]
-    test_keys = {(row["suite"], row["task_idx"], row["episode_idx"],
-                  row["trajectory_seed"]) for row in test}
-    available = [row for row in expanded if (
-        row["suite"], row["task_idx"], row["episode_idx"], row["trajectory_seed"]
-    ) not in test_keys]
+    if len(base) < development_target + test_target:
+        raise ValueError(
+            "seeded PRO manifest requires one distinct base identity per requested group")
+
+    def with_seed(row, split):
+        raw = (f"{seed}|{split}|{row['suite']}|{row['task_idx']}|"
+               f"{row['episode_idx']}").encode()
+        return {**row,
+                "trajectory_seed": int(hashlib.sha256(raw).hexdigest()[:8], 16),
+                "collection_split": split}
+
+    base.sort(key=lambda row: hashlib.sha256(
+        f"{seed}|test|{row['suite']}|{row['task_idx']}|{row['episode_idx']}".encode()
+    ).hexdigest())
+    test = [with_seed(row, "confirmatory_test") for row in base[:test_target]]
+    available = base[test_target:]
     # Interleave source failures and successes, then suites, to avoid an easy cohort.
     buckets = defaultdict(list)
     for row in available:
         buckets[(row["suite"], bool(row.get("success")))].append(row)
     for key in buckets:
         buckets[key].sort(key=lambda row: hashlib.sha256(
-            f"{seed}|development|{row['trajectory_seed']}".encode()).hexdigest())
+            f"{seed}|development|{row['suite']}|{row['task_idx']}|"
+            f"{row['episode_idx']}".encode()).hexdigest())
     development = []
     while len(development) < development_target and any(buckets.values()):
         for key in sorted(buckets, key=str):
             if buckets[key] and len(development) < development_target:
-                development.append({**buckets[key].pop(),
-                                    "collection_split": "development"})
+                development.append(with_seed(buckets[key].pop(), "development"))
     if len(development) != development_target or len(test) != test_target:
         raise ValueError("insufficient source identities for requested seeded PRO manifest")
     return {"development": development, "confirmatory_test": test}

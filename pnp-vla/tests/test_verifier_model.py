@@ -4,7 +4,8 @@ import torch
 from pnp.verifier.data import CleanChunkExample
 from pnp.verifier.model import CompactAdvantageVerifier
 from pnp.verifier.train import (
-    AdvantageTrainConfig, _loader, dataset_hash, summarize_candidate_records,
+    AdvantageTrainConfig, _loader, dataset_hash, paired_candidate_comparison,
+    summarize_candidate_records, train_advantage, verifier_registration_eligibility,
 )
 
 
@@ -113,3 +114,39 @@ def test_dataset_hash_detects_label_and_artifact_changes():
         **example.__dict__, "actions": np.ones((50, 7), np.float32)})
     assert dataset_hash([example]) != dataset_hash([changed_label])
     assert dataset_hash([example]) != dataset_hash([changed_actions])
+
+
+def test_rank_training_restores_and_reports_the_best_epoch():
+    examples = []
+    for group in range(4):
+        for candidate, success in enumerate((0, 1)):
+            actions = np.zeros((50, 7), np.float32)
+            actions[:10, 0] = success * 2 - 1
+            examples.append(CleanChunkExample(
+                rollout_id=f"g{group}-c{candidate}", experiment="synthetic",
+                benchmark="libero", suite="s", task_idx=0, episode_idx=group,
+                chunk_idx=0, chunk_position=0, obs_enc=np.full(16, group, np.float32),
+                actions=actions, action_mask=np.ones(50, bool), success=success,
+                candidate_group_id=f"g{group}",
+                candidate_kind="default" if candidate == 0 else "fresh_noise_1"))
+    model = CompactAdvantageVerifier(obs_dim=16, dropout=0, conditioning="film")
+    config = AdvantageTrainConfig(
+        rank_epochs=3, patience=2, rank_lr=1e-3, batch_rollouts=4)
+    _, metadata = train_advantage(
+        model, examples[:6], examples[6:], torch.device("cpu"), config=config)
+    assert metadata["best_rank_epoch"] is not None
+    assert 0 <= metadata["best_rank_epoch"] < metadata["rank_epochs_ran"]
+    assert len(metadata["rank_history"]) == metadata["rank_epochs_ran"]
+
+
+def test_paired_registration_gate_requires_all_four_signals():
+    selected = [{"group_id": f"g{i}", "pair_accuracy": 1., "top1": 1.}
+                for i in range(5)]
+    control = [{"group_id": f"g{i}", "pair_accuracy": 0., "top1": 0.}
+               for i in range(5)]
+    comparison = paired_candidate_comparison(
+        selected, control, n_bootstrap=100)
+    metrics = {"ranking_accuracy_ci95": [.7, 1.],
+               "top1_uplift_default_ci95": [.1, .5]}
+    gate = verifier_registration_eligibility(metrics, comparison, comparison)
+    assert gate["eligible"]

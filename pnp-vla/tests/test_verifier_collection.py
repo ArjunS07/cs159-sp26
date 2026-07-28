@@ -19,7 +19,7 @@ def test_seeded_pro_manifest_is_deterministic_and_split_disjoint():
         "suite": f"suite-{episode % 2}", "task_idx": episode % 5,
         "episode_idx": episode, "chunk_idx": 2, "u_mean": episode,
         "success": episode % 3 != 0, "uncertainty_stratum": "high",
-    } for episode in range(20)]
+    } for episode in range(50)]
     first = build_seeded_pro_manifest(
         rows, development_target=24, test_target=16, seed=4)
     second = build_seeded_pro_manifest(
