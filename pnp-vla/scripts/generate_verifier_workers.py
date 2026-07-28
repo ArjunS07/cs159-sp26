@@ -9,8 +9,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-DEFAULT_SOURCE = ROOT / "notebooks" / "04_collect_verifier_pairs.ipynb"
-DEFAULT_OUTPUT = ROOT / "notebooks" / "workers"
+DEFAULT_SOURCE = ROOT / "notebooks" / "archive" / "verifier_v1" / "04_collect_verifier_pairs.ipynb"
+DEFAULT_OUTPUT = ROOT / "notebooks" / "archive" / "verifier_v1" / "workers"
 
 
 def _patch_worker(master: dict, shard_count: int, shard_index: int, *,

@@ -1113,12 +1113,14 @@ print(json.dumps(report, indent=2))'''),
 
 
 def main():
+    archive = ROOT / "notebooks" / "archive" / "verifier_v1"
+    archive.mkdir(parents=True, exist_ok=True)
     outputs = {
-        ROOT / "notebooks" / "03_verifier_experiments.ipynb": notebook(EXPERIMENT_CELLS),
-        ROOT / "notebooks" / "04_collect_verifier_pairs.ipynb": notebook(COLLECTION_CELLS),
-        ROOT / "notebooks" / "05_collect_targeted_verifier_groups.ipynb": notebook(
+        archive / "03_verifier_experiments.ipynb": notebook(EXPERIMENT_CELLS),
+        archive / "04_collect_verifier_pairs.ipynb": notebook(COLLECTION_CELLS),
+        archive / "05_collect_targeted_verifier_groups.ipynb": notebook(
             TARGETED_COLLECTION_CELLS),
-        ROOT / "notebooks" / "06_evaluate_online_verifier_selection.ipynb": notebook(
+        archive / "06_evaluate_online_verifier_selection.ipynb": notebook(
             ONLINE_EVALUATION_CELLS),
     }
     for path, value in outputs.items():
@@ -1127,14 +1129,14 @@ def main():
     # Keep upload-ready worker copies synchronized with the canonical notebook.
     from generate_verifier_workers import generate_workers
     generate_workers(
-        ROOT / "notebooks" / "04_collect_verifier_pairs.ipynb",
-        ROOT / "notebooks" / "workers",
+        archive / "04_collect_verifier_pairs.ipynb",
+        archive / "workers",
         shard_count=3,
         worker_prefix="04_verifier_pairs_worker",
     )
     generate_workers(
-        ROOT / "notebooks" / "05_collect_targeted_verifier_groups.ipynb",
-        ROOT / "notebooks" / "workers",
+        archive / "05_collect_targeted_verifier_groups.ipynb",
+        archive / "workers",
         shard_count=3,
         worker_prefix="05_targeted_verifier_worker",
     )

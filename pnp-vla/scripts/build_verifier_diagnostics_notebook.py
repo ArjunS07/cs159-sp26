@@ -247,7 +247,8 @@ display(curve); print(json.dumps(diagnosis, indent=2))'''),
 
 
 def main():
-    path = ROOT / "notebooks" / "07_verifier_training_diagnostics.ipynb"
+    path = (ROOT / "notebooks" / "archive" / "verifier_v1" /
+            "07_verifier_training_diagnostics.ipynb")
     path.write_text(json.dumps(notebook(CELLS), indent=1) + "\n")
     print(path)
 
