@@ -41,6 +41,9 @@ class CleanChunkExample:
     uncertainty_stratum: str | None = None
     trajectory_seed: int | None = None
     collection_split: str | None = None
+    n_steps: int | None = None
+    replay_action_count: int | None = None
+    return_target: float | None = None
 
     @property
     def task_key(self) -> tuple[str, str, int]:
@@ -49,8 +52,34 @@ class CleanChunkExample:
 
 ROLLOUT_COLUMNS = (
     "rollout_id,experiment,benchmark,suite,task_idx,episode_idx,success,"
-    "pcp_chunks_path,trajectory_path,status"
+    "n_steps,pcp_chunks_path,trajectory_path,status"
 )
+
+
+@dataclass
+class ChunkTransitionExample:
+    """One policy-decision transition with matching long and short actions."""
+
+    rollout_id: str
+    experiment: str
+    benchmark: str
+    suite: str
+    task_idx: int
+    episode_idx: int
+    chunk_idx: int
+    chunk_position: float
+    obs_enc: np.ndarray
+    next_obs_enc: np.ndarray
+    actions: np.ndarray
+    action_mask: np.ndarray
+    reward: float
+    discount: float
+    terminal: bool
+    return_target: float
+
+    @property
+    def task_key(self) -> tuple[str, str, int]:
+        return self.benchmark, self.suite, self.task_idx
 
 
 def _download_with_retry(store, path: str, attempts: int = 5):
@@ -112,6 +141,55 @@ def build_clean_chunk_examples(row: dict, pcp_frame, trajectory: dict, *,
     return out
 
 
+def build_chunk_transitions(row: dict, pcp_frame, trajectory: dict, *,
+                            horizon: int = 50, action_dim: int = 7,
+                            gamma: float = 0.999) -> list[ChunkTransitionExample]:
+    """Align consecutive decision embeddings with the actions executed between them."""
+    actions = np.asarray(trajectory["actions"], dtype=np.float32)[:, :action_dim]
+    observations = {}
+    positions = {}
+    for chunk_idx, group in pcp_frame.groupby("chunk_idx", sort=True):
+        first = group.iloc[0]
+        observations[int(chunk_idx)] = np.asarray(
+            first["obs_enc"], dtype=np.float32).reshape(-1)
+        positions[int(chunk_idx)] = float(first["chunk_pos"])
+    ordered = sorted(observations)
+    out = []
+    for offset, chunk_idx in enumerate(ordered):
+        start = chunk_idx * horizon
+        stop = min(start + horizon, len(actions))
+        if start >= stop:
+            continue
+        is_last = offset == len(ordered) - 1
+        next_idx = ordered[offset + 1] if not is_last else None
+        # A nonterminal transition must span exactly one policy decision.
+        if next_idx is not None and next_idx != chunk_idx + 1:
+            continue
+        n_actions = stop - start
+        padded = np.zeros((horizon, action_dim), dtype=np.float32)
+        mask = np.zeros(horizon, dtype=np.bool_)
+        padded[:n_actions] = actions[start:stop]
+        mask[:n_actions] = True
+        terminal = next_idx is None
+        success = bool(row["success"])
+        remaining = max(len(actions) - start, 1)
+        out.append(ChunkTransitionExample(
+            rollout_id=row["rollout_id"], experiment=row["experiment"],
+            benchmark=row["benchmark"], suite=row["suite"],
+            task_idx=int(row["task_idx"]), episode_idx=int(row["episode_idx"]),
+            chunk_idx=chunk_idx, chunk_position=positions[chunk_idx],
+            obs_enc=observations[chunk_idx],
+            next_obs_enc=(observations[next_idx] if next_idx is not None
+                          else np.zeros_like(observations[chunk_idx])),
+            actions=padded, action_mask=mask,
+            reward=float(success and terminal),
+            discount=0.0 if terminal else float(gamma ** n_actions),
+            terminal=terminal,
+            return_target=float(success) * float(gamma ** (remaining - 1)),
+        ))
+    return out
+
+
 def load_clean_chunk_examples(store, experiments: Sequence[str], *, horizon: int = 50,
                               action_dim: int = 7, progress=None,
                               cache_dir: str | Path | None = None
@@ -138,6 +216,42 @@ def load_clean_chunk_examples(store, experiments: Sequence[str], *, horizon: int
                 _download_with_retry(store, row["trajectory_path"]))) as trajectory:
             rollout_examples = build_clean_chunk_examples(
                 row, pcp, trajectory, horizon=horizon, action_dim=action_dim)
+        if cache_path is not None:
+            temporary = cache_path.with_suffix(".tmp")
+            with temporary.open("wb") as handle:
+                pickle.dump(rollout_examples, handle)
+            temporary.replace(cache_path)
+        examples.extend(rollout_examples)
+    return examples
+
+
+def load_chunk_transitions(store, experiments: Sequence[str], *, horizon: int = 50,
+                           action_dim: int = 7, gamma: float = 0.999,
+                           progress=None, cache_dir: str | Path | None = None
+                           ) -> list[ChunkTransitionExample]:
+    """Download historical artifacts and reconstruct policy-decision transitions."""
+    import pandas as pd
+
+    rows = _paged_rollouts(store, tuple(experiments))
+    iterator = progress(rows) if progress else rows
+    cache_dir = Path(cache_dir) if cache_dir is not None else None
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    examples = []
+    for row in iterator:
+        cache_path = (cache_dir / f"{row['rollout_id']}.pkl"
+                      if cache_dir is not None else None)
+        if cache_path is not None and cache_path.exists():
+            with cache_path.open("rb") as handle:
+                examples.extend(pickle.load(handle))
+            continue
+        pcp = pd.read_parquet(io.BytesIO(
+            _download_with_retry(store, row["pcp_chunks_path"])))
+        with np.load(io.BytesIO(
+                _download_with_retry(store, row["trajectory_path"]))) as trajectory:
+            rollout_examples = build_chunk_transitions(
+                row, pcp, trajectory, horizon=horizon, action_dim=action_dim,
+                gamma=gamma)
         if cache_path is not None:
             temporary = cache_path.with_suffix(".tmp")
             with temporary.open("wb") as handle:
@@ -240,6 +354,14 @@ def load_candidate_examples(store, experiment="verifier-clean-pairs-v1", *,
                 collection_split=(group.get("collection_split") or
                                   (group.get("metadata_json") or {}).get(
                                       "collection_split")),
+                n_steps=(int(row["n_steps"]) if row.get("n_steps") is not None else None),
+                replay_action_count=int((group.get("metadata_json") or {}).get(
+                    "replay_action_count", 0)),
+                return_target=(
+                    float(bool(row["success"])) * .999 ** max(
+                        int(row["n_steps"]) - int((group.get("metadata_json") or {}).get(
+                            "replay_action_count", 0)) - 1, 0)
+                    if row.get("n_steps") is not None else float(bool(row["success"]))),
             ))
         if cache_path is not None:
             temporary = cache_path.with_suffix(".tmp")

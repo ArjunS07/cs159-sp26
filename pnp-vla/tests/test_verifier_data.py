@@ -2,7 +2,7 @@ import numpy as np
 from dataclasses import replace
 
 from pnp.verifier.data import (
-    CleanChunkExample, build_clean_chunk_examples, candidate_cv_splits,
+    CleanChunkExample, build_chunk_transitions, build_clean_chunk_examples, candidate_cv_splits,
     exclude_candidate_identities, known_task_split, locked_candidate_split, select_examples,
     shuffle_candidate_actions_within_group, validate_candidate_groups,
 )
@@ -31,6 +31,27 @@ def test_build_clean_chunks_preserves_terminal_partial_mask():
     assert examples[0].action_mask.sum() == 50
     assert examples[1].action_mask.sum() == 10
     assert np.all(examples[1].actions[10:] == 0)
+
+
+def test_build_chunk_transitions_has_td_and_monte_carlo_targets():
+    import pandas as pd
+
+    row = {"rollout_id": "r", "experiment": "e", "benchmark": "libero", "suite": "s",
+           "task_idx": 0, "episode_idx": 0, "success": True}
+    frame = pd.DataFrame([
+        {"chunk_idx": 0, "chunk_pos": 0.0, "obs_enc": [1.0] * 8},
+        {"chunk_idx": 1, "chunk_pos": 0.5, "obs_enc": [2.0] * 8},
+    ])
+    trajectory = {"actions": np.ones((60, 7), dtype=np.float32)}
+    transitions = build_chunk_transitions(row, frame, trajectory, gamma=.9)
+    assert len(transitions) == 2
+    assert transitions[0].reward == 0
+    assert np.isclose(transitions[0].discount, .9 ** 50)
+    assert np.array_equal(transitions[0].next_obs_enc, np.full(8, 2, np.float32))
+    assert transitions[1].terminal and transitions[1].reward == 1
+    assert transitions[1].discount == 0 and transitions[1].action_mask.sum() == 10
+    assert np.isclose(transitions[0].return_target, .9 ** 59)
+    assert np.isclose(transitions[1].return_target, .9 ** 9)
 
 
 def test_known_split_keeps_rollout_chunks_together_and_disjoint():

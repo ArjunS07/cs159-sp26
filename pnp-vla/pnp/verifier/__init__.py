@@ -1,7 +1,9 @@
 """Clean-action verifier models, datasets, training, and paired collection helpers."""
 
 from .data import (
+    ChunkTransitionExample,
     CleanChunkExample,
+    build_chunk_transitions,
     build_clean_chunk_examples,
     candidate_cv_splits,
     candidate_episode_identities,
@@ -9,12 +11,22 @@ from .data import (
     exclude_episode_identities,
     known_task_split,
     load_clean_chunk_examples,
+    load_chunk_transitions,
     load_candidate_examples,
     locked_candidate_split,
     prefix_action_statistics,
     select_examples,
     shuffle_candidate_actions_within_group,
     validate_candidate_groups,
+)
+from .critic import HybridChunkCritic
+from .critic_train import (
+    HybridCriticTrainConfig,
+    evaluate_long_critic,
+    hybrid_checkpoint_bytes,
+    train_long_critic,
+    train_short_critic,
+    transition_dataset_hash,
 )
 from .model import (
     CompactAdvantageVerifier,
@@ -46,10 +58,14 @@ from .train import (
 
 __all__ = [
     "CleanChunkExample",
+    "ChunkTransitionExample",
+    "HybridChunkCritic",
+    "HybridCriticTrainConfig",
     "CompactAdvantageVerifier",
     "VerifierOutput",
     "AdvantageTrainConfig",
     "build_clean_chunk_examples",
+    "build_chunk_transitions",
     "candidate_cv_splits",
     "candidate_episode_identities",
     "evaluate_candidate_ranker",
@@ -59,6 +75,7 @@ __all__ = [
     "dataset_hash",
     "known_task_split",
     "load_clean_chunk_examples",
+    "load_chunk_transitions",
     "load_candidate_examples",
     "locked_candidate_split",
     "new_verifier_id",
@@ -80,4 +97,9 @@ __all__ = [
     "collect_replay_candidate_group",
     "postprocess_chunk",
     "predict_clean_chunk",
+    "evaluate_long_critic",
+    "hybrid_checkpoint_bytes",
+    "train_long_critic",
+    "train_short_critic",
+    "transition_dataset_hash",
 ]
