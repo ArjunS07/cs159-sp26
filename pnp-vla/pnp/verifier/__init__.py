@@ -44,6 +44,7 @@ from .collection import (
 )
 from .train import (
     AdvantageTrainConfig,
+    aggregate_candidate_records,
     evaluate_candidate_ranker,
     candidate_rank_records,
     dataset_hash,
@@ -64,6 +65,7 @@ __all__ = [
     "CompactAdvantageVerifier",
     "VerifierOutput",
     "AdvantageTrainConfig",
+    "aggregate_candidate_records",
     "build_clean_chunk_examples",
     "build_chunk_transitions",
     "candidate_cv_splits",

@@ -252,9 +252,13 @@ development=existing_development+new_development
 audit=validate_candidate_groups(development)
 assert audit["discordant_groups"] >= 100, audit
 # Seal IDs only. Do not query verifier_candidates for this experiment here.
-sealed=(store.client.table("verifier_candidate_groups").select("candidate_group_id")
+sealed=(store.client.table("verifier_candidate_groups").select(
+        "candidate_group_id,benchmark,suite,task_idx,episode_idx")
         .eq("experiment", CONFIRMATORY).execute().data or [])
 assert len(sealed) >= 120, len(sealed)
+sealed_identities={(row["benchmark"],row["suite"],int(row["task_idx"]),
+                    int(row["episode_idx"])) for row in sealed}
+historical=exclude_episode_identities(historical,sealed_identities)
 folds=candidate_cv_splits(development, [e.rollout_id for e in development], N_FOLDS, 42)
 print({"historical_chunks":len(historical), "development":audit,
        "new_PRO_development":new_audit,
@@ -376,6 +380,18 @@ if os.getenv("WANDB_API_KEY"):
 print(stage2_summary); print("selected",selected)'''),
     md("## 6. Final refits and single checkpoint bundle"),
     code(r'''selected_spec=spec_by_name[selected]
+selected_records=aggregate_candidate_records(pooled[selected])
+action_records=aggregate_candidate_records(pooled[ACTION["name"]])
+shuffled_records=aggregate_candidate_records(pooled[SHUFFLED["name"]])
+development_metrics=summarize_candidate_records(selected_records)
+action_comparison=paired_candidate_comparison(
+    selected_records,action_records,n_bootstrap=2000)
+shuffled_comparison=paired_candidate_comparison(
+    selected_records,shuffled_records,seed=43,n_bootstrap=2000)
+development_gate=verifier_registration_eligibility(
+    development_metrics,action_comparison,shuffled_comparison)
+development_report={"metrics":development_metrics,"vs_action_only":action_comparison,
+                    "vs_shuffled_actions":shuffled_comparison,"gate":development_gate}
 epoch_by_name={name:max(1,int(rows.best_epoch.median())+1)
                for name,rows in stage2.groupby("name")}
 final_epochs=epoch_by_name[selected]
@@ -402,17 +418,25 @@ bundle={"model":selected_model.state_dict(),"controls":{
     "action_only":{"model":action_model.state_dict(),"spec":ACTION},
     "shuffled_actions":{"model":shuffled_model.state_dict(),"spec":SHUFFLED}},
     "metadata":{"selected_spec":selected_spec,"final_rank_epochs":final_epochs,
+                "parameter_count":sum(p.numel() for p in selected_model.parameters()),
+                "development_report":development_report,
+                "development_records":selected_records,
+                "action_control_records":action_records,
+                "shuffled_control_records":shuffled_records,
                 "stage2_summary":stage2_summary.reset_index().to_dict("records")}}
 import io
 buffer=io.BytesIO(); torch.save(bundle,buffer)
 verifier_id=new_verifier_id()
 store.start_run("verifier_train","libero+libero_pro","state-conditioned-verifier-v2",
-                config=bundle["metadata"])
+                config={"selected_spec":selected_spec,
+                        "final_rank_epochs":final_epochs,
+                        "development_gate":development_gate})
 store.register_verifier(verifier_id,buffer.getvalue(),{
     "model_class":"CompactAdvantageVerifier","obs_dim":2048,"action_dim":7,
     "horizon":50,"prefix_length":10,"architecture":selected_spec["architecture"],
     "action_width":64,"dropout":selected_spec["dropout"]},
-    {"development_stage2":stage2_summary.reset_index().to_dict("records")},
+    {"development_stage2":stage2_summary.reset_index().to_dict("records"),
+     "development_report":development_report},
     {"folds":folds,"sealed_confirmatory_group_ids":sorted(
         row["candidate_group_id"] for row in sealed)},dataset_hash=dataset_hash(development))
 store.finish_run(n_rollouts=len(development))

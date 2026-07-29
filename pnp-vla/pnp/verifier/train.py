@@ -304,6 +304,25 @@ def summarize_candidate_records(records, *, seed=42, n_bootstrap=10_000):
     return metrics
 
 
+def aggregate_candidate_records(records):
+    """Average repeated seed/fold predictions before cluster-level inference."""
+    grouped = defaultdict(list)
+    for row in records:
+        grouped[row["group_id"]].append(row)
+    output = []
+    numeric = ("pair_accuracy", "margin", "top1", "default", "random", "oracle")
+    for group_id, members in sorted(grouped.items()):
+        first = members[0]
+        row = {"group_id": group_id, "benchmark": first["benchmark"],
+               "uncertainty_stratum": first["uncertainty_stratum"]}
+        for key in numeric:
+            values = np.asarray([member[key] for member in members], dtype=np.float64)
+            row[key] = float(np.nanmean(values)) if np.isfinite(values).any() else float("nan")
+        row["comparisons"] = int(max(member["comparisons"] for member in members))
+        output.append(row)
+    return output
+
+
 def paired_candidate_comparison(conditioned_records, control_records, *, seed=42,
                                 n_bootstrap=10_000):
     """Cluster-bootstrap conditioned-minus-control differences by state group."""

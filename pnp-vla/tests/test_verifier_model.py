@@ -5,7 +5,7 @@ from pnp.verifier.data import CleanChunkExample
 from pnp.verifier.model import CompactAdvantageVerifier
 from pnp.verifier.critic import HybridChunkCritic
 from pnp.verifier.train import (
-    AdvantageTrainConfig, _loader, dataset_hash, paired_candidate_comparison,
+    AdvantageTrainConfig, _loader, aggregate_candidate_records, dataset_hash, paired_candidate_comparison,
     summarize_candidate_records, train_advantage, verifier_registration_eligibility,
 )
 
@@ -113,6 +113,19 @@ def test_candidate_metrics_average_pairs_at_the_group_level():
     assert metrics["group_macro_ranking_accuracy"] == 0.5
     assert metrics["n_pairwise_comparisons"] == 5
     assert metrics["top1_success"] == 0.5
+
+
+def test_repeated_seed_records_are_aggregated_before_inference():
+    records = [
+        {"group_id": "a", "benchmark": "libero", "uncertainty_stratum": "high",
+         "pair_accuracy": value, "margin": value, "comparisons": 4,
+         "top1": value, "default": 0., "random": .5, "oracle": 1.}
+        for value in (0., .5, 1.)]
+    aggregated = aggregate_candidate_records(records)
+    assert len(aggregated) == 1
+    assert aggregated[0]["pair_accuracy"] == .5
+    assert aggregated[0]["top1"] == .5
+    assert aggregated[0]["comparisons"] == 4
 
 
 def test_weighted_sampler_changes_draws_across_epochs_reproducibly():

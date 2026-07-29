@@ -48,6 +48,7 @@ def test_build_chunk_transitions_has_td_and_monte_carlo_targets():
     assert transitions[0].reward == 0
     assert np.isclose(transitions[0].discount, .9 ** 50)
     assert np.array_equal(transitions[0].next_obs_enc, np.full(8, 2, np.float32))
+    assert transitions[0].next_chunk_position == .5
     assert transitions[1].terminal and transitions[1].reward == 1
     assert transitions[1].discount == 0 and transitions[1].action_mask.sum() == 10
     assert np.isclose(transitions[0].return_target, .9 ** 59)

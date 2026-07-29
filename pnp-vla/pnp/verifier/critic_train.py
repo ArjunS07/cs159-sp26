@@ -53,6 +53,7 @@ class TransitionDataset(Dataset):
             "actions": torch.from_numpy(e.actions),
             "mask": torch.from_numpy(e.action_mask),
             "position": torch.tensor(e.chunk_position, dtype=torch.float32),
+            "next_position": torch.tensor(e.next_chunk_position, dtype=torch.float32),
             "reward": torch.tensor(e.reward, dtype=torch.float32),
             "discount": torch.tensor(e.discount, dtype=torch.float32),
             "return_target": torch.tensor(e.return_target, dtype=torch.float32),
@@ -95,7 +96,7 @@ def evaluate_long_critic(model, examples, device, config):
         b = _to(raw, device)
         q = model.long_values(b["obs"], b["position"], b["actions"], b["mask"])
         target = b["reward"] + b["discount"] * model.state_value(
-            b["next_obs"], torch.clamp(b["position"] + 1 / 10, max=1))
+            b["next_obs"], b["next_position"])
         q_loss = sum(F.smooth_l1_loss(member, target) for member in q)
         minimum = q.amin(0)
         value_loss = _expectile_loss(
@@ -127,7 +128,7 @@ def train_long_critic(model, train_examples, val_examples, device, *, config=Non
         b = _to(raw, device)
         with torch.no_grad():
             td_target = b["reward"] + b["discount"] * target.state_value(
-                b["next_obs"], torch.clamp(b["position"] + 1 / 10, max=1))
+                b["next_obs"], b["next_position"])
         q = model.long_values(b["obs"], b["position"], b["actions"], b["mask"])
         q_loss = sum(F.smooth_l1_loss(member, td_target) for member in q)
         with torch.no_grad():

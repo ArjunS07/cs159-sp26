@@ -68,6 +68,7 @@ class ChunkTransitionExample:
     episode_idx: int
     chunk_idx: int
     chunk_position: float
+    next_chunk_position: float
     obs_enc: np.ndarray
     next_obs_enc: np.ndarray
     actions: np.ndarray
@@ -178,6 +179,8 @@ def build_chunk_transitions(row: dict, pcp_frame, trajectory: dict, *,
             benchmark=row["benchmark"], suite=row["suite"],
             task_idx=int(row["task_idx"]), episode_idx=int(row["episode_idx"]),
             chunk_idx=chunk_idx, chunk_position=positions[chunk_idx],
+            next_chunk_position=(positions[next_idx] if next_idx is not None
+                                 else positions[chunk_idx]),
             obs_enc=observations[chunk_idx],
             next_obs_enc=(observations[next_idx] if next_idx is not None
                           else np.zeros_like(observations[chunk_idx])),
