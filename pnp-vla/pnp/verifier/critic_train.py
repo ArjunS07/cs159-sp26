@@ -212,6 +212,7 @@ def train_short_critic(model, historical, candidate_train, candidate_val, device
                        config=None):
     """Distill Qc into Qa while fitting same-state causal outcomes and rankings."""
     config = config or HybridCriticTrainConfig()
+    model.to(device)
     for parameter in (*model.long_critics.parameters(), *model.value_network.parameters()):
         parameter.requires_grad_(False)
     parameters = list(model.short_critics.parameters())
