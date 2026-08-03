@@ -4,47 +4,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from nb_common import bootstrap
+
 
 ROOT = Path(__file__).parents[1]
 OUT = ROOT / "notebooks" / "workers"
 SHARD_COUNT = 6
 
-BOOTSTRAP = '''import os
-import subprocess
-import sys
-from google.colab import userdata
-
-for key in ("SUPABASE_URL", "SUPABASE_SERVICE_KEY", "HF_TOKEN"):
-    os.environ[key] = userdata.get(key)
-
-gh_pat = userdata.get("GH_PAT")
-repo_dir = "/content/cs159-sp26"
-repo_url = f"https://{gh_pat}@github.com/ArjunS07/cs159-sp26.git"
-
-if not os.path.isdir(os.path.join(repo_dir, ".git")):
-    subprocess.run(["git", "clone", "--branch", "main", repo_url, repo_dir], check=True)
-else:
-    subprocess.run(["git", "-C", repo_dir, "fetch", "origin", "main"], check=True)
-    subprocess.run(["git", "-C", repo_dir, "checkout", "main"], check=True)
-    subprocess.run(["git", "-C", repo_dir, "pull", "--ff-only", "origin", "main"], check=True)
-
-subprocess.run([
-    sys.executable, "-m", "pip", "install", "-q", "-e", f"{repo_dir}/pnp-vla[sim]",
-], check=True)
-
-# Editable installs add a .pth file that a fresh interpreter would process at startup. This
-# notebook interpreter was already running during pip, so expose the source tree immediately.
-package_dir = f"{repo_dir}/pnp-vla"
-if package_dir not in sys.path:
-    sys.path.insert(0, package_dir)
-
-import pnp
-print("Loaded pnp from:", pnp.__file__)
-'''
-
-ENV_SETUP = '''from pnp.env_setup import setup_environment
-setup_environment()  # If the runtime restarts, use Run all again.
-'''
+# Clone/install [sim] and run env setup in one fetched bootstrap cell.
+BOOTSTRAP = bootstrap("sim", setup_env=True)
 
 
 def cell(cell_type: str, source: str) -> dict:
@@ -84,7 +52,6 @@ SHARD_INDEX = {shard_index}
             cell("markdown", f"# {title}\n\n"
                  "Stable launcher: all mutable experiment logic is pulled from `pnp.experiments`.\n"),
             cell("code", BOOTSTRAP),
-            cell("code", ENV_SETUP),
             cell("code", run),
         ],
     }

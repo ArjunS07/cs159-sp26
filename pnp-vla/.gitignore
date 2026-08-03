@@ -22,3 +22,6 @@ tables/
 wandb/
 
 .DS_Store
+
+
+ROLLOUT_PLAN.md

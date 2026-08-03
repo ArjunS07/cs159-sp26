@@ -134,6 +134,28 @@ class SupabaseStore:
         self._enc_lru: "OrderedDict[str, np.lib.npyio.NpzFile]" = OrderedDict()
         self._enc_lru_size = encoding_cache_size
 
+    # ── paginated reads ────────────────────────────────────────────────────
+    def fetch_all(self, table: str, columns: str = "*", *, configure=None,
+                  order_by: Iterable[str] = (), page_size: int = 1000) -> list[dict]:
+        """Read every matching row from ``table``, paging past Supabase's row cap.
+
+        ``configure`` receives the select query for filters (``.eq``/``.in_``/…);
+        ``order_by`` names columns to sort by for deterministic pagination.
+        """
+        rows: list[dict] = []
+        start = 0
+        while True:
+            query = self.client.table(table).select(columns)
+            if configure is not None:
+                query = configure(query)
+            for column in order_by:
+                query = query.order(column)
+            batch = query.range(start, start + page_size - 1).execute().data or []
+            rows.extend(batch)
+            if len(batch) < page_size:
+                return rows
+            start += page_size
+
     # ── hashing / ids ──────────────────────────────────────────────────────
     @staticmethod
     def init_state_hash(init_state) -> str:

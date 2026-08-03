@@ -1,13 +1,7 @@
 """Build the hybrid-critic training and development-only arbitration notebooks."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
-from build_verifier_v2_notebooks import BOOTSTRAP, PAGES, code, md, notebook
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from nb_common import BOOTSTRAP, ROOT, code, md, notebook, write_notebook
 
 
 HYBRID = notebook([
@@ -25,30 +19,22 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm.auto import tqdm
-from pnp.store import SupabaseStore
+from pnp import notebook as nb
 from pnp.verifier import *
 
-DEVICE=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT=Path(package_dir)/"analysis_outputs"/"hybrid_critic"; OUTPUT.mkdir(parents=True,exist_ok=True)
-store=SupabaseStore()
+ctx=nb.setup("hybrid_critic"); store,DEVICE,OUTPUT=ctx.store,ctx.device,ctx.output
 HISTORICAL=("libero-hybrid-schedules-k3-v1","libero-pro-canonical-core-k3-v1")
 DEVELOPMENT=("verifier-clean-pairs-v3","verifier-clean-pairs-v4-dev",
              "verifier-clean-pairs-v4-test","verifier-online-selection-v1",
              "verifier-v2-pro-development")
-CONFIRMATORY="verifier-v2-pro-confirmatory"
 SEEDS=(42,43,44); N_FOLDS=4
 
 transitions=load_chunk_transitions(
     store,HISTORICAL,progress=tqdm,cache_dir=OUTPUT/"transition_cache")
 development=load_candidate_examples(store,DEVELOPMENT,cache_dir=OUTPUT/"candidate_cache")
 audit=validate_candidate_groups(development)
-sealed=(store.client.table("verifier_candidate_groups").select(
-    "candidate_group_id,benchmark,suite,task_idx,episode_idx")
-    .eq("experiment",CONFIRMATORY).execute().data or [])
-assert len(sealed)>=120,len(sealed)
-sealed_identities={(r["benchmark"],r["suite"],int(r["task_idx"]),int(r["episode_idx"]))
-                   for r in sealed}
-transitions=exclude_episode_identities(transitions,sealed_identities)
+sealed_identities, sealed = nb.sealed_identities(store)
+transitions=nb.drop_sealed(transitions,sealed_identities)
 folds=candidate_cv_splits(development,[e.rollout_id for e in development],N_FOLDS,42)
 
 valid=np.concatenate([e.actions[e.action_mask] for e in transitions])
@@ -207,13 +193,10 @@ opening confirmatory outcomes. Otherwise evaluate exactly one winner."""),
     md("## 1. Setup"), code(BOOTSTRAP),
     md("## 2. Development-only arbitration"),
     code(r'''import json, torch
-from pathlib import Path
-from pnp.store import SupabaseStore
+from pnp import notebook as nb
 from pnp.verifier import *
 
-DEVICE=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT=Path(package_dir)/"analysis_outputs"/"verifier_confirmation"; OUTPUT.mkdir(parents=True,exist_ok=True)
-store=SupabaseStore()
+ctx=nb.setup("verifier_confirmation"); store,DEVICE,OUTPUT=ctx.store,ctx.device,ctx.output
 
 def latest(experiment):
     rows=(store.client.table("verifier_models").select("verifier_id,created_at,metrics_json")
@@ -271,10 +254,8 @@ print(json.dumps(report,indent=2))'''),
 
 def main():
     notebooks = ROOT / "notebooks"
-    (notebooks / "10_train_hybrid_chunk_critic.ipynb").write_text(
-        json.dumps(HYBRID, indent=1) + "\n")
-    (notebooks / "11_arbitrate_and_confirm_verifier.ipynb").write_text(
-        json.dumps(ARBITRATION, indent=1) + "\n")
+    write_notebook(notebooks / "10_train_hybrid_chunk_critic.ipynb", HYBRID)
+    write_notebook(notebooks / "11_arbitrate_and_confirm_verifier.ipynb", ARBITRATION)
 
 
 if __name__ == "__main__":

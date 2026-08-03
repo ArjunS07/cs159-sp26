@@ -486,3 +486,10 @@ def verifier_checkpoint_bytes(model, scaler, metadata):
 
 def new_verifier_id():
     return uuid.uuid4().hex[:16]
+
+
+# Public, stable aliases over the internal ranking helpers. Notebooks and the
+# diagnostics module consume these instead of reaching for the underscored names.
+group_examples = _group_examples
+score_group = _score_group
+bootstrap_interval = _bootstrap_interval

@@ -268,26 +268,16 @@ def load_candidate_examples(store, experiment="verifier-clean-pairs-v1", *,
                             cache_dir: str | Path | None = None):
     """Load exact/fallback candidate artifacts into the common verifier example type."""
     experiments = [experiment] if isinstance(experiment, str) else list(experiment)
-    def pages(table, configure):
-        rows, start = [], 0
-        while True:
-            batch = configure(store.client.table(table).select("*")).range(
-                start, start + 999).execute().data or []
-            rows.extend(batch)
-            if len(batch) < 1000:
-                return rows
-            start += 1000
-
-    groups = pages("verifier_candidate_groups", lambda query: (
+    groups = store.fetch_all("verifier_candidate_groups", configure=lambda query: (
         query.eq("experiment", experiments[0]) if len(experiments) == 1
         else query.in_("experiment", experiments)))
     group_ids = [group["candidate_group_id"] for group in groups]
     candidates = []
     for start in range(0, len(group_ids), 100):
         batch_ids = group_ids[start:start + 100]
-        candidates.extend(pages(
+        candidates.extend(store.fetch_all(
             "verifier_candidates",
-            lambda query, ids=batch_ids: query.in_("candidate_group_id", ids)))
+            configure=lambda query, ids=batch_ids: query.in_("candidate_group_id", ids)))
     candidate_counts = Counter(row["candidate_group_id"] for row in candidates)
     # Old fallback IDs included a requested mid-rollout chunk even though the
     # actual branch was always episode-initial. Keep only the richest group per

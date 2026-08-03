@@ -79,7 +79,7 @@ def test_six_launchers_have_fixed_unique_indices():
         assert "SHARD_COUNT = 6" in source
         assert f"SHARD_INDEX = {index}" in source
         assert "run_libero_hybrid_worker" in source
-        assert "sys.path.insert(0, package_dir)" in source
+        assert "colab_bootstrap.py" in source  # fetch-and-exec bootstrap
 
 
 def test_six_pro_launchers_have_fixed_unique_indices():
@@ -94,7 +94,7 @@ def test_six_pro_launchers_have_fixed_unique_indices():
         assert "SHARD_COUNT = 6" in source
         assert f"SHARD_INDEX = {index}" in source
         assert "run_libero_pro_worker" in source
-        assert "sys.path.insert(0, package_dir)" in source
+        assert "colab_bootstrap.py" in source  # fetch-and-exec bootstrap
 
 
 def test_three_verifier_v2_launchers_have_fixed_unique_indices():

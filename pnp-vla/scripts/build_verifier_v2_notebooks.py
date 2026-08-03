@@ -1,60 +1,7 @@
-"""Build the V2 verifier collection, architecture sweep, and confirmation notebooks."""
+"""Build the V2 verifier collection and architecture-sweep notebooks."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def md(source):
-    return {"cell_type": "markdown", "metadata": {}, "source": source}
-
-
-def code(source):
-    return {"cell_type": "code", "execution_count": None, "metadata": {},
-            "outputs": [], "source": source}
-
-
-def notebook(cells, name):
-    return {"cells": cells, "metadata": {"accelerator": "GPU", "colab": {"name": name},
-        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-        "language_info": {"name": "python"}}, "nbformat": 4, "nbformat_minor": 5}
-
-
-BOOTSTRAP = r'''import os, subprocess, sys
-try:
-    from google.colab import userdata
-    for key in ("SUPABASE_URL", "SUPABASE_SERVICE_KEY", "HF_TOKEN", "WANDB_API_KEY"):
-        value = userdata.get(key)
-        if value: os.environ[key] = value
-    repo_dir = "/content/cs159-sp26"
-    gh_pat = userdata.get("GH_PAT")
-    repo_url = f"https://{gh_pat}@github.com/ArjunS07/cs159-sp26.git"
-    if not os.path.isdir(os.path.join(repo_dir, ".git")):
-        subprocess.run(["git", "clone", "--branch", "main", repo_url, repo_dir], check=True)
-    else:
-        subprocess.run(["git", "-C", repo_dir, "pull", "--ff-only", "origin", "main"], check=True)
-except ImportError:
-    repo_dir = os.path.abspath("..") if os.path.basename(os.getcwd()) == "pnp-vla" else os.getcwd()
-package_dir = os.path.join(repo_dir, "pnp-vla")
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e",
-                package_dir + "[sim,analysis]"], check=True)
-if package_dir not in sys.path: sys.path.insert(0, package_dir)
-import pnp
-print("Loaded pnp from:", pnp.__file__)'''
-
-
-PAGES = r'''def pages(table, columns, configure=lambda q: q, order_by=()):
-    rows=[]; start=0
-    while True:
-        query = configure(store.client.table(table).select(columns))
-        for column in order_by: query = query.order(column)
-        batch = query.range(start, start+999).execute().data or []
-        rows += batch
-        if len(batch) < 1000: return rows
-        start += 1000'''
+from nb_common import BOOTSTRAP, ROOT, code, md, notebook, write_notebook
 
 
 COLLECTION = notebook([
@@ -82,9 +29,7 @@ episode_lookup = {(ep["suite"], ep["task_idx"], ep.get("ep_idx", ep.get("episode
                   for ep in episodes}
 print({"PRO identities": len(episode_lookup), "device": str(device)})'''),
     md("## 3. Freeze and upload the outcome-blind seeded manifest"),
-    code(PAGES + r'''
-
-DEVELOPMENT_EXPERIMENT = "verifier-v2-pro-development"
+    code(r'''DEVELOPMENT_EXPERIMENT = "verifier-v2-pro-development"
 TEST_EXPERIMENT = "verifier-v2-pro-confirmatory"
 CANDIDATE_COUNT = 12
 PREFIX_LENGTH = 10
@@ -92,19 +37,19 @@ SHARD_COUNT = 1   # Generated workers set this to 3.
 SHARD_INDEX = 0
 assert 0 <= SHARD_INDEX < SHARD_COUNT
 
-rollouts = pages(
+rollouts = store.fetch_all(
     "rollouts", "rollout_id,benchmark,suite,task_idx,episode_idx,success",
-    lambda q: q.eq("experiment", "libero-pro-canonical-core-k3-v1").eq(
+    configure=lambda q: q.eq("experiment", "libero-pro-canonical-core-k3-v1").eq(
         "method", "pnp_uncertainty_only").eq("status", "completed"),
-    ("rollout_id",))
+    order_by=("rollout_id",))
 rollout_ids = sorted(row["rollout_id"] for row in rollouts)
 euler=[]
 for start in range(0, len(rollout_ids), 100):
     ids=rollout_ids[start:start+100]
-    euler += pages(
+    euler += store.fetch_all(
         "pnp_euler_steps", "rollout_id,chunk_idx,euler_step,u_mean",
-        lambda q, ids=ids: q.in_("rollout_id", ids),
-        ("rollout_id", "chunk_idx", "euler_step"))
+        configure=lambda q, ids=ids: q.in_("rollout_id", ids),
+        order_by=("rollout_id", "chunk_idx", "euler_step"))
 by_rollout={row["rollout_id"]: row for row in rollouts}
 uncertainty=defaultdict(list)
 for row in euler:
@@ -134,16 +79,16 @@ print({"development": 240, "confirmatory_test": 160, "worker": len(manifest),
        "hashes": hashes, "manifest_path": manifest_path})'''),
     md("## 4. Resume-safe sharded collection"),
     code(r'''experiments=(DEVELOPMENT_EXPERIMENT, TEST_EXPERIMENT)
-existing_rows=pages(
+existing_rows=store.fetch_all(
     "verifier_candidate_groups", "candidate_group_id,experiment",
-    lambda q: q.in_("experiment", experiments), ("candidate_group_id",))
+    configure=lambda q: q.in_("experiment", experiments), order_by=("candidate_group_id",))
 existing_ids={row["candidate_group_id"] for row in existing_rows}
 candidate_rows=[]
 for start in range(0, len(existing_ids), 100):
     ids=sorted(existing_ids)[start:start+100]
-    candidate_rows += pages(
+    candidate_rows += store.fetch_all(
         "verifier_candidates", "candidate_id,candidate_group_id",
-        lambda q, ids=ids: q.in_("candidate_group_id", ids), ("candidate_id",))
+        configure=lambda q, ids=ids: q.in_("candidate_group_id", ids), order_by=("candidate_id",))
 counts=defaultdict(int)
 for row in candidate_rows: counts[row["candidate_group_id"]] += 1
 complete={gid for gid in existing_ids if counts[gid] == CANDIDATE_COUNT}
@@ -191,13 +136,13 @@ print({"new_outcomes": new_outcomes, "skipped": skipped,
     code(r'''for split, experiment, target in (
     ("development", DEVELOPMENT_EXPERIMENT, 240),
     ("confirmatory_test", TEST_EXPERIMENT, 160)):
-    groups=pages("verifier_candidate_groups", "candidate_group_id",
-                 lambda q, e=experiment: q.eq("experiment", e), ("candidate_group_id",))
+    groups=store.fetch_all("verifier_candidate_groups", "candidate_group_id",
+                 configure=lambda q, e=experiment: q.eq("experiment", e), order_by=("candidate_group_id",))
     ids={row["candidate_group_id"] for row in groups}; candidates=[]
     for start in range(0, len(ids), 100):
         batch=sorted(ids)[start:start+100]
-        candidates += pages("verifier_candidates", "candidate_group_id,success",
-                            lambda q, ids=batch: q.in_("candidate_group_id", ids))
+        candidates += store.fetch_all("verifier_candidates", "candidate_group_id,success",
+                            configure=lambda q, ids=batch: q.in_("candidate_group_id", ids))
     counts=defaultdict(int)
     for row in candidates: counts[row["candidate_group_id"]] += 1
     report={"target": target, "groups": len(ids),
@@ -227,17 +172,14 @@ import pandas as pd
 import torch
 import wandb
 from tqdm.auto import tqdm
-from pnp.store import SupabaseStore
+from pnp import notebook as nb
 from pnp.verifier import *
 
-DEVICE=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT=Path(package_dir)/"analysis_outputs"/"verifier_v2"; OUTPUT.mkdir(parents=True, exist_ok=True)
-store=SupabaseStore()
+ctx=nb.setup("verifier_v2"); store,DEVICE,OUTPUT=ctx.store,ctx.device,ctx.output
 HISTORICAL=("libero-hybrid-schedules-k3-v1", "libero-pro-canonical-core-k3-v1")
 PRIMARY=("verifier-clean-pairs-v3", "verifier-clean-pairs-v4-dev",
          "verifier-clean-pairs-v4-test", "verifier-online-selection-v1",
          "verifier-v2-pro-development")
-CONFIRMATORY="verifier-v2-pro-confirmatory"
 SEEDS=(42,43,44); N_FOLDS=4; PREFIX_LENGTH=10
 
 historical=load_clean_chunk_examples(
@@ -251,14 +193,9 @@ assert new_audit["groups"] >= 220, new_audit
 development=existing_development+new_development
 audit=validate_candidate_groups(development)
 assert audit["discordant_groups"] >= 100, audit
-# Seal IDs only. Do not query verifier_candidates for this experiment here.
-sealed=(store.client.table("verifier_candidate_groups").select(
-        "candidate_group_id,benchmark,suite,task_idx,episode_idx")
-        .eq("experiment", CONFIRMATORY).execute().data or [])
-assert len(sealed) >= 120, len(sealed)
-sealed_identities={(row["benchmark"],row["suite"],int(row["task_idx"]),
-                    int(row["episode_idx"])) for row in sealed}
-historical=exclude_episode_identities(historical,sealed_identities)
+# Seal IDs only. nb.sealed_identities never queries verifier_candidates.
+sealed_identities, sealed = nb.sealed_identities(store)
+historical=nb.drop_sealed(historical, sealed_identities)
 folds=candidate_cv_splits(development, [e.rollout_id for e in development], N_FOLDS, 42)
 print({"historical_chunks":len(historical), "development":audit,
        "new_PRO_development":new_audit,
@@ -447,78 +384,15 @@ print({"registered_verifier":verifier_id,"selected":selected_spec,
 ], "09_train_state_conditioned_verifier_v2.ipynb")
 
 
-CONFIRMATION = notebook([
-    md("""# 10 — One-shot LIBERO-PRO verifier V2 confirmation
-
-Run only after notebook 09 registers the final bundle and all 160 confirmatory
-groups are complete. This opens the sealed outcomes once and applies the
-predeclared registration gates."""),
-    md("## 1. Setup"), code(BOOTSTRAP),
-    md("## 2. Load the frozen bundle and sealed candidates"),
-    code(r'''import json
-from pathlib import Path
-import torch
-from pnp.store import SupabaseStore
-from pnp.verifier import *
-
-DEVICE=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT=Path(package_dir)/"analysis_outputs"/"verifier_v2"; OUTPUT.mkdir(parents=True,exist_ok=True)
-store=SupabaseStore()
-registered=(store.client.table("verifier_models").select("verifier_id,created_at")
-            .eq("experiment","state-conditioned-verifier-v2")
-            .order("created_at",desc=True).limit(1).execute().data or [])
-assert registered,"no state-conditioned-verifier-v2 checkpoint is registered"
-verifier_id=registered[0]["verifier_id"]
-checkpoint,row=store.load_verifier(verifier_id)
-examples=load_candidate_examples(
-    store,"verifier-v2-pro-confirmatory",cache_dir=OUTPUT/"confirmatory_cache")
-audit=validate_candidate_groups(examples,expected_candidates=12)
-assert audit["groups"] >= 150, audit
-
-def load_model(spec,state):
-    model=CompactAdvantageVerifier(obs_dim=int(row["obs_dim"]),action_dim=int(row["action_dim"]),
-        action_width=64,dropout=spec["dropout"],conditioning=spec["architecture"])
-    model.load_state_dict(state); return model.to(DEVICE).eval()
-
-selected_spec=checkpoint["metadata"]["selected_spec"]
-selected=load_model(selected_spec,checkpoint["model"])
-action=load_model(checkpoint["controls"]["action_only"]["spec"],
-                  checkpoint["controls"]["action_only"]["model"])
-shuffled=load_model(checkpoint["controls"]["shuffled_actions"]["spec"],
-                    checkpoint["controls"]["shuffled_actions"]["model"])
-print({"verifier":verifier_id,"integrity":audit})'''),
-    md("## 3. Predeclared paired-bootstrap gate"),
-    code(r'''config=AdvantageTrainConfig(seed=20260728,prefix_length=10)
-metrics,selected_records=evaluate_candidate_ranker(
-    selected,examples,DEVICE,config=config,return_records=True)
-_,action_records=evaluate_candidate_ranker(
-    action,examples,DEVICE,config=config,return_records=True)
-_,shuffled_records=evaluate_candidate_ranker(
-    shuffled,examples,DEVICE,config=config,return_records=True)
-action_comparison=paired_candidate_comparison(selected_records,action_records,seed=20260728)
-shuffled_comparison=paired_candidate_comparison(
-    selected_records,shuffled_records,seed=20260729)
-gate=verifier_registration_eligibility(metrics,action_comparison,shuffled_comparison)
-report={"verifier_id":verifier_id,"metrics":metrics,
-        "vs_action_only":action_comparison,"vs_shuffled_actions":shuffled_comparison,
-        "registration_gate":gate}
-(OUTPUT/"confirmatory_report.json").write_text(json.dumps(report,indent=2,sort_keys=True))
-(store.client.table("verifier_models").update({"metrics_json":report})
- .eq("verifier_id",verifier_id).execute())
-print(json.dumps(report,indent=2))
-print("REGISTERED" if gate["eligible"] else "EXPLORATORY ONLY — gate not met")'''),
-], "10_confirm_verifier_v2.ipynb")
-
-
-def write_notebook(path, document):
-    path.write_text(json.dumps(document, indent=1) + "\n")
+# Notebook 10 is the hybrid-critic trainer and notebook 11 the one-shot
+# confirmation/arbitration -- both generated by build_hybrid_critic_notebooks.py.
+# The superseded standalone "10 — confirm verifier V2" notebook is retired.
 
 
 def main():
     notebooks = ROOT / "notebooks"
     write_notebook(notebooks / "08_collect_verifier_v2_pro.ipynb", COLLECTION)
     write_notebook(notebooks / "09_train_state_conditioned_verifier_v2.ipynb", TRAINING)
-    write_notebook(notebooks / "10_confirm_verifier_v2.ipynb", CONFIRMATION)
 
 
 if __name__ == "__main__":
