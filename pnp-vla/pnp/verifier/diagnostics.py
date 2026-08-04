@@ -491,6 +491,97 @@ def fit_gbt_baseline(cand: pd.DataFrame, *, prefix_length: int = 10, n_splits: i
     }
 
 
+# --- training-free and score-based selectors, scored as deployed success --- #
+def _mode_medoid(group: pd.DataFrame, mode):
+    """Row index of the candidate closest to its mode's prefix centroid."""
+    subset = group[group["mode"] == mode]
+    features = np.stack([np.asarray(p, dtype=float) for p in subset["prefix"]])
+    centroid = features.mean(axis=0)
+    return subset.index[int(np.argmin(((features - centroid) ** 2).sum(axis=1)))]
+
+
+def _select_random(group: pd.DataFrame) -> float:
+    return float(group["success"].mean())
+
+
+def _select_max_dist_default(group: pd.DataFrame) -> float:
+    prefixes = {idx: np.asarray(group.loc[idx, "prefix"], dtype=float) for idx in group.index}
+    default_rows = group.index[group["is_default"]]
+    reference = (prefixes[default_rows[0]] if len(default_rows)
+                 else np.mean(list(prefixes.values()), axis=0))
+    pick = max(group.index, key=lambda i: np.linalg.norm(prefixes[i] - reference))
+    return float(group.loc[pick, "success"])
+
+
+def _select_largest_mode_medoid(group: pd.DataFrame) -> float:
+    largest = group.groupby("mode").size().idxmax()
+    return float(group.loc[_mode_medoid(group, largest), "success"])
+
+
+def _select_pick_best(group: pd.DataFrame, score_col: str) -> float:
+    scores = group[score_col]
+    if scores.isna().any():
+        return float("nan")
+    return float(group.loc[scores.idxmax(), "success"])
+
+
+def _select_reject_worst(group: pd.DataFrame, score_col: str, quantile: float) -> float:
+    scores = group[score_col]
+    if scores.isna().any():
+        return float("nan")
+    survivors = group[scores >= scores.quantile(quantile)]
+    return float(survivors["success"].mean()) if len(survivors) else float(group["success"].mean())
+
+
+def _select_best_mode_medoid(group: pd.DataFrame, score_col: str) -> float:
+    scores = group[score_col]
+    if scores.isna().any():
+        return float("nan")
+    best = group.groupby("mode").apply(lambda g: g[score_col].mean()).idxmax()
+    return float(group.loc[_mode_medoid(group, best), "success"])
+
+
+def selector_zoo(cand: pd.DataFrame, *, score_cols=("score",), quantile: float = 0.25,
+                 seed: int = 42, n_bootstrap: int = 10_000) -> pd.DataFrame:
+    """Deployed success of training-free and score-based selectors vs the default (0.650 bar).
+
+    Each selector maps a candidate group to the success of the candidate it would execute (or
+    an expected success for stochastic selectors). Aggregated across groups into deployed
+    success + uplift over the default candidate, with a bootstrap CI. Score-based selectors
+    are evaluated for BOTH operators -- pick-best (argmax score) and reject-worst (drop the
+    bottom ``quantile`` by score, then a uniform pick from survivors) -- for every column in
+    ``score_cols``, so any scorer (GBT, current verifier, a future rebuild) can be compared.
+    Requires ``mode`` (call ``add_mode_structure`` first) for the mode-based selectors.
+    """
+    from .train import bootstrap_interval
+
+    groups = list(cand.groupby("group_id"))
+    default_mean = float(np.mean([default_success(g) for _, g in groups]))
+    rows = []
+
+    def _record(name, score_col, selector):
+        values = [v for _, group in groups if not np.isnan(v := selector(group))]
+        if not values:
+            return
+        ci = bootstrap_interval(values, seed, n_bootstrap)
+        rows.append({"selector": name, "score_col": score_col or "-",
+                     "deployed_success": float(np.mean(values)),
+                     "uplift_vs_default": float(np.mean(values)) - default_mean,
+                     "ci_lo": float(ci[0]), "ci_hi": float(ci[1]), "n_groups": len(values)})
+
+    _record("random", None, _select_random)
+    _record("majority_mode", None, majority_mode_success)
+    _record("max_dist_default", None, _select_max_dist_default)
+    _record("largest_mode_medoid", None, _select_largest_mode_medoid)
+    for col in score_cols:
+        _record("pick_best", col, lambda g, c=col: _select_pick_best(g, c))
+        _record("reject_worst", col, lambda g, c=col: _select_reject_worst(g, c, quantile))
+        _record("best_mode_medoid", col, lambda g, c=col: _select_best_mode_medoid(g, c))
+    result = pd.DataFrame(rows)
+    result.attrs["default_success"] = default_mean
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # Checkpoint reconstruction
 # --------------------------------------------------------------------------- #

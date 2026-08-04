@@ -182,6 +182,22 @@ def test_fit_gbt_baseline_returns_comparable_ranking():
         assert result["importances"] == {}
 
 
+def test_selector_zoo_pick_best_and_reject_worst():
+    # successes default=0, fresh_noise_1=1, fresh_noise_2=0; inject a controlled score column.
+    cand = dg.build_candidate_table(_group("g", [0, 1, 0]), model=None)
+    dg.add_mode_structure(cand)
+    cand["score"] = cand["kind"].map(
+        {"default": 0.1, "fresh_noise_1": 0.9, "fresh_noise_2": 0.5})
+    zoo = dg.selector_zoo(cand, score_cols=("score",), quantile=0.25)
+    pick = zoo[zoo.selector == "pick_best"].iloc[0]
+    assert pick["deployed_success"] == 1.0 and pick["uplift_vs_default"] == 1.0  # picks the success
+    # quantile(0.25)=0.3 -> survivors are scores 0.9 (success) and 0.5 (failure) -> mean 0.5.
+    reject = zoo[zoo.selector == "reject_worst"].iloc[0]
+    assert reject["deployed_success"] == 0.5
+    rnd = zoo[zoo.selector == "random"].iloc[0]
+    assert np.isclose(rnd["deployed_success"], 1 / 3)  # group mean success
+
+
 def test_stratify_by_u_level_buckets_into_terciles():
     # six groups with distinct endpoint-U values -> three terciles over group values.
     cand = dg.build_candidate_table(
