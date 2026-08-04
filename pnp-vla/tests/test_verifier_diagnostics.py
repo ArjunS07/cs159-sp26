@@ -154,6 +154,34 @@ def test_prefix_distance_disagreement_rises_and_flattens():
     assert flat_slope == 0.0
 
 
+def test_handcrafted_features_shape_and_values():
+    cand = dg.build_candidate_table(_group("g", [0, 1, 0]), model=None)  # prefixes 0, 1, 2
+    feats = dg.handcrafted_features(cand)
+    assert list(feats.columns) == list(dg._HANDCRAFTED_FEATURE_NAMES)
+    assert feats.shape == (3, 9)
+    default_row = feats.loc[cand.index[cand["is_default"]][0]]
+    # constant prefix -> zero jerk/smoothness/std; default is 0 distance from itself.
+    assert default_row["jerk"] == 0.0 and default_row["smoothness"] == 0.0
+    assert default_row["grip_mean"] == 0.0 and default_row["dist_default"] == 0.0
+    assert default_row["chunk_position"] == 0.0
+    assert np.isclose(default_row["dist_centroid"], np.sqrt(70))  # ||0 - 1|| over 70 dims
+    fn2_row = feats.loc[cand.index[cand["kind"] == "fresh_noise_2"][0]]
+    assert fn2_row["grip_mean"] == 2.0
+
+
+def test_fit_gbt_baseline_returns_comparable_ranking():
+    cand = dg.build_candidate_table(
+        sum((_group(f"g{i}", [0, 1, 0]) for i in range(6)), []), model=None)
+    dg.add_mode_structure(cand)
+    result = dg.fit_gbt_baseline(cand, n_splits=3)
+    assert set(result) >= {"ranking", "n_groups", "importances"}
+    if dg._HAVE_SKLEARN:  # sklearn is the [analysis] extra; absent -> graceful NaN result.
+        assert np.isnan(result["ranking"]) or 0.0 <= result["ranking"] <= 1.0
+        assert len(result["importances"]) == 9
+    else:
+        assert result["importances"] == {}
+
+
 def test_stratify_by_u_level_buckets_into_terciles():
     # six groups with distinct endpoint-U values -> three terciles over group values.
     cand = dg.build_candidate_table(

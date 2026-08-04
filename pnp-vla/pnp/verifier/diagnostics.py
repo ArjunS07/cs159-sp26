@@ -402,6 +402,95 @@ def prefix_distance_disagreement(cand: pd.DataFrame, *, n_bins: int = 8) -> tupl
     return table, slope
 
 
+_HANDCRAFTED_FEATURE_NAMES = ("jerk", "smoothness", "grip_mean", "grip_std",
+                              "grip_switches", "dist_centroid", "dist_default",
+                              "mode_size", "chunk_position")
+
+
+def _candidate_geoms(prefix_vec, prefix_length: int):
+    """Shape features of one executed prefix: jerk, smoothness, gripper-channel stats."""
+    actions = np.asarray(prefix_vec, dtype=float).reshape(prefix_length, -1)
+    diffs = np.diff(actions, axis=0)
+    jerk = float(np.linalg.norm(np.diff(diffs, axis=0))) if len(diffs) > 1 else 0.0
+    smoothness = float(np.linalg.norm(diffs))
+    grip = actions[:, -1]
+    grip_switches = float((np.abs(np.diff(np.sign(grip))) > 0).sum())
+    return jerk, smoothness, float(grip.mean()), float(grip.std()), grip_switches
+
+
+def handcrafted_features(cand: pd.DataFrame, *, prefix_length: int = 10) -> pd.DataFrame:
+    """Hand-made geometric features per candidate for the boring baseline (no learning).
+
+    Per-candidate shape features (jerk, smoothness, gripper-channel mean/std/switches) plus
+    group-relative geometry (distance to the group centroid and to the default candidate),
+    the candidate's mode size, and its chunk_position. Returns a DataFrame aligned to
+    ``cand.index`` with the columns in ``_HANDCRAFTED_FEATURE_NAMES``.
+    """
+    records = {}
+    for _, group in cand.groupby("group_id"):
+        prefixes = {idx: np.asarray(group.loc[idx, "prefix"], dtype=float) for idx in group.index}
+        centroid = np.mean(list(prefixes.values()), axis=0)
+        default_rows = group.index[group["is_default"]]
+        default_vec = prefixes[default_rows[0]] if len(default_rows) else centroid
+        mode_size = (group.groupby("mode")["mode"].transform("size")
+                     if "mode" in group else pd.Series(len(group), index=group.index))
+        for idx in group.index:
+            geoms = _candidate_geoms(prefixes[idx], prefix_length)
+            records[idx] = [*geoms,
+                            float(np.linalg.norm(prefixes[idx] - centroid)),
+                            float(np.linalg.norm(prefixes[idx] - default_vec)),
+                            float(mode_size.loc[idx]),
+                            float(group.loc[idx].get("chunk_position", 0.0))]
+    return pd.DataFrame.from_dict(
+        records, orient="index", columns=list(_HANDCRAFTED_FEATURE_NAMES)).reindex(cand.index)
+
+
+def fit_gbt_baseline(cand: pd.DataFrame, *, prefix_length: int = 10, n_splits: int = 5,
+                     seed: int = 0) -> dict:
+    """Gradient-boosted-tree boring baseline on handcrafted features (H-representation test).
+
+    Predicts candidate success under GroupKFold on ``group_id`` (no candidate leakage across
+    folds), collects out-of-fold probabilities, and scores them with the same
+    ``group_pair_accuracy`` used for the deep model -- so the numbers are directly comparable.
+    GBT ~ deep model => the deep model is not the bottleneck; GBT wins => representation is;
+    GBT ~ chance => strong H-chaos evidence. Requires sklearn ([analysis] extra).
+    """
+    if not _HAVE_SKLEARN:
+        return {"ranking": float("nan"), "n_groups": 0, "importances": {}, "note": "sklearn missing"}
+    from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.model_selection import GroupKFold
+
+    features = handcrafted_features(cand, prefix_length=prefix_length)
+    matrix = features.to_numpy(dtype=float)
+    success = cand["success"].to_numpy()
+    groups = cand["group_id"].to_numpy()
+    n_splits = min(n_splits, len(np.unique(groups)))
+    if n_splits < 2:
+        return {"ranking": float("nan"), "n_groups": int(cand.group_id.nunique()),
+                "importances": {}, "note": "need >= 2 groups"}
+    oof = np.full(len(cand), np.nan)
+    importances = np.zeros(matrix.shape[1])
+    folds = 0
+    for train_idx, test_idx in GroupKFold(n_splits=n_splits).split(matrix, success, groups):
+        if len(np.unique(success[train_idx])) < 2:  # single-class fold -> unusable
+            continue
+        model = GradientBoostingClassifier(random_state=seed)
+        model.fit(matrix[train_idx], success[train_idx])
+        oof[test_idx] = model.predict_proba(matrix[test_idx])[:, 1]
+        importances += model.feature_importances_
+        folds += 1
+    scored = cand.assign(_gbt=oof)
+    pair = [a for _, group in scored.groupby("group_id")
+            if not np.isnan(a := group_pair_accuracy(group["_gbt"], group["success"]))]
+    return {
+        "ranking": float(np.mean(pair)) if pair else float("nan"),
+        "n_groups": len(pair),
+        "importances": dict(sorted(
+            zip(_HANDCRAFTED_FEATURE_NAMES, importances / folds if folds else importances),
+            key=lambda kv: -kv[1])),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Checkpoint reconstruction
 # --------------------------------------------------------------------------- #
