@@ -171,6 +171,7 @@ def build_candidate_table(examples, model=None, device=None, *, prefix_length: i
                 "success": int(example.success),
                 "prefix": prefix_features(example, prefix_length),
                 "return_target": example.return_target,
+                "chunk_position": float(example.chunk_position),
             })
     return pd.DataFrame(rows)
 
@@ -230,6 +231,130 @@ def deployment_stratum_stats(cand: pd.DataFrame, *, stratum_col: str = "spread_t
         "oracle_uplift": float(np.mean(oracle)) if oracle else float("nan"),
         "discordant_n": len(pair),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Per-denoising-step uncertainty reconstruction
+# --------------------------------------------------------------------------- #
+# The probe runs at every euler step; noise level s decreases 0.9 -> 0.1. The stored
+# `uncertainty_stratum` is a tercile of the trajectory MEAN of these per-step u_mean
+# values (see collection.build_stratified_manifest). These helpers recover the raw
+# per-s signal so a gate can be defined at a chosen noise level instead of the average.
+_U_STEP_LEVELS = (0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)
+
+
+def _u_step_column(s) -> str:
+    """Stable column name for a noise level, e.g. 0.5 -> 'u_s50'."""
+    return f"u_s{int(round(float(s) * 100)):02d}"
+
+
+def _pivot_euler_rows(rows) -> dict:
+    """(rollout_id, chunk_idx) -> {u_s<level>: mean u_mean} from pnp_euler_steps rows.
+
+    Pure and offline (no store access) so it is unit-testable. Repeated rows at the
+    same (key, noise level) are averaged.
+    """
+    from collections import defaultdict
+
+    acc = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        key = (row["rollout_id"], int(row["chunk_idx"]))
+        acc[key][_u_step_column(row["s"])].append(float(row["u_mean"]))
+    return {key: {col: float(np.mean(vals)) for col, vals in cols.items()}
+            for key, cols in acc.items()}
+
+
+def attach_per_step_uncertainty(cand: pd.DataFrame, development, store, *,
+                                source_experiments=None, batch: int = 200,
+                                progress=None) -> pd.DataFrame:
+    """Attach per-denoising-step U columns to ``cand``, keyed by candidate group.
+
+    The stored ``uncertainty_stratum`` collapses the whole denoising trajectory into a
+    single tercile bucket. This reconstructs, per candidate group, the source
+    ``(rollout_id, chunk_idx)`` it was branched from and pulls that chunk's per-euler-step
+    ``u_mean`` from ``pnp_euler_steps``, exposing U at each noise level.
+
+    Adds columns ``u_s90..u_s10`` (percent noise level; ``u_s10`` is the endpoint, nearest
+    data), plus ``u_traj_mean`` (mean over available steps, the stratum's basis),
+    ``u_endpoint`` (== ``u_s10``), and ``u_mid`` (nearest s=0.5). Groups whose source chunk
+    is not found keep NaN. Modifies and returns ``cand``.
+
+    ``development`` is the ``CleanChunkExample`` list (it carries the identity fields the
+    scored table drops). ``source_experiments`` optionally narrows the ``rollouts`` lookup
+    to the base experiments that own the probe rows -- faster and less ambiguous.
+    """
+    from collections import defaultdict
+
+    # 1. candidate_group_id -> source identity (examples carry these fields; cand drops them).
+    identity = {}
+    for example in development:
+        gid = example.candidate_group_id
+        if gid and gid not in identity:
+            identity[gid] = (example.benchmark, example.suite, int(example.task_idx),
+                             int(example.episode_idx), int(example.chunk_idx))
+    wanted4 = {ident[:4] for ident in identity.values()}
+
+    # 2. (benchmark, suite, task_idx, episode_idx) -> [source rollout_id] from `rollouts`.
+    def _configure_rollouts(query):
+        query = query.select("rollout_id,benchmark,suite,task_idx,episode_idx")
+        return query.in_("experiment", list(source_experiments)) if source_experiments else query
+
+    ident_to_rids = defaultdict(list)
+    for row in store.fetch_all("rollouts", configure=_configure_rollouts):
+        key = (row["benchmark"], row["suite"], int(row["task_idx"]), int(row["episode_idx"]))
+        if key in wanted4:
+            ident_to_rids[key].append(row["rollout_id"])
+
+    # 3. pull pnp_euler_steps for those source rollouts, batched over rollout_id.
+    rids = sorted({rid for group in ident_to_rids.values() for rid in group})
+    starts = range(0, len(rids), batch)
+    starts = progress(starts) if progress else starts
+    euler_rows = []
+    for start in starts:
+        ids = rids[start:start + batch]
+        euler_rows.extend(store.fetch_all(
+            "pnp_euler_steps", configure=lambda query, ids=ids: query.select(
+                "rollout_id,chunk_idx,euler_step,s,u_mean").in_("rollout_id", ids)))
+    per_chunk = _pivot_euler_rows(euler_rows)
+
+    # 4. per group, pick the source rollout that actually has probe rows at its chunk.
+    group_u = {}
+    for gid, (bench, suite, task, episode, chunk) in identity.items():
+        for rid in ident_to_rids.get((bench, suite, task, episode), []):
+            cols = per_chunk.get((rid, chunk))
+            if cols:
+                group_u[gid] = cols
+                break
+
+    # 5. write columns onto cand.
+    step_cols = [_u_step_column(s) for s in _U_STEP_LEVELS]
+    for col in step_cols:
+        cand[col] = cand["group_id"].map(lambda g, c=col: group_u.get(g, {}).get(c, np.nan))
+    present = [c for c in step_cols if cand[c].notna().any()]
+    cand["u_traj_mean"] = cand[present].mean(axis=1) if present else np.nan
+    cand["u_endpoint"] = cand[_u_step_column(min(_U_STEP_LEVELS))]
+    cand["u_mid"] = cand[_u_step_column(min(_U_STEP_LEVELS, key=lambda s: abs(s - 0.5)))]
+    matched = int(cand["group_id"].isin(group_u).sum())
+    print("attached per-step U: %d/%d candidate rows, %d/%d groups matched"
+          % (matched, len(cand), len(group_u), cand["group_id"].nunique()))
+    return cand
+
+
+def stratify_by_u_level(cand: pd.DataFrame, u_col: str, *, n_buckets: int = 3,
+                        labels=("low", "mid", "high")) -> pd.DataFrame:
+    """Re-run the 0a stratified summary using a chosen per-step U column as the stratum.
+
+    Buckets groups into terciles of ``u_col`` (group-level value) and calls ``stratified``.
+    Lets you compare, e.g., a gate on endpoint U (``u_s10``) vs mid-trajectory U (``u_s50``)
+    vs the stored trajectory-average stratum.
+    """
+    group_u = cand.groupby("group_id")[u_col].first()
+    edges = np.array(group_u.quantile(np.linspace(0, 1, n_buckets + 1).tolist()), dtype=float)
+    edges[0], edges[-1] = -np.inf, np.inf
+    bucket = pd.cut(group_u, bins=np.unique(edges), labels=list(labels)[:len(np.unique(edges)) - 1])
+    col = f"{u_col}_bucket"
+    cand[col] = cand["group_id"].map(bucket.to_dict())
+    return stratified(cand[cand[col].notna()], col)
 
 
 # --------------------------------------------------------------------------- #
