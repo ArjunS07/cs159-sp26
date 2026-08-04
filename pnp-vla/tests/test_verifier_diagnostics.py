@@ -124,3 +124,43 @@ def test_stratified_and_deployment_stats_are_model_aware():
     assert stats["discordant_n"] == 0           # no model scores -> no usable pairs
     assert np.isnan(stats["ranking"])
     assert stats["oracle_uplift"] >= 0.0        # oracle uplift is model-free and available
+
+
+def test_pivot_euler_rows_averages_per_noise_level():
+    rows = [
+        {"rollout_id": "r0", "chunk_idx": 0, "euler_step": 1, "s": 0.9, "u_mean": 0.02},
+        {"rollout_id": "r0", "chunk_idx": 0, "euler_step": 5, "s": 0.5, "u_mean": 0.04},
+        {"rollout_id": "r0", "chunk_idx": 0, "euler_step": 5, "s": 0.5, "u_mean": 0.06},  # avg 0.05
+        {"rollout_id": "r0", "chunk_idx": 1, "euler_step": 1, "s": 0.9, "u_mean": 0.10},
+    ]
+    pivot = dg._pivot_euler_rows(rows)
+    assert pivot[("r0", 0)] == {"u_s90": 0.02, "u_s50": 0.05}
+    assert pivot[("r0", 1)] == {"u_s90": 0.10}
+    assert dg._u_step_column(0.5) == "u_s50" and dg._u_step_column(0.1) == "u_s10"
+
+
+def test_prefix_distance_disagreement_rises_and_flattens():
+    # prefixes at value 0 (both success) and value 5 (both failure): the only disagreeing
+    # pairs are the far (0 vs 5) pairs -> P(disagree) rises with distance.
+    rising = ([_candidate("g", "default", 1, 0.0), _candidate("g", "fresh_noise_1", 1, 0.0),
+               _candidate("g", "fresh_noise_2", 0, 5.0), _candidate("g", "fresh_noise_3", 0, 5.0)])
+    cand = dg.build_candidate_table(rising, model=None)
+    table, slope = dg.prefix_distance_disagreement(cand)
+    assert list(table.columns) == ["distance_bin", "dist_mid", "p_disagree", "n"]
+    assert slope > 0
+    # all-success group -> no disagreements anywhere -> flat (zero-slope) curve.
+    flat = dg.build_candidate_table(_group("h", [1, 1, 1, 1]), model=None)
+    _, flat_slope = dg.prefix_distance_disagreement(flat)
+    assert flat_slope == 0.0
+
+
+def test_stratify_by_u_level_buckets_into_terciles():
+    # six groups with distinct endpoint-U values -> three terciles over group values.
+    cand = dg.build_candidate_table(
+        sum((_group(f"g{i}", [0, 1, 0]) for i in range(6)), []), model=None)
+    cand["u_s10"] = cand["group_id"].map(
+        {f"g{i}": v for i, v in enumerate([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])})
+    table = dg.stratify_by_u_level(cand, "u_s10")
+    assert "u_s10_bucket" in cand.columns
+    assert set(table["u_s10_bucket"]) <= {"low", "mid", "high"}
+    assert "oracle_uplift" in table.columns

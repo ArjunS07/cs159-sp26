@@ -62,6 +62,7 @@ from .train import (
 from .diagnostics import (
     add_mode_structure,
     assign_modes,
+    attach_per_step_uncertainty,
     build_candidate_table,
     build_verifier,
     default_success,
@@ -71,8 +72,10 @@ from .diagnostics import (
     majority_mode_success,
     mode_ranking_accuracy,
     pairwise_spread,
+    prefix_distance_disagreement,
     prefix_features,
     stratified,
+    stratify_by_u_level,
     within_mode_pair_fraction,
 )
 
@@ -90,6 +93,7 @@ __all__ = [
     "score_group",
     "add_mode_structure",
     "assign_modes",
+    "attach_per_step_uncertainty",
     "build_candidate_table",
     "build_verifier",
     "default_success",
@@ -99,8 +103,10 @@ __all__ = [
     "majority_mode_success",
     "mode_ranking_accuracy",
     "pairwise_spread",
+    "prefix_distance_disagreement",
     "prefix_features",
     "stratified",
+    "stratify_by_u_level",
     "within_mode_pair_fraction",
     "build_clean_chunk_examples",
     "build_chunk_transitions",

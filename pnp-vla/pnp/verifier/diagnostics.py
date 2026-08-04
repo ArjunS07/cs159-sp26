@@ -358,6 +358,51 @@ def stratify_by_u_level(cand: pd.DataFrame, u_col: str, *, n_buckets: int = 3,
 
 
 # --------------------------------------------------------------------------- #
+# Wave-0 model-free screening (no verifier scores; runs before any model is trusted)
+# --------------------------------------------------------------------------- #
+def prefix_distance_disagreement(cand: pd.DataFrame, *, n_bins: int = 8) -> tuple:
+    """Label disagreement vs prefix distance within groups (the H-chaos probe).
+
+    For every unordered candidate pair inside a group, record the Euclidean distance
+    between their executed-prefix vectors and whether their success labels differ. Pairs
+    are pooled across groups and binned by distance (equal-mass quantile bins). A curve of
+    P(labels differ) that RISES with distance means outcomes vary smoothly with the prefix
+    (a learnable causal structure); a FLAT curve means disagreement is independent of the
+    prefix, i.e. within-group labels are coin flips (chaos dominates).
+
+    Returns ``(table, slope)`` where ``table`` has ``{distance_bin, dist_mid, p_disagree,
+    n}`` and ``slope`` is the least-squares slope of ``p_disagree`` vs ``dist_mid`` (>0
+    rising, ~0 flat). Model-free: uses only stored prefixes and success labels.
+    """
+    distances, disagree = [], []
+    for _, group in cand.groupby("group_id"):
+        features = np.stack([np.asarray(p, dtype=float) for p in group["prefix"]])
+        success = group["success"].to_numpy()
+        n = len(group)
+        for i in range(n):
+            for j in range(i + 1, n):
+                distances.append(float(np.linalg.norm(features[i] - features[j])))
+                disagree.append(int(success[i] != success[j]))
+    columns = ["distance_bin", "dist_mid", "p_disagree", "n"]
+    if not distances:
+        return pd.DataFrame(columns=columns), float("nan")
+    distances = np.asarray(distances)
+    disagree = np.asarray(disagree)
+    edges = np.unique(np.quantile(distances, np.linspace(0, 1, n_bins + 1)))
+    bins = np.clip(np.digitize(distances, edges[1:-1]), 0, len(edges) - 2)
+    rows = []
+    for b in range(len(edges) - 1):
+        mask = bins == b
+        if mask.any():
+            rows.append({"distance_bin": b, "dist_mid": float(distances[mask].mean()),
+                         "p_disagree": float(disagree[mask].mean()), "n": int(mask.sum())})
+    table = pd.DataFrame(rows, columns=columns)
+    slope = (float(np.polyfit(table["dist_mid"], table["p_disagree"], 1)[0])
+             if len(table) >= 2 else float("nan"))
+    return table, slope
+
+
+# --------------------------------------------------------------------------- #
 # Checkpoint reconstruction
 # --------------------------------------------------------------------------- #
 def build_verifier(arch: dict, state_dict, device=None):
