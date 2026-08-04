@@ -453,10 +453,14 @@ def fit_gbt_baseline(cand: pd.DataFrame, *, prefix_length: int = 10, n_splits: i
     folds), collects out-of-fold probabilities, and scores them with the same
     ``group_pair_accuracy`` used for the deep model -- so the numbers are directly comparable.
     GBT ~ deep model => the deep model is not the bottleneck; GBT wins => representation is;
-    GBT ~ chance => strong H-chaos evidence. Requires sklearn ([analysis] extra).
+    GBT ~ chance => strong H-chaos evidence. Requires sklearn ([analysis] extra). The returned
+    ``oof`` array (out-of-fold success probabilities, aligned to ``cand``) can be attached as a
+    score column and fed to :func:`selector_zoo`.
     """
+    nan_oof = np.full(len(cand), np.nan)
     if not _HAVE_SKLEARN:
-        return {"ranking": float("nan"), "n_groups": 0, "importances": {}, "note": "sklearn missing"}
+        return {"ranking": float("nan"), "n_groups": 0, "importances": {},
+                "oof": nan_oof, "note": "sklearn missing"}
     from sklearn.ensemble import GradientBoostingClassifier
     from sklearn.model_selection import GroupKFold
 
@@ -467,7 +471,7 @@ def fit_gbt_baseline(cand: pd.DataFrame, *, prefix_length: int = 10, n_splits: i
     n_splits = min(n_splits, len(np.unique(groups)))
     if n_splits < 2:
         return {"ranking": float("nan"), "n_groups": int(cand.group_id.nunique()),
-                "importances": {}, "note": "need >= 2 groups"}
+                "importances": {}, "oof": nan_oof, "note": "need >= 2 groups"}
     oof = np.full(len(cand), np.nan)
     importances = np.zeros(matrix.shape[1])
     folds = 0
@@ -488,6 +492,7 @@ def fit_gbt_baseline(cand: pd.DataFrame, *, prefix_length: int = 10, n_splits: i
         "importances": dict(sorted(
             zip(_HANDCRAFTED_FEATURE_NAMES, importances / folds if folds else importances),
             key=lambda kv: -kv[1])),
+        "oof": oof,
     }
 
 
