@@ -198,6 +198,20 @@ def test_selector_zoo_pick_best_and_reject_worst():
     assert np.isclose(rnd["deployed_success"], 1 / 3)  # group mean success
 
 
+def test_simulate_selector_uplift_monotonic_in_r_and_k():
+    outcomes = [0, 1, 0, 1, 0, 0, 1, 0]  # 8 candidates, 3 successes
+    cand = dg.build_candidate_table(
+        sum((_group(f"g{i}", outcomes) for i in range(4)), []), model=None)
+    surf = dg.simulate_selector_uplift(cand, r_grid=(0.5, 0.75, 1.0), k_grid=(1, 2, 4, 8))
+    for k in (1, 2, 4, 8):  # deployed success is non-decreasing in r at every budget
+        col = surf[surf.k == k].sort_values("r")["deployed_success"].to_numpy()
+        assert np.all(np.diff(col) >= -1e-12)
+        if k > 1:  # k=1 has no selection benefit (best-of-1 == random)
+            assert col[-1] > col[0]
+    oracle = surf[surf.r == 1.0].sort_values("k")["deployed_success"].to_numpy()
+    assert np.all(np.diff(oracle) >= -1e-12) and oracle[-1] > oracle[0]  # best-of-k grows with k
+
+
 def test_stratify_by_u_level_buckets_into_terciles():
     # six groups with distinct endpoint-U values -> three terciles over group values.
     cand = dg.build_candidate_table(

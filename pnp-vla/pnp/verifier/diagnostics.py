@@ -582,6 +582,46 @@ def selector_zoo(cand: pd.DataFrame, *, score_cols=("score",), quantile: float =
     return result
 
 
+# --- selector-quality -> deployed-uplift simulation (sets the target ranking) --- #
+def _best_of_k(m: int, s: int, k: int) -> float:
+    """Exact best-of-k oracle success: probability that k of m candidates include a success."""
+    from math import comb
+
+    if k >= m:
+        return 1.0 if s > 0 else 0.0
+    return 1.0 - comb(m - s, k) / comb(m, k)
+
+
+def simulate_selector_uplift(cand: pd.DataFrame, *,
+                             r_grid=(0.5, 0.55, 0.6, 0.65, 0.7, 0.8, 0.9, 1.0),
+                             k_grid=(1, 2, 4, 8), group_col: str = "group_id") -> pd.DataFrame:
+    """Deployed success as a function of selector ranking accuracy ``r`` and budget ``k``.
+
+    Models a selector of pairwise ranking accuracy ``r`` as a noisy oracle: with probability
+    ``q = max(0, 2r - 1)`` it returns the best of ``k`` sampled candidates (exact combinatorial
+    oracle), otherwise a uniformly random one (group mean). Averaged over groups with at least
+    ``k`` candidates. Labels only -- no model. Converts "ranking above 0.5" into "the minimum
+    ``r`` needed to beat the 0.650 default at a given ``k``".
+    """
+    groups = [(int(group["success"].sum()), len(group))
+              for _, group in cand.groupby(group_col)]
+    default_mean = float(np.mean([default_success(group)
+                                  for _, group in cand.groupby(group_col)]))
+    rows = []
+    for k in k_grid:
+        eligible = [(s, m) for s, m in groups if m >= k]
+        if not eligible:
+            continue
+        best = np.array([_best_of_k(m, s, k) for s, m in eligible])
+        random_pick = np.array([s / m for s, m in eligible])
+        for r in r_grid:
+            q = max(0.0, 2 * r - 1)
+            success = float(np.mean(q * best + (1 - q) * random_pick))
+            rows.append({"k": k, "r": r, "deployed_success": success,
+                         "uplift_vs_default": success - default_mean, "n_groups": len(eligible)})
+    return pd.DataFrame(rows)
+
+
 # --------------------------------------------------------------------------- #
 # Checkpoint reconstruction
 # --------------------------------------------------------------------------- #
