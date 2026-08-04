@@ -181,12 +181,13 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                             experiment, task_episodes, [(name, cfg)], done=done))
                         for start in range(0, len(todo), rollout_batch_size):
                             group = todo[start:start + rollout_batch_size]
+                            batch_t0 = time.perf_counter()
                             results = run_episode_batch(
                                 envs[:len(group)], [item[0] for item in group], policy,
                                 preprocess, postprocess, device, cfg)
+                            inference_ms_total += (time.perf_counter() - batch_t0) * 1000.0
                             occupied_lanes += len(group); batch_slots += rollout_batch_size
                             for (ep, method, config, rid), result in zip(group, results):
-                                inference_ms_total += result["inference_ms_total"]
                                 store.log_result(rid, ep, method, config, result)
                                 completed += 1; progress.update()
                                 elapsed_h = max((time.time() - collection_t0) / 3600, 1e-9)
