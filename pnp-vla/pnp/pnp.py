@@ -123,10 +123,9 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         if generators is None:
             last_eps = torch.empty_like(x_acc).normal_(generator=gen)
         else:
-            last_eps = torch.cat([
-                torch.empty_like(x_acc[i:i + 1]).normal_(generator=generators[i])
-                for i in range(x_acc.shape[0])
-            ], dim=0)
+            last_eps = torch.empty_like(x_acc)
+            for i in range(x_acc.shape[0]):
+                last_eps[i:i + 1].normal_(generator=generators[i])
         x_acc = (1.0 - s) * a_hat + s * last_eps
 
     A = torch.stack(a_hats, dim=0)                     # (K, B, chunk, adim)
