@@ -388,8 +388,8 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                     state["frames"].append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
                 state["robot_states"].append(np.concatenate([
                     obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"]]).copy())
-                state["obs"], _, env_done, _ = env.step(a)
                 state["step"] += 1
+                state["obs"], _, env_done, _ = env.step(a)
                 if env.check_success():
                     state.update(success=True, terminated_reason="success", done=True)
                 elif env_done:
