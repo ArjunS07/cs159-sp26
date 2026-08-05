@@ -1,6 +1,7 @@
 """Stable, package-owned rollout drivers for thin Colab worker launchers."""
 from __future__ import annotations
 
+import collections
 import contextlib
 import io
 
@@ -23,6 +24,16 @@ FULL_ABLATION_TASKS = {
 LIBERO_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 EXPERIMENT = "libero-hybrid-schedules-k3-v1"
 PRO_EXPERIMENT = "libero-pro-canonical-core-k3-v1"
+
+# ── Expanded 16-suite PRO run ────────────────────────────────────────────────
+# A single schedule at a larger K, over every perturbation family, to test whether the
+# per-iteration disagreement DECAY across the K perturbations predicts correctability. The
+# decay signal lives in pnp_action_vectors.u_iter / u_iter_vec, recorded unconditionally by
+# run_probe -- no a_hats blobs needed (112 bytes/step instead of 7 KB).
+PRO_EXPANDED_EXPERIMENT = "pro-16suite-k5-steps34-v1"
+PRO_EXPANDED_K = 5
+PRO_EXPANDED_STEPS = (3, 4)
+PRO_EXPANDED_EPISODES = 20          # episodes/task; short suites contribute what they ship
 
 
 def build_full_methods(schedules=SCHEDULES, k=K):
@@ -68,6 +79,27 @@ def build_pro_methods(k=K):
     ]
     if len(methods) != 3:
         raise AssertionError(f"expected 3 PRO methods, got {len(methods)}")
+    return methods
+
+
+def build_pro_expanded_methods(k=PRO_EXPANDED_K, steps=PRO_EXPANDED_STEPS):
+    """Expanded PRO arms: observed no-op, matched compute, refine-last -- one schedule, one K.
+
+    All three arms probe (or spend) the same budget: `10 + k*len(steps)` velocity-field
+    evaluations per chunk, so the compute control is honest at this K rather than reused from
+    the K=3 matrix.
+    """
+    probe = dict(pnp_steps=tuple(steps), pnp_k=k)
+    control_steps = BASE_INFERENCE_STEPS + k * len(steps)
+    methods = [
+        (Method.UNCERTAINTY, RolloutConfig(**probe, save_pcp_features=True)),
+        (Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=control_steps)),
+        (Method.REFINEMENT, RolloutConfig(**probe, refine=True)),
+    ]
+    if len(methods) != 3:
+        raise AssertionError(f"expected 3 expanded PRO methods, got {len(methods)}")
+    if any(config.refine_average for _, config in methods):
+        raise AssertionError("refine-average is out of scope for the expanded PRO run")
     return methods
 
 
@@ -126,6 +158,57 @@ def _prepare_libero_pro_episodes():
     if not all(ep["canonical_member"] for ep in episodes):
         raise AssertionError("canonical PRO manifest contains a non-canonical identity")
     print("LIBERO-PRO canonical manifest: 600 identities x 3 configs = 1800 rollouts")
+    return episodes
+
+
+def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODES):
+    """Install all 16 expanded-cohort PRO suites and build their episode manifest.
+
+    Unlike the canonical path this asserts no fixed identity count: `_with_milk` suites ship 10
+    init states per task while the rest ship more, so the total depends on the installed assets.
+    The count is printed and returned instead of hard-coded (see ROLLOUT_PLAN.md).
+    """
+    from . import libero_pro
+
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            pro_dir = libero_pro.clone_libero_pro()
+            libero_pro.install_assets(
+                suites=libero_pro.EXPANDED_PRO_SUITES, pro_dir=pro_dir)
+            libero_pro.apply_env_patches(pro_dir=pro_dir)
+            libero_pro.patch_torch_load()
+            benchmark_dict = libero_pro.reload_benchmark()
+            episodes = libero_pro.build_libero_pro_episodes(
+                benchmark_dict, suites=libero_pro.EXPANDED_PRO_SUITES,
+                episode_idxs=range(episodes_per_task))
+    finally:
+        # Print even on failure: the states/task table and the alias/asset warnings are exactly
+        # what diagnose a bad install, and they are worthless if an exception swallows them.
+        print(captured.getvalue()[-4000:])
+
+    identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in episodes
+    }
+    if len(identities) != len(episodes):
+        raise AssertionError(
+            f"expanded PRO manifest has duplicate identities "
+            f"({len(episodes)} rows / {len(identities)} identities)")
+    suites = sorted({ep["suite"] for ep in episodes})
+    if len(suites) != len(libero_pro.EXPANDED_PRO_SUITES):
+        missing = sorted(set(libero_pro.EXPANDED_PRO_SUITES) - set(suites))
+        raise AssertionError(f"expanded PRO manifest is missing suites: {missing}")
+    if not all(ep["expanded_member"] for ep in episodes):
+        raise AssertionError("expanded PRO manifest contains a non-expanded identity")
+
+    per_suite = collections.Counter(ep["suite"] for ep in episodes)
+    print(f'{"suite":<36}{"episodes":>9}{"max_steps":>11}')
+    for suite in libero_pro.EXPANDED_PRO_SUITES:
+        steps = sorted({ep["max_steps"] for ep in episodes if ep["suite"] == suite})
+        print(f"{suite:<36}{per_suite[suite]:>9}{str(steps[0] if steps else '-'):>11}")
+    print(f"LIBERO-PRO expanded manifest: {len(episodes)} identities x 3 configs = "
+          f"{len(episodes) * 3} rollouts")
     return episodes
 
 
@@ -226,4 +309,38 @@ def run_libero_pro_worker(*, shard_count: int, shard_index: int,
         cohort="canonical", shard_count=shard_count, shard_index=shard_index,
         benchmark="libero_pro", driver="canonical_pro_core",
         run_metadata={"libero_pro_revision": libero_pro.LIBERO_PRO_REVISION},
+    )
+
+
+def run_libero_pro_expanded_worker(*, shard_count: int, shard_index: int,
+                                   experiment: str = PRO_EXPANDED_EXPERIMENT,
+                                   episodes_per_task: int = PRO_EXPANDED_EPISODES):
+    """Run one shard of the expanded 16-suite PRO plan at K=5, refine-last (3,4).
+
+    Apply supabase/migrations/004_u_iter.sql FIRST. The per-iteration disagreement this run
+    exists to measure goes to pnp_action_vectors.u_iter / u_iter_vec; without those columns the
+    first rollout's insert fails with an unknown-column error and the worker stops. It fails
+    loudly rather than dropping the signal, but it fails after the rollouts row is already
+    upserted -- so that identity would then be skipped as done. Delete the experiment's rows
+    before retrying.
+    """
+    from . import libero_pro, models
+
+    episodes = identity_shard(
+        _prepare_libero_pro_expanded_episodes(episodes_per_task), shard_count, shard_index)
+    methods = build_pro_expanded_methods()
+    expected = len(episodes) * len(methods)
+    print(f"PRO expanded worker {shard_index}/{shard_count}: {len(episodes)} identities x "
+          f"{len(methods)} configs = {expected} rollouts")
+    policy, preprocess, postprocess = models.load_pi05()
+    device = models.default_device()
+    store = SupabaseStore()
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
+        experiment=experiment, episodes=episodes, methods=methods,
+        cohort="expanded", shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="expanded_pro_16suite",
+        run_metadata={"libero_pro_revision": libero_pro.LIBERO_PRO_REVISION,
+                      "pnp_k": PRO_EXPANDED_K, "pnp_steps": list(PRO_EXPANDED_STEPS),
+                      "episodes_per_task": episodes_per_task},
     )

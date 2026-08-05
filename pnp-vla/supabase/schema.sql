@@ -179,7 +179,13 @@ CREATE TABLE IF NOT EXISTS pnp_action_vectors (
     a_std_vec    JSONB,
     bc_vec       JSONB,
     mm_pc1_frac  REAL,
-    mm_bc_pc1    REAL
+    mm_bc_pc1    REAL,
+    -- Per-ITERATION consecutive disagreement from the K predict-and-perturb iterations:
+    -- u_iter is (K-1,) scalars, u_iter_vec is (K-1, action_dim). u_mean/u_vec in
+    -- pnp_euler_steps average this axis away; these keep it so decay across the K
+    -- perturbations is measurable.
+    u_iter       JSONB,
+    u_iter_vec   JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_pav_rollout ON pnp_action_vectors(rollout_id);
 
@@ -294,3 +300,7 @@ CREATE TABLE IF NOT EXISTS encoding_cache (
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS canonical_member BOOLEAN;
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS expanded_member BOOLEAN;
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS generated_chunks_path TEXT;
+
+-- Idempotent migration for databases created before per-iteration uncertainty was recorded.
+ALTER TABLE pnp_action_vectors ADD COLUMN IF NOT EXISTS u_iter JSONB;
+ALTER TABLE pnp_action_vectors ADD COLUMN IF NOT EXISTS u_iter_vec JSONB;

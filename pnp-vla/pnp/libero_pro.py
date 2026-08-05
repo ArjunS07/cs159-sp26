@@ -23,11 +23,26 @@ import re
 import shutil
 import sys
 
-from .config import MAX_STEPS_MAP, LIBERO_PRO_MAX_STEPS
+from .config import resolve_max_steps
 
 LIBERO_PRO_REPO = "https://github.com/Zxy-MLlab/LIBERO-PRO.git"
 LIBERO_PRO_REVISION = "eafdb809426b13153aa1e4c42d6601844217dfec"
 PRO_SUFFIXES = ("_lan", "_swap", "_object", "_task", "_env", "_temp")
+
+# Assets live in TWO places and picking the wrong one silently invalidates results. The official
+# HF dataset ships exactly these 16 suites; the position-perturbation (_temp_x*/y*) and distractor
+# (_with_*) suites exist ONLY in the git clone, each under its own per-suite directory.
+#
+# The failure that motivated this split: sourcing a _temp suite's init states from the
+# unperturbed `libero_object` inflated SR from ~45% to ~90%, because a .pruned_init stores the
+# full sim state including object pose and env.set_init_state() overrides the perturbed region
+# the bddl defines. Never substitute a different suite's init files.
+LIBERO_PRO_HF_DATASET = "zhouxueyang/LIBERO-Pro"
+HF_PRO_SUITES = frozenset(
+    f"libero_{base}_{kind}"
+    for base in ("10", "goal", "object", "spatial")
+    for kind in ("lan", "object", "swap", "task")
+)
 
 TEMP_TASKS = [
     "pick_up_the_alphabet_soup_and_place_it_in_the_basket",
@@ -87,32 +102,69 @@ def clone_libero_pro(dest: str = "/content/LIBERO-PRO") -> str:
     return dest
 
 
+def _hf_asset_root() -> str:
+    """Download the official LIBERO-PRO asset dataset and return its local root."""
+    from huggingface_hub import snapshot_download
+    return snapshot_download(LIBERO_PRO_HF_DATASET, repo_type="dataset",
+                             token=os.getenv("HF_TOKEN"))
+
+
+def _states_per_task(path: str) -> int | str:
+    """Length of a .pruned_init state array, for the post-install diagnostic."""
+    import torch
+    try:
+        return len(torch.load(path, weights_only=False))
+    except Exception as exc:                                  # noqa: BLE001 - diagnostic only
+        return f"err {type(exc).__name__}"
+
+
 def install_assets(*, suites=None, site: str | None = None,
                    pro_dir: str = "/content/LIBERO-PRO") -> str:
-    """Install selected official BDDL/init assets from the LIBERO-PRO clone.
+    """Install official BDDL/init assets for `suites`, each from its own upstream source.
 
-    Re-running this function is safe: identical files are copied over the prior installation.
-    Restricting the copy to the requested suites keeps the canonical 600-identity run independent
-    of expanded-cohort additions in the upstream repository.
+    Per-family sourcing (see HF_PRO_SUITES): `_swap`/`_task`/`_lan`/`_object` come from the
+    HuggingFace dataset, `_temp_x*`/`_temp_y*` and `_with_*` from the pinned git clone. Both read
+    the suite's OWN per-suite directory -- a suite's init states are never taken from another
+    suite. A missing source raises rather than falling back, so a wrong-source install cannot
+    happen silently.
+
+    Re-running is safe: identical files are copied over the prior installation. Prints
+    states/task per suite, which is the diagnostic that catches a truncated or wrong-source copy.
     """
     suites = list(dict.fromkeys(suites or CANONICAL_PRO_SUITES))
     site = site or libero_site()
-    asset_root = os.path.join(pro_dir, "libero", "libero")
-    for kind, suffix in (("bddl_files", ".bddl"), ("init_files", ".pruned_init")):
-        for suite in suites:
+    clone_root = os.path.join(pro_dir, "libero", "libero")
+    hf_root = None
+    if any(suite in HF_PRO_SUITES for suite in suites):
+        hf_root = _hf_asset_root()
+
+    installed = {}
+    for suite in suites:
+        from_hf = suite in HF_PRO_SUITES
+        asset_root = hf_root if from_hf else clone_root
+        for kind, suffix in (("bddl_files", ".bddl"), ("init_files", ".pruned_init")):
             src = os.path.join(asset_root, kind, suite)
             if not os.path.isdir(src):
-                raise FileNotFoundError(f"official LIBERO-PRO assets missing {kind}/{suite}")
-            files = [name for name in os.listdir(src) if name.endswith(suffix)]
+                raise FileNotFoundError(
+                    f"official LIBERO-PRO assets missing {kind}/{suite} under "
+                    f"{'the HuggingFace dataset ' + LIBERO_PRO_HF_DATASET if from_hf else pro_dir}")
+            files = sorted(name for name in os.listdir(src) if name.endswith(suffix))
             if len(files) != 10:
                 raise RuntimeError(
-                    f"expected 10 {suffix} files for {suite}, found {len(files)}")
+                    f"expected 10 {suffix} files (one per task) for {suite}, found {len(files)}")
             dst = os.path.join(site, kind, suite)
             os.makedirs(dst, exist_ok=True)
             for name in files:
                 shutil.copy2(os.path.join(src, name), os.path.join(dst, name))
+            if kind == "init_files":
+                installed[suite] = ("hf" if from_hf else "clone",
+                                    _states_per_task(os.path.join(dst, files[0])))
+
     print(f"installed official assets for {len(suites)} LIBERO-PRO suites")
-    return asset_root
+    print(f'{"suite":<36}{"source":>8}{"states/task":>13}')
+    for suite, (source, n_states) in installed.items():
+        print(f"{suite:<36}{source:>8}{str(n_states):>13}")
+    return clone_root
 
 
 def apply_env_patches(site: str | None = None, pro_dir: str = "/content/LIBERO-PRO") -> None:
@@ -141,6 +193,21 @@ def apply_env_patches(site: str | None = None, pro_dir: str = "/content/LIBERO-P
             if f.endswith(".py") and not os.path.exists(os.path.join(dst_obj, f)):
                 shutil.copy2(os.path.join(src_obj, f), os.path.join(dst_obj, f))
                 print(f"Added new object file: {f}")
+
+    # 1b) custom meshes the distractor (_with_*) suites reference. robosuite resolves them
+    # relative to dist-packages, not to the clone, so the tree has to be copied out.
+    # site is <dist-packages>/libero/libero, so dist-packages is two levels up.
+    src_custom = os.path.join(pro_dir, "notebooks", "custom_assets")
+    dst_custom = os.path.join(os.path.dirname(os.path.dirname(site)),
+                              "notebooks", "custom_assets")
+    if not os.path.isdir(src_custom):
+        print(f"WARNING: not found in clone: notebooks/custom_assets "
+              f"(distractor suites may fail to build)")
+    elif os.path.exists(dst_custom):
+        print(f"custom_assets already installed: {dst_custom}")
+    else:
+        shutil.copytree(src_custom, dst_custom)
+        print(f"Copied custom_assets -> {dst_custom}")
 
     binit = os.path.join(site, "benchmark/__init__.py")
     content = open(binit).read()
@@ -181,6 +248,43 @@ def apply_env_patches(site: str | None = None, pro_dir: str = "/content/LIBERO-P
             f.writelines(f'    "{t}",\n' for t in TEMP_TASKS)
             f.write("]\n")
     print(f"Registered {len(additions)} PRO + {len(temp_add)} position-perturb suites")
+
+    # 6) object-name aliases. Some PRO bddl files reference renamed/rescaled objects that the
+    # patched envs/objects/__init__.py does not register, so copying that file is NOT sufficient
+    # -- without these, env construction raises KeyError on the missing name.
+    register_object_aliases()
+
+
+# Alias -> the already-registered object it should resolve to.
+OBJECT_ALIASES = {
+    "black_bowl": "akita_black_bowl",
+    "yellow_plate": "plate",
+    "bigger_akita_black_bowl": "akita_black_bowl",
+    "brown_rack": "wine_rack",
+    "red_cream_cheese": "cream_cheese",
+    "white_bottle": "wine_bottle",
+    "yellow_cabinet": "wooden_cabinet",
+    "yellow_stove": "stove",
+}
+
+
+def register_object_aliases(aliases: dict | None = None) -> list[str]:
+    """Point PRO object aliases at their base objects in the live OBJECTS_DICT.
+
+    Import-time mutation of the installed package, so it must run after apply_env_patches has
+    copied envs/objects/__init__.py. Returns the aliases actually added.
+    """
+    from libero.libero.envs.objects import OBJECTS_DICT
+    aliases = aliases or OBJECT_ALIASES
+    added = []
+    for alias, base in aliases.items():
+        if alias not in OBJECTS_DICT and base in OBJECTS_DICT:
+            OBJECTS_DICT[alias] = OBJECTS_DICT[base]
+            added.append(alias)
+    unresolved = [a for a in aliases if a not in OBJECTS_DICT]
+    print(f"OBJECTS_DICT: {len(OBJECTS_DICT)} entries, registered {len(added)} alias(es)"
+          + (f"; UNRESOLVED (base absent too): {unresolved}" if unresolved else ""))
+    return added
 
 
 def patch_torch_load() -> None:
@@ -304,7 +408,7 @@ def build_libero_pro_episodes(benchmark_dict, suites=None, episode_idxs=None):
     for suite in suites:
         desc = describe_suite(suite)
         task_suite = benchmark_dict[suite]()
-        max_steps = MAX_STEPS_MAP.get(suite, LIBERO_PRO_MAX_STEPS)
+        max_steps = resolve_max_steps(suite)
         for task_idx in range(task_suite.n_tasks):
             task = task_suite.get_task(task_idx)
             init_states = task_suite.get_task_init_states(task_idx)

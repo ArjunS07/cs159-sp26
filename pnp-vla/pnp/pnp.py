@@ -126,9 +126,11 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
     A = torch.stack(a_hats, dim=0)                     # (K, B, chunk, adim)
     z_hat_full = torch.stack(a_hats_full, dim=0).mean(dim=0)   # (B, chunk, max_adim)
     if A.shape[0] >= 2:
-        u_consecutive = (A[1:] - A[:-1]).abs().mean(dim=0)     # (B, chunk, adim)
+        d_consecutive = (A[1:] - A[:-1]).abs()                 # (K-1, B, chunk, adim)
+        u_consecutive = d_consecutive.mean(dim=0)              # (B, chunk, adim)
         a_std = A.std(dim=0)
     else:
+        d_consecutive = torch.zeros_like(A[:1])
         u_consecutive = torch.zeros_like(A[0]); a_std = torch.zeros_like(A[0])
 
     rec = {
@@ -139,6 +141,12 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         "u_vec": u_consecutive.mean(dim=(0, 1)).detach().float().cpu().numpy(),
         "a_std_vec": a_std.mean(dim=(0, 1)).detach().float().cpu().numpy(),
         "a_mean_vec": A.mean(dim=(0, 1, 2)).detach().float().cpu().numpy(),
+        # Per-ITERATION disagreement, i.e. |a_hat_{i+1} - a_hat_i| for i in 0..K-2, kept instead
+        # of collapsed into u_mean. This is what makes "does disagreement DECAY across the K
+        # perturbations?" answerable; u_mean/u_vec average that axis away. ~112 bytes per probed
+        # step at K=5, so it is recorded unconditionally rather than behind a save_* sink.
+        "u_iter": d_consecutive.mean(dim=(1, 2, 3)).detach().float().cpu().numpy(),
+        "u_iter_vec": d_consecutive.mean(dim=(1, 2)).detach().float().cpu().numpy(),
     }
     if compute_multimodal and A.shape[0] >= 4:
         bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(A.detach().float().cpu().numpy()[:, 0])

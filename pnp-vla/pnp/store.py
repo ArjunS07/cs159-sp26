@@ -337,6 +337,11 @@ class SupabaseStore:
                 v = {"chunk_idx": ci, "euler_step": st["step"],
                      "a_mean_vec": list(map(float, st.get("a_mean_vec", []))),
                      "a_std_vec": list(map(float, st.get("a_std_vec", [])))}
+                # Per-iteration consecutive disagreement: u_iter is (K-1,), u_iter_vec (K-1, adim).
+                if st.get("u_iter") is not None:
+                    v["u_iter"] = [float(x) for x in st["u_iter"]]
+                if st.get("u_iter_vec") is not None:
+                    v["u_iter_vec"] = [[float(x) for x in row] for row in st["u_iter_vec"]]
                 if "bc_vec" in st:
                     v.update(bc_vec=list(map(float, st["bc_vec"])),
                              mm_pc1_frac=st.get("mm_pc1_frac"), mm_bc_pc1=st.get("mm_bc_pc1"))

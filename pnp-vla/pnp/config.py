@@ -36,7 +36,25 @@ MAX_STEPS_MAP = {
     "libero_10": 520,
     "libero_90": 400,
 }
-LIBERO_PRO_MAX_STEPS = 280  # default horizon for non-stock PRO suites
+LIBERO_PRO_MAX_STEPS = 280  # fallback when a suite matches no stock base
+
+# Longest base-suite prefix wins, so libero_object_temp_x0.1 -> libero_object, not a partial match.
+_BASE_SUITE_PREFIXES = tuple(sorted(MAX_STEPS_MAP, key=len, reverse=True))
+
+
+def resolve_max_steps(suite: str) -> int:
+    """Episode horizon for a suite, stock or perturbed.
+
+    LIBERO-PRO's own TASK_MAX_STEPS gives every perturbed suite its BASE suite's canonical limit
+    (goal 300, spatial 220, libero_10 520, object 280 -- the OpenVLA values, each the suite's
+    longest training demo plus margin). So resolve by longest base prefix rather than exact key,
+    or `libero_10_swap` silently runs at 280 instead of 520 and `libero_goal_*` at 280 instead
+    of 300.
+    """
+    for prefix in _BASE_SUITE_PREFIXES:
+        if suite.startswith(prefix):
+            return MAX_STEPS_MAP[prefix]
+    return LIBERO_PRO_MAX_STEPS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model

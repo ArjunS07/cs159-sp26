@@ -31,6 +31,10 @@ def notebook(shard_index: int, *, benchmark: str = "libero") -> dict:
         filename = f"libero_pro_worker_{shard_index}.ipynb"
         title = f"LIBERO-PRO canonical worker {shard_index}/{SHARD_COUNT}"
         function = "run_libero_pro_worker"
+    elif benchmark == "libero_pro_expanded":
+        filename = f"libero_pro16_worker_{shard_index}.ipynb"
+        title = f"LIBERO-PRO expanded 16-suite worker {shard_index}/{SHARD_COUNT}"
+        function = "run_libero_pro_expanded_worker"
     else:
         raise ValueError(f"unknown benchmark: {benchmark}")
     run = f'''from pnp.experiments import {function}
@@ -57,11 +61,17 @@ SHARD_INDEX = {shard_index}
     }
 
 
+STEMS = {
+    "libero": "libero_worker",
+    "libero_pro": "libero_pro_worker",
+    "libero_pro_expanded": "libero_pro16_worker",
+}
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    for benchmark in ("libero", "libero_pro"):
+    for benchmark, stem in STEMS.items():
         for shard_index in range(SHARD_COUNT):
-            stem = "libero_worker" if benchmark == "libero" else "libero_pro_worker"
             path = OUT / f"{stem}_{shard_index}.ipynb"
             path.write_text(json.dumps(
                 notebook(shard_index, benchmark=benchmark), indent=1) + "\n")
