@@ -34,6 +34,10 @@ PRO_EXPANDED_EXPERIMENT = "pro-16suite-k5-steps34-v1"
 PRO_EXPANDED_K = 5
 PRO_EXPANDED_STEPS = (3, 4)
 PRO_EXPANDED_EPISODES = 20          # episodes/task; short suites contribute what they ship
+# The matched-compute control is ~28% of wall time and carries no telemetry, so it is deferred.
+# Flip to True and re-run the same workers to fill it in: it is a distinct config_hash, so
+# iter_todo requests only the missing control rollouts and skips everything already collected.
+PRO_EXPANDED_INCLUDE_CONTROL = False
 
 
 def build_full_methods(schedules=SCHEDULES, k=K):
@@ -82,22 +86,26 @@ def build_pro_methods(k=K):
     return methods
 
 
-def build_pro_expanded_methods(k=PRO_EXPANDED_K, steps=PRO_EXPANDED_STEPS):
-    """Expanded PRO arms: observed no-op, matched compute, refine-last -- one schedule, one K.
+def build_pro_expanded_methods(k=PRO_EXPANDED_K, steps=PRO_EXPANDED_STEPS,
+                               include_control=PRO_EXPANDED_INCLUDE_CONTROL):
+    """Expanded PRO arms: observed no-op, refine-last, and optionally matched compute.
 
-    All three arms probe (or spend) the same budget: `10 + k*len(steps)` velocity-field
-    evaluations per chunk, so the compute control is honest at this K rather than reused from
-    the K=3 matrix.
+    Every arm spends `10 + k*len(steps)` velocity-field evaluations per chunk, so the control is
+    honest at this K rather than reused from the K=3 matrix. It is optional because it carries no
+    telemetry: dropping it costs only the compute confound defence, and it can be back-filled
+    later under the same experiment label without recollecting anything (its config_hash is
+    distinct, so iter_todo asks for exactly the missing rollouts).
     """
     probe = dict(pnp_steps=tuple(steps), pnp_k=k)
     control_steps = BASE_INFERENCE_STEPS + k * len(steps)
-    methods = [
-        (Method.UNCERTAINTY, RolloutConfig(**probe, save_pcp_features=True)),
-        (Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=control_steps)),
-        (Method.REFINEMENT, RolloutConfig(**probe, refine=True)),
-    ]
-    if len(methods) != 3:
-        raise AssertionError(f"expected 3 expanded PRO methods, got {len(methods)}")
+    methods = [(Method.UNCERTAINTY, RolloutConfig(**probe, save_pcp_features=True))]
+    if include_control:
+        methods.append(
+            (Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=control_steps)))
+    methods.append((Method.REFINEMENT, RolloutConfig(**probe, refine=True)))
+    expected = 3 if include_control else 2
+    if len(methods) != expected:
+        raise AssertionError(f"expected {expected} expanded PRO methods, got {len(methods)}")
     if any(config.refine_average for _, config in methods):
         raise AssertionError("refine-average is out of scope for the expanded PRO run")
     return methods
@@ -314,7 +322,8 @@ def run_libero_pro_worker(*, shard_count: int, shard_index: int,
 
 def run_libero_pro_expanded_worker(*, shard_count: int, shard_index: int,
                                    experiment: str = PRO_EXPANDED_EXPERIMENT,
-                                   episodes_per_task: int = PRO_EXPANDED_EPISODES):
+                                   episodes_per_task: int = PRO_EXPANDED_EPISODES,
+                                   include_control: bool = PRO_EXPANDED_INCLUDE_CONTROL):
     """Run one shard of the expanded 16-suite PRO plan at K=5, refine-last (3,4).
 
     Apply supabase/migrations/004_u_iter.sql FIRST. The per-iteration disagreement this run
@@ -323,15 +332,21 @@ def run_libero_pro_expanded_worker(*, shard_count: int, shard_index: int,
     loudly rather than dropping the signal, but it fails after the rollouts row is already
     upserted -- so that identity would then be skipped as done. Delete the experiment's rows
     before retrying.
+
+    Resumable: rollout ids are a pure function of (experiment, identity, logical config), so a
+    disconnected worker restarted with the same shard_index skips completed work. Toggling
+    include_control changes only WHICH configs are requested, never the ids of the others, so the
+    control can be deferred now and back-filled later without recollecting anything.
     """
     from . import libero_pro, models
 
     episodes = identity_shard(
         _prepare_libero_pro_expanded_episodes(episodes_per_task), shard_count, shard_index)
-    methods = build_pro_expanded_methods()
+    methods = build_pro_expanded_methods(include_control=include_control)
     expected = len(episodes) * len(methods)
     print(f"PRO expanded worker {shard_index}/{shard_count}: {len(episodes)} identities x "
-          f"{len(methods)} configs = {expected} rollouts")
+          f"{len(methods)} configs = {expected} rollouts "
+          f"(matched-compute control {'ON' if include_control else 'DEFERRED'})")
     policy, preprocess, postprocess = models.load_pi05()
     device = models.default_device()
     store = SupabaseStore()
@@ -342,5 +357,6 @@ def run_libero_pro_expanded_worker(*, shard_count: int, shard_index: int,
         benchmark="libero_pro", driver="expanded_pro_16suite",
         run_metadata={"libero_pro_revision": libero_pro.LIBERO_PRO_REVISION,
                       "pnp_k": PRO_EXPANDED_K, "pnp_steps": list(PRO_EXPANDED_STEPS),
-                      "episodes_per_task": episodes_per_task},
+                      "episodes_per_task": episodes_per_task,
+                      "include_control": include_control},
     )

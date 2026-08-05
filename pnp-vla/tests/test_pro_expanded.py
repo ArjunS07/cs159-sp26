@@ -75,7 +75,7 @@ def test_longest_base_prefix_wins():
 # Method matrix
 # ─────────────────────────────────────────────────────────────────────────────
 def test_expanded_methods_are_three_unique_arms_at_k5():
-    methods = build_pro_expanded_methods()
+    methods = build_pro_expanded_methods(include_control=True)
     assert [name for name, _ in methods] == [
         Method.UNCERTAINTY, Method.EXTRA_STEPS, Method.REFINEMENT,
     ]
@@ -95,9 +95,36 @@ def test_expanded_methods_are_three_unique_arms_at_k5():
     assert refine.refine and not refine.refine_average
 
 
+def test_control_is_deferred_by_default():
+    names = [name for name, _ in build_pro_expanded_methods()]
+    assert names == [Method.UNCERTAINTY, Method.REFINEMENT]
+
+
+def test_deferring_the_control_preserves_the_other_arms_identities():
+    """The whole reason the control can be back-filled later: dropping it must not perturb the
+    telemetry arms' rollout ids, or a resumed worker would recollect everything."""
+    episode = {"benchmark": "libero_pro", "suite": "libero_goal_swap", "task_idx": 0,
+               "ep_idx": 0, "init_state_hash": "abc123abc123"}
+    store = object.__new__(SupabaseStore)
+
+    def ids(methods):
+        return {name: store.rollout_id(PRO_EXPANDED_EXPERIMENT, episode, name, config)
+                for name, config in methods}
+
+    without = ids(build_pro_expanded_methods(include_control=False))
+    with_control = ids(build_pro_expanded_methods(include_control=True))
+    assert set(without) == {Method.UNCERTAINTY, Method.REFINEMENT}
+    for name, rid in without.items():
+        assert with_control[name] == rid
+    # ...and the control itself is a distinct id, so back-filling collects only what is missing.
+    assert with_control[Method.EXTRA_STEPS] not in without.values()
+
+
 def test_expanded_arms_never_write_ahats_blobs():
     # The decay signal is u_iter (112 B/step), not a_hats stacks (7 KB/step).
-    assert not any(config.save_ahats for _, config in build_pro_expanded_methods())
+    for control in (False, True):
+        assert not any(config.save_ahats for _, config
+                       in build_pro_expanded_methods(include_control=control))
 
 
 def test_expanded_experiment_is_separate_from_the_canonical_one():
@@ -108,7 +135,7 @@ def test_expanded_experiment_is_separate_from_the_canonical_one():
     }
     expanded = {
         SupabaseStore.config_hash(SupabaseStore._logical_key(name, config))
-        for name, config in build_pro_expanded_methods()
+        for name, config in build_pro_expanded_methods(include_control=True)
     }
     # Different K and schedule => no config collides, so neither run can absorb the other's rows.
     assert not (canonical & expanded)
