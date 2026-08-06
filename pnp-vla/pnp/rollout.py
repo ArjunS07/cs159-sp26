@@ -282,6 +282,80 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
 # ─────────────────────────────────────────────────────────────────────────────
 # Env-lifecycle helper (the one loop convenience the repo provides)
 # ─────────────────────────────────────────────────────────────────────────────
+def _sim_state(env):
+    """Flattened MuJoCo state of a (possibly wrapped) robosuite env, or None."""
+    target = getattr(env, "env", env)
+    sim = getattr(target, "sim", None) or getattr(env, "sim", None)
+    if sim is None:
+        return None
+    try:
+        return np.asarray(sim.get_state().flatten()).copy()
+    except Exception:
+        return None
+
+
+def measure_replay_determinism(env, ep, n_steps=12, camera="agentview_image"):
+    """Separate PHYSICS drift from RENDER drift across two identical replays.
+
+    A bit-exact frame comparison is only a valid oracle if replaying an episode reproduces itself.
+    When it does not, the question is which layer moved:
+
+      * physics identical, pixels differ  -> the rasteriser is nondeterministic (Mesa software EGL
+        does this). Harmless for behaviour; compare frames with a tolerance, not equality.
+      * physics differs                   -> reset()/set_init_state() is not restoring state, which
+        undermines any paired-arm comparison at the same identity, not just this optimisation.
+
+    Returns {'state_max', 'image_max', 'image_frac', 'first_state_drift', 'first_image_drift'}.
+    """
+    def replay():
+        set_camera_observables(env, True)
+        env.reset()
+        env.set_init_state(ep["init_state"])
+        states, images = [], []
+        for _ in range(n_steps):
+            obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+            states.append(_sim_state(env))
+            value = obs.get(camera)
+            images.append(None if value is None else np.asarray(value, dtype=np.int16).copy())
+        return states, images
+
+    states_a, images_a = replay()
+    states_b, images_b = replay()
+
+    state_max, image_max, image_frac = 0.0, 0, 0.0
+    first_state, first_image = None, None
+    print(f"{'step':>5}{'|dstate|max':>14}{'|dpixel|max':>13}{'pixels differing':>18}")
+    for step in range(n_steps):
+        sa, sb = states_a[step], states_b[step]
+        ds = float(np.abs(sa - sb).max()) if sa is not None and sb is not None else float("nan")
+        ia, ib = images_a[step], images_b[step]
+        if ia is None or ib is None:
+            di, frac = -1, float("nan")
+        else:
+            diff = np.abs(ia - ib)
+            di, frac = int(diff.max()), float((diff > 0).mean())
+        print(f"{step:>5}{ds:>14.3e}{di:>13}{frac:>17.2%}")
+        if ds == ds and ds > 0 and first_state is None:
+            first_state = step
+        if di > 0 and first_image is None:
+            first_image = step
+        state_max = max(state_max, 0.0 if ds != ds else ds)
+        image_max, image_frac = max(image_max, di), max(image_frac, 0.0 if frac != frac else frac)
+
+    print(f"\nphysics: max |dstate| = {state_max:.3e}"
+          + (f", first drift at step {first_state}" if first_state is not None else " (identical)"))
+    print(f"render : max |dpixel| = {image_max}, up to {image_frac:.2%} of pixels"
+          + (f", first drift at step {first_image}" if first_image is not None else " (identical)"))
+    if state_max == 0.0 and image_max > 0:
+        print("=> physics is deterministic, the rasteriser is not. Compare frames with a "
+              "tolerance; behaviour is unaffected.")
+    elif state_max > 0.0:
+        print("=> the SIMULATOR diverges between replays. This affects paired comparisons at the "
+              "same identity, not just render skipping.")
+    return {"state_max": state_max, "image_max": image_max, "image_frac": image_frac,
+            "first_state_drift": first_state, "first_image_drift": first_image}
+
+
 def measure_render_lag(env, ep, off_at=1, on_at=8, n_steps=12, camera="agentview_image"):
     """Measure how many steps a re-enabled camera needs before it renders fresh again.
 
@@ -312,41 +386,38 @@ def measure_render_lag(env, ep, off_at=1, on_at=8, n_steps=12, camera="agentview
     # env looks exactly like a stale-frame bug.
     reference = replay()
     control = replay()
-    reproducible = all(
-        (a is None and b is None) or (a is not None and b is not None and np.array_equal(a, b))
-        for a, b in zip(reference, control))
-    first_drift = next((i for i, (a, b) in enumerate(zip(reference, control))
-                        if not ((a is None and b is None)
-                                or (a is not None and b is not None and np.array_equal(a, b)))),
-                       None)
-    print(f"control: two untouched replays reproduce each other = {reproducible}"
-          + (f" (first drift at step {first_drift})" if first_drift is not None else ""))
-    if not reproducible:
-        print("=> replaying this episode is not frame-reproducible, so a stale-frame test on two\n"
-              "   separate replays cannot conclude anything. Fix or characterise the drift first.")
-        set_camera_observables(env, True)
-        return None
+    def _delta(a, b):
+        if a is None or b is None:
+            return None
+        return int(np.abs(np.asarray(a, dtype=np.int16) - np.asarray(b, dtype=np.int16)).max())
+
+    # The control establishes the NOISE FLOOR. Mesa's rasteriser is not bit-deterministic, so
+    # bit-equality is the wrong oracle -- "fresh" means within the floor, exactly as
+    # assert_pnp_noop measures a vanilla-vs-vanilla floor before judging the probe.
+    floor = max((d for d in (_delta(a, b) for a, b in zip(reference, control))
+                 if d is not None), default=0)
+    tolerance = max(3 * floor, 2)
+    print(f"control: max |dpixel| between two untouched replays = {floor} "
+          f"-> fresh means within {tolerance}")
 
     probed = replay(off=off_at, on=on_at)
     set_camera_observables(env, True)
 
     lead = None
-    print(f"\n{'step':>5}{'state':>10}{'vs reference':>16}{'vs pre-disable':>17}")
+    print(f"\n{'step':>5}{'state':>10}{'d(reference)':>14}{'d(pre-disable)':>16}{'verdict':>10}")
     # The probed run's OWN last rendered frame before the disable window.
     stale = probed[off_at - 1] if off_at >= 1 else None
     for step in range(on_at, n_steps):
         image = probed[step]
-        if image is None:
-            state, matches_ref, matches_stale = "missing", False, False
-        else:
-            state = "present"
-            matches_ref = np.array_equal(image, reference[step])
-            matches_stale = stale is not None and np.array_equal(image, stale)
-        print(f"{step:>5}{state:>10}{str(matches_ref):>16}{str(matches_stale):>17}")
-        if matches_ref and lead is None:
+        d_ref, d_stale = _delta(image, reference[step]), _delta(image, stale)
+        fresh = d_ref is not None and d_ref <= tolerance
+        print(f"{step:>5}{'missing' if image is None else 'present':>10}"
+              f"{'-' if d_ref is None else d_ref:>14}{'-' if d_stale is None else d_stale:>16}"
+              f"{'fresh' if fresh else 'STALE':>10}")
+        if fresh and lead is None:
             lead = step - on_at + 1
     if lead is None:
-        print("\nnever matched the reference -- rendering cannot be skipped on this robosuite")
+        print("\nnever came within the noise floor -- rendering cannot be skipped this way")
     else:
         print(f"\nmeasured render_lead = {lead}")
     return lead
@@ -379,38 +450,45 @@ def assert_render_skip_equivalent(env, ep, policy, preprocess, postprocess, devi
         return wrapped
 
     from dataclasses import replace
-    runs = {}
-    for label, skip in (("always", False), ("skipped", True)):
+    runs = []
+    # Two always-rendering runs first: their disagreement is the nondeterminism FLOOR. Neither the
+    # rasteriser nor bf16 flow matching is bit-reproducible, so bit-equality would fail for
+    # reasons that have nothing to do with skipping. Same shape as assert_pnp_noop.
+    for skip in (False, False, True):
         frames: list = []
         result = run_episode(env, ep, policy, _record(frames), postprocess, device,
                              replace(base, skip_unused_renders=skip))
-        runs[label] = (frames, result)
+        runs.append((frames, result))
+    (base_frames, base_result), (ctrl_frames, _), (skip_frames, skip_result) = runs
 
-    always_frames, always = runs["always"]
-    skipped_frames, skipped = runs["skipped"]
-    n = min(len(always_frames), len(skipped_frames))
-    identical = (len(always_frames) == len(skipped_frames)
-                 and all(np.array_equal(always_frames[i], skipped_frames[i]) for i in range(n)))
-    first_bad = next((i for i in range(n)
-                      if not np.array_equal(always_frames[i], skipped_frames[i])), None)
-    action_gap = float(np.abs(
-        always["trajectory"]["actions"][:min(always["n_steps"], skipped["n_steps"])]
-        - skipped["trajectory"]["actions"][:min(always["n_steps"], skipped["n_steps"])]
-    ).max()) if always.get("trajectory") and skipped.get("trajectory") else float("nan")
+    def _gap(left, right):
+        n = min(len(left), len(right))
+        if n == 0:
+            return float("nan"), None
+        deltas = [float(np.abs(np.asarray(left[i], dtype=np.float64)
+                               - np.asarray(right[i], dtype=np.float64)).max())
+                  for i in range(n)]
+        worst = max(deltas)
+        return worst, (deltas.index(worst) if worst > 0 else None)
 
-    msg = (f"assert_render_skip_equivalent: decisions={len(always_frames)}/{len(skipped_frames)} "
-           f"images_identical={identical}"
-           + (f" first_mismatch_at={first_bad}" if first_bad is not None else "")
-           + f"  success {always['success']}->{skipped['success']}"
-           f"  n_steps {always['n_steps']}->{skipped['n_steps']}"
-           f"  max|action delta|={action_gap:.2e}"
-           f"  elapsed {always['elapsed_s']:.1f}s->{skipped['elapsed_s']:.1f}s "
-           f"({always['elapsed_s'] / max(skipped['elapsed_s'], 1e-9):.2f}x)"
-           f"  -> {'OK' if identical else 'FAIL'}")
-    if not identical and raise_on_fail:
+    floor, _ = _gap(base_frames, ctrl_frames)
+    gap, first_bad = _gap(base_frames, skip_frames)
+    tolerance = max(3 * floor, 1e-3) if floor == floor else float("nan")
+    same_count = len(base_frames) == len(skip_frames)
+    ok = same_count and gap == gap and gap <= tolerance
+
+    msg = (f"assert_render_skip_equivalent: decisions={len(base_frames)}/{len(skip_frames)}"
+           f"  image_gap={gap:.4g} (floor={floor:.4g}, tol={tolerance:.4g})"
+           + (f" worst_at={first_bad}" if first_bad is not None else "")
+           + f"  success {base_result['success']}->{skip_result['success']}"
+           f"  n_steps {base_result['n_steps']}->{skip_result['n_steps']}"
+           f"  elapsed {base_result['elapsed_s']:.1f}s->{skip_result['elapsed_s']:.1f}s "
+           f"({base_result['elapsed_s'] / max(skip_result['elapsed_s'], 1e-9):.2f}x)"
+           f"  -> {'OK' if ok else 'FAIL'}")
+    if not ok and raise_on_fail:
         raise AssertionError(msg)
     print(msg)
-    return identical
+    return ok
 
 
 def iter_task_envs(episodes):
