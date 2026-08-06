@@ -72,6 +72,18 @@ print("  eligible groups=%d  mean_saved=%.1f  CI=[%.1f,%.1f]  faster-option frac
         spd["savings_ci_lo"],spd["savings_ci_hi"],spd["fraction_with_faster_option"]))
 dec=decidable_groups(cand)
 print("decidable-only groups:",dec.group_id.nunique(),"/",cand.group_id.nunique())'''),
+    md("""### 3b. Is the speed signal *learnable*?  *(oracle headroom vs predictability)*
+
+`speed_selection_uplift` is an **oracle** bound (fastest success picked in hindsight). This asks
+whether a model can *predict* the faster candidate from the prefix. `~0.5` ⇒ speed is present but
+unrankable — the same chaos as the binary label; `>0.5` ⇒ a real, learnable lever."""),
+    code(r'''succ=cand[cand.success==1]
+succ_slope=prefix_distance_disagreement(succ,value_col="n_steps")[1] if len(succ) else float("nan")
+print("n_steps disagreement (success-only): slope=%.5f  (rising => speed varies smoothly)"%succ_slope)
+spd_gbt=fit_gbt_speed_regression(cand,prefix_length=PREFIX_LENGTH)
+print("GBT speed-ranking accuracy: %.3f  (0.5=chance, >0.5=learnable; n_groups=%d)"
+      %(spd_gbt["speed_ranking"],spd_gbt["n_groups"]))
+print("top speed features:",list(spd_gbt["importances"].items())[:5])'''),
     md("""## 4. Prefix-distance / label-disagreement curve  *(H-chaos)*
 
 Rising `p_disagree` with distance = outcomes vary smoothly with the prefix (learnable);
@@ -139,13 +151,15 @@ free_beats=bool((zoo[zoo.score_col=="-"].uplift_ci_lo>0).any())
 gbt_sel=zoo[(zoo.score_col=="gbt_score")&(zoo.uplift_ci_lo>0)]
 ceil=surf[surf.r==1.0].sort_values("k").iloc[-1]
 gbt_flat=(not np.isfinite(gbt_rank)) or (gbt_rank<0.54)
-speed_signal=bool(np.isfinite(spd["savings_ci_lo"]) and spd["savings_ci_lo"]>0)
+speed_oracle=bool(np.isfinite(spd["savings_ci_lo"]) and spd["savings_ci_lo"]>0)
+speed_learnable=bool(np.isfinite(spd_gbt["speed_ranking"]) and spd_gbt["speed_ranking"]>0.54)
 print("signals:")
 print("  GBT ranking      = %.3f  (flat if <0.54: %s)"%(gbt_rank,gbt_flat))
 print("  distance curve   : slope=%.5f range=%.3f  (rises: %s)"%(dd_slope,dd_range,curve_rises))
 print("  free selector beats default (uplift_ci_lo>0): %s"%free_beats)
 print("  GBT selector beats default (uplift_ci_lo>0) : %s"%(not gbt_sel.empty))
-print("  continuous speed signal (savings_ci_lo>0)   : %s"%speed_signal)
+print("  speed oracle headroom (savings_ci_lo>0)     : %s"%speed_oracle)
+print("  speed LEARNABLE (GBT speed-rank>0.54)       : %s (%.3f)"%(speed_learnable,spd_gbt["speed_ranking"]))
 print("  perfect-selector ceiling: deployed=%.3f  uplift=%.3f (k=%d)"
       %(ceil.deployed_success,ceil.uplift_vs_default,int(ceil.k)))
 print("-"*60)
@@ -153,9 +167,12 @@ success_alive=(not gbt_flat) or curve_rises or free_beats or (not gbt_sel.empty)
 if success_alive:
     print("Gate A = ALIVE -> Wave 1 (3a hygiene rebuild: overfit check, action norm,",
           "multi-task heads; then nb 12 model-scored D1)")
-elif speed_signal:
-    print("Gate A = ALIVE (continuous) -> signal exists on completion SPEED, not binary",
-          "success. Pursue the speed/return target; still run the commit-horizon study (nb 15).")
+elif speed_learnable:
+    print("Gate A = ALIVE (speed, learnable) -> a model predicts the faster candidate.",
+          "Pursue the speed/return target; still run the commit-horizon study (nb 15).")
+elif speed_oracle:
+    print("Gate A = MARGINAL (speed, oracle-only) -> speed headroom exists but the GBT cannot",
+          "predict it (same chaos as binary). The commit-horizon study (nb 14/15) is decisive.")
 elif ceil.uplift_vs_default < 0.02:
     print("Gate A = DEAD -> pivot: honest-negative / mode-level operator (Chunk 6).",
           "Even a perfect selector barely clears the 0.650 default at H=10.",

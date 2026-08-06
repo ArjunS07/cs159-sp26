@@ -719,6 +719,98 @@ def speed_selection_uplift(cand: pd.DataFrame, *, n_steps_col: str = "n_steps",
             "fraction_with_faster_option": (faster / n_eligible) if n_eligible else float("nan")}
 
 
+def _speed_pair_accuracy(scores, values) -> float:
+    """Pairwise concordance: fraction of pairs where the higher score has the SMALLER n_steps.
+
+    ``values`` are step counts (lower = faster = better). Pairs with equal value are excluded; a
+    score tie counts 0.5. 0.5 = chance. NaN when no pair has distinct values.
+    """
+    scores = np.asarray(scores, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if np.isnan(scores).any():
+        return float("nan")
+    pairs, agree = 0, 0.0
+    for i in range(len(values)):
+        for j in range(i + 1, len(values)):
+            if values[i] == values[j]:
+                continue
+            pairs += 1
+            d = (scores[i] - scores[j]) * (values[j] - values[i])  # higher score -> fewer steps
+            agree += 1.0 if d > 0 else (0.5 if d == 0 else 0.0)
+    return agree / pairs if pairs else float("nan")
+
+
+def speed_ranking_accuracy(cand: pd.DataFrame, score_col: str, *, group_col: str = "group_id",
+                           n_steps_col: str = "n_steps") -> float:
+    """Mean within-group speed-ranking accuracy among SUCCESSFUL candidates.
+
+    Restricts each group to its successes with a known ``n_steps`` and asks whether ``score_col``
+    ranks the faster ones higher (:func:`_speed_pair_accuracy`). Groups with < 2 distinct-speed
+    successes are skipped. 0.5 = chance; > 0.5 = the score carries speed signal. This is the
+    *learnability* companion to :func:`speed_selection_uplift` (which is an oracle headroom bound).
+    """
+    accuracies = []
+    for _, g in cand.groupby(group_col):
+        succ = g[g["success"] == 1]
+        steps = pd.to_numeric(succ[n_steps_col], errors="coerce")
+        keep = steps.notna()
+        if int(keep.sum()) < 2:
+            continue
+        a = _speed_pair_accuracy(succ[score_col][keep].to_numpy(), steps[keep].to_numpy())
+        if not np.isnan(a):
+            accuracies.append(a)
+    return float(np.mean(accuracies)) if accuracies else float("nan")
+
+
+def fit_gbt_speed_regression(cand: pd.DataFrame, *, prefix_length: int = 10, n_splits: int = 5,
+                             seed: int = 0, n_steps_col: str = "n_steps") -> dict:
+    """Is completion speed LEARNABLE from the prefix? GBT regression on n_steps among successes.
+
+    Restricts to successful candidates with a known ``n_steps``, fits a GradientBoostingRegressor
+    on the handcrafted geometric features under GroupKFold on ``group_id`` (no leakage), and scores
+    the out-of-fold predictions by within-group speed-ranking accuracy (:func:`speed_ranking_accuracy`).
+    ~0.5 => speed is present but not predictable from the prefix (the same chaos as the binary
+    label); > 0.5 => a real, learnable speed lever. Requires sklearn ([analysis] extra).
+    """
+    nan_oof = np.full(len(cand), np.nan)
+    steps_all = pd.to_numeric(cand[n_steps_col], errors="coerce")
+    mask = (cand["success"] == 1).to_numpy() & steps_all.notna().to_numpy()
+    if not _HAVE_SKLEARN or int(mask.sum()) < 4:
+        return {"speed_ranking": float("nan"), "n_groups": 0, "importances": {},
+                "oof": nan_oof, "note": "sklearn missing or too few successes"}
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.model_selection import GroupKFold
+
+    features = handcrafted_features(cand, prefix_length=prefix_length).to_numpy(dtype=float)
+    sub = np.where(mask)[0]
+    matrix, target = features[sub], steps_all.to_numpy()[sub]
+    groups = cand["group_id"].to_numpy()[sub]
+    n_splits = min(n_splits, len(np.unique(groups)))
+    if n_splits < 2:
+        return {"speed_ranking": float("nan"), "n_groups": 0, "importances": {},
+                "oof": nan_oof, "note": "need >= 2 success groups"}
+    oof = np.full(len(cand), np.nan)
+    importances = np.zeros(matrix.shape[1])
+    folds = 0
+    for train_idx, test_idx in GroupKFold(n_splits=n_splits).split(matrix, target, groups):
+        model = GradientBoostingRegressor(random_state=seed)
+        model.fit(matrix[train_idx], target[train_idx])
+        oof[sub[test_idx]] = model.predict(matrix[test_idx])
+        importances += model.feature_importances_
+        folds += 1
+    scored = cand.assign(_spd=-oof)  # goodness = fewer predicted steps
+    ranking = speed_ranking_accuracy(scored, "_spd", group_col="group_id", n_steps_col=n_steps_col)
+    n_groups = 0
+    for _, g in scored.groupby("group_id"):
+        steps = pd.to_numeric(g[g["success"] == 1][n_steps_col], errors="coerce").dropna()
+        n_groups += int(steps.nunique() >= 2)
+    return {"speed_ranking": ranking, "n_groups": n_groups,
+            "importances": dict(sorted(
+                zip(_HANDCRAFTED_FEATURE_NAMES, importances / folds if folds else importances),
+                key=lambda kv: -kv[1])),
+            "oof": oof}
+
+
 # --------------------------------------------------------------------------- #
 # Checkpoint reconstruction
 # --------------------------------------------------------------------------- #

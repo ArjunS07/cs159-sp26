@@ -78,6 +78,8 @@ default (`uplift_ci_lo > 0`)."""),
     zoo=selector_zoo(cand.assign(gbt_score=gbt["oof"]),score_cols=("gbt_score",))
     beats=zoo[zoo.uplift_ci_lo>0].sort_values("uplift_vs_default",ascending=False)
     best=beats.iloc[0] if len(beats) else None
+    sp=speed_selection_uplift(cand)
+    spg=fit_gbt_speed_regression(cand,prefix_length=PREFIX_LENGTH)
     return {"H":h,"groups":cand.group_id.nunique(),
             "decidable":dm["binary_decidable"],
             "decidable_frac":round(dm["binary_fraction"],3),
@@ -88,7 +90,11 @@ default (`uplift_ci_lo > 0`)."""),
             "ceiling_uplift":round(ceil.uplift_vs_default,3),"ceiling_k":int(ceil.k),
             "best_selector":(best.selector if best is not None else "none"),
             "best_uplift":(round(best.uplift_vs_default,3) if best is not None else 0.0),
-            "best_uplift_ci_lo":(round(best.uplift_ci_lo,3) if best is not None else float("nan"))}
+            "best_uplift_ci_lo":(round(best.uplift_ci_lo,3) if best is not None else float("nan")),
+            "speed_savings":round(sp["mean_step_savings"],2),
+            "speed_savings_ci_lo":round(sp["savings_ci_lo"],2),
+            "speed_learnable_rank":(round(spg["speed_ranking"],3)
+                                    if np.isfinite(spg["speed_ranking"]) else float("nan"))}
 
 summary=pd.DataFrame([horizon_summary(h,c) for h,c in sorted(tables.items())])
 display(summary)'''),

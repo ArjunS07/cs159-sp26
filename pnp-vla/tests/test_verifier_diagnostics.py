@@ -279,6 +279,35 @@ def test_speed_selection_uplift():
     assert np.isclose(out["fraction_with_faster_option"], 0.5)  # only group "a"
 
 
+def test_speed_ranking_accuracy():
+    # among successes: a score that is higher for the faster (fewer n_steps) candidate -> 1.0.
+    examples = [_candidate("g", "default", 1, 0.0, n_steps=100),
+                _candidate("g", "fresh_noise_1", 1, 1.0, n_steps=80),
+                _candidate("g", "fresh_noise_2", 1, 2.0, n_steps=120),
+                _candidate("g", "fresh_noise_3", 0, 3.0, n_steps=280)]  # failure ignored
+    cand = dg.build_candidate_table(examples, model=None)
+    cand["good"] = 1000 - cand["n_steps"]        # higher -> fewer steps -> perfect speed ranking
+    assert dg.speed_ranking_accuracy(cand, "good") == 1.0
+    cand["bad"] = cand["n_steps"].astype(float)  # higher -> more steps -> anti-correlated
+    assert dg.speed_ranking_accuracy(cand, "bad") == 0.0
+
+
+def test_fit_gbt_speed_regression_keys():
+    examples = sum((
+        [_candidate(f"g{i}", "default", 1, 0.0, n_steps=100 + i),
+         _candidate(f"g{i}", "fresh_noise_1", 1, 5.0, n_steps=80 + i),
+         _candidate(f"g{i}", "fresh_noise_2", 1, 2.0, n_steps=120 + i)] for i in range(6)), [])
+    cand = dg.build_candidate_table(examples, model=None)
+    dg.add_mode_structure(cand)
+    result = dg.fit_gbt_speed_regression(cand, n_splits=3)
+    assert set(result) >= {"speed_ranking", "n_groups", "importances", "oof"}
+    if dg._HAVE_SKLEARN:
+        assert np.isnan(result["speed_ranking"]) or 0.0 <= result["speed_ranking"] <= 1.0
+        assert result["n_groups"] == 6  # every group has 3 distinct-speed successes
+    else:
+        assert result["importances"] == {}
+
+
 def test_stratify_by_u_level_buckets_into_terciles():
     # six groups with distinct endpoint-U values -> three terciles over group values.
     cand = dg.build_candidate_table(
