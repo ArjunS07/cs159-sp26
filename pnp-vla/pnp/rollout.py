@@ -294,6 +294,61 @@ def _sim_state(env):
         return None
 
 
+def diagnose_frame_mismatch(env, ep, n_steps=6, camera="agentview_image", n_replays=3):
+    """Locate WHY two replays render differently when their physics is identical.
+
+    A constant, large, structured pixel difference is not rasteriser noise. This distinguishes the
+    candidate explanations:
+
+      * only the FIRST replay differs -> cold render context / uninitialised framebuffer after
+        make_env; benign, and fixed by discarding one warm-up replay.
+      * a frame matches another replay at a DIFFERENT step -> staleness or an off-by-one.
+      * a frame matches a flipped copy -> orientation, i.e. the [::-1, ::-1] convention.
+      * none of the above -> genuinely different scene content (materials, object variants).
+    """
+    def replay():
+        set_camera_observables(env, True)
+        env.reset()
+        env.set_init_state(ep["init_state"])
+        out = []
+        for _ in range(n_steps):
+            obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+            value = obs.get(camera)
+            out.append(None if value is None else np.asarray(value, dtype=np.int16).copy())
+        return out
+
+    runs = [replay() for _ in range(n_replays)]
+    d = lambda a, b: (None if a is None or b is None else int(np.abs(a - b).max()))
+
+    print("pairwise max |dpixel| at each step (replay i vs replay j)")
+    header = "".join(f"{f'{i}v{j}':>8}" for i in range(n_replays) for j in range(i + 1, n_replays))
+    print(f"{'step':>5}{header}")
+    for step in range(n_steps):
+        cells = "".join(f"{str(d(runs[i][step], runs[j][step])):>8}"
+                        for i in range(n_replays) for j in range(i + 1, n_replays))
+        print(f"{step:>5}{cells}")
+
+    later_agree = all(d(runs[i][s], runs[j][s]) == 0
+                      for s in range(n_steps) for i in range(1, n_replays)
+                      for j in range(i + 1, n_replays))
+    print(f"\nreplays after the first agree exactly: {later_agree}")
+    if later_agree and n_replays > 2 and any(
+            d(runs[0][s], runs[1][s]) not in (0, None) for s in range(n_steps)):
+        print("=> only the FIRST replay differs: cold render context. Discard one warm-up replay "
+              "and rendering is reproducible.")
+
+    first, second = runs[0][n_steps - 1], runs[1][n_steps - 1]
+    if first is not None and second is not None:
+        best = min(((d(first, runs[1][s]), s) for s in range(n_steps)), key=lambda t: t[0])
+        print(f"closest match for replay0 step {n_steps - 1} is replay1 step {best[1]} "
+              f"(|dpixel|max={best[0]})")
+        print(f"vs vertical flip  |dpixel|max={d(first, second[::-1])}")
+        print(f"vs 180 deg flip   |dpixel|max={d(first, second[::-1, ::-1])}")
+        print(f"mean pixel value  replay0={first.mean():.2f}  replay1={second.mean():.2f}")
+    set_camera_observables(env, True)
+    return runs
+
+
 def measure_replay_determinism(env, ep, n_steps=12, camera="agentview_image"):
     """Separate PHYSICS drift from RENDER drift across two identical replays.
 
