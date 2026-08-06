@@ -28,7 +28,14 @@ def test_missing_arm_renders_as_a_placeholder_not_a_crash():
     tally = {("libero_goal_swap", Method.UNCERTAINTY): [4, 0]}
     table = format_progress_table(tally, ARMS)
     assert "0% (0/4)" in table
-    assert "-" in table.splitlines()[1]
+    assert "-" in table.splitlines()[2]
+
+
+def test_header_states_what_n_counts():
+    """n aggregates a suite's tasks within one shard; readers assumed episodes-per-task."""
+    table = format_progress_table({("libero_goal_swap", Method.UNCERTAINTY): [34, 3]}, ARMS)
+    header = table.splitlines()[0]
+    assert "THIS shard" in header and "not episodes per task" in header
 
 
 def test_unknown_suite_has_no_historical_reference():
@@ -46,5 +53,5 @@ def test_every_collected_suite_has_a_historical_reference():
 def test_suites_are_listed_in_a_stable_order():
     tally = {("libero_spatial_swap", Method.UNCERTAINTY): [1, 0],
              ("libero_goal_swap", Method.UNCERTAINTY): [1, 1]}
-    rows = format_progress_table(tally, ARMS).splitlines()[1:]
+    rows = format_progress_table(tally, ARMS).splitlines()[2:]
     assert [row.split()[0] for row in rows] == ["libero_goal_swap", "libero_spatial_swap"]

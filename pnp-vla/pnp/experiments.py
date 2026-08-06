@@ -205,7 +205,9 @@ def format_progress_table(tally, method_names) -> str:
     baseline, while the refine arm is the intervention.
     """
     labels = [(name, _METHOD_LABELS.get(name, name)) for name in method_names]
-    lines = [f"{'suite':<32}" + "".join(f"{label:>16}" for _, label in labels)
+    lines = ["n = rollouts done in THIS shard, summed over the suite's tasks "
+             "(not episodes per task)",
+             f"{'suite':<32}" + "".join(f"{label:>16}" for _, label in labels)
              + f"{'historical':>12}"]
     for suite in sorted({key[0] for key in tally}):
         cells = ""
