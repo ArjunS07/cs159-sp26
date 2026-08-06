@@ -13,6 +13,7 @@ from pnp.config import (
     LIBERO_PRO_MAX_STEPS,
     MAX_STEPS_MAP,
     LOGICAL_FIELDS,
+    RolloutConfig,
     resolve_max_steps,
 )
 from pnp.experiments import (
@@ -22,11 +23,13 @@ from pnp.experiments import (
     PRO_EXPERIMENT,
     build_pro_expanded_methods,
     build_pro_methods,
+    expanded_pro_suites,
 )
 from pnp.libero_pro import (
     EXPANDED_PRO_SUITES,
     HF_PRO_SUITES,
     OBJECT_ALIASES,
+    ZERO_SR_PRO_SUITES,
     register_object_aliases,
 )
 from pnp.store import SupabaseStore
@@ -142,10 +145,49 @@ def test_expanded_experiment_is_separate_from_the_canonical_one():
 
 
 def test_sinks_stay_out_of_the_rollout_identity():
-    """save_* flags are persistence-only; they must never enter the identity hash."""
+    """Persistence- and performance-only flags must never enter the identity hash."""
     for sink in ("save_ahats", "save_pcp_features", "save_observations", "save_trajectory",
-                 "save_generated_chunks", "save_uncertainty", "video", "compute_multimodal"):
+                 "save_generated_chunks", "save_uncertainty", "video", "compute_multimodal",
+                 "skip_unused_renders", "render_lead"):
         assert sink not in LOGICAL_FIELDS
+
+
+def test_render_skipping_does_not_change_any_rollout_identity():
+    """Enabling the render optimisation mid-collection must not orphan collected rollouts."""
+    from dataclasses import replace
+    episode = {"benchmark": "libero_pro", "suite": "libero_goal_swap", "task_idx": 0,
+               "ep_idx": 0, "init_state_hash": "abc123abc123"}
+    store = object.__new__(SupabaseStore)
+    for name, config in build_pro_expanded_methods(include_control=True):
+        plain = replace(config, skip_unused_renders=False, render_lead=1)
+        assert (store.rollout_id(PRO_EXPANDED_EXPERIMENT, episode, name, config)
+                == store.rollout_id(PRO_EXPANDED_EXPERIMENT, episode, name, plain))
+
+
+def test_expanded_arms_skip_renders_at_the_measured_lead():
+    """Lead 2 is measured: a re-enabled camera serves a cache for one step (27.1 ms) and renders
+    on the second (249.3 ms), against 250.3 ms always-on and 24.5 ms cameras-off."""
+    for _, config in build_pro_expanded_methods(include_control=True):
+        assert config.skip_unused_renders is True
+        assert config.render_lead == 2
+
+
+def test_render_lead_must_be_at_least_one():
+    with pytest.raises(ValueError, match="render_lead"):
+        RolloutConfig(render_lead=0)
+
+
+def test_collection_excludes_the_zero_success_suites():
+    """A 0%-SR suite has no failure->success transitions, so it cannot inform correctability --
+    and libero_10_swap is the most expensive suite in the set."""
+    collected = expanded_pro_suites()
+    assert set(ZERO_SR_PRO_SUITES).isdisjoint(collected)
+    assert len(collected) == len(EXPANDED_PRO_SUITES) - len(ZERO_SR_PRO_SUITES) == 13
+    # The historical cohort definition itself must stay intact for reproducing past analyses.
+    assert len(EXPANDED_PRO_SUITES) == 16
+    assert set(collected) < set(EXPANDED_PRO_SUITES)
+    # Order is preserved so identity sharding stays comparable.
+    assert collected == [s for s in EXPANDED_PRO_SUITES if s not in set(ZERO_SR_PRO_SUITES)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

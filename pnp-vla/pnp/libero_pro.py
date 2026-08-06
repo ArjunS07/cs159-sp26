@@ -77,6 +77,13 @@ EXPANDED_PRO_SUITES = [
 ]
 
 UNION_PRO_SUITES = list(dict.fromkeys(CANONICAL_PRO_SUITES + EXPANDED_PRO_SUITES))
+
+# Suites measured at 0% success on the prior 16-suite run. A suite with no successes has no
+# failure->success transitions, so it cannot inform a correctability hypothesis -- while
+# libero_10_swap is the most expensive suite in the set (520 steps, never terminating early) and
+# these three together were ~29% of wall clock. Excluded from collection, kept in
+# EXPANDED_PRO_SUITES so the historical cohort definition and its analyses stay reproducible.
+ZERO_SR_PRO_SUITES = ("libero_10_swap", "libero_object_task", "libero_object_temp_x0.3")
 # Backwards-compatible name; the default is now the deduplicated collection manifest.
 DEFAULT_PRO_SUITES = UNION_PRO_SUITES
 

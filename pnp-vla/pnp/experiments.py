@@ -38,6 +38,11 @@ PRO_EXPANDED_EPISODES = 20          # episodes/task; short suites contribute wha
 # Flip to True and re-run the same workers to fill it in: it is a distinct config_hash, so
 # iter_todo requests only the missing control rollouts and skips everything already collected.
 PRO_EXPANDED_INCLUDE_CONTROL = False
+# Camera rendering is 90% of a LIBERO step (measured: 250.3 ms on, 24.5 ms off) and the policy
+# reads an observation only at chunk boundaries. A re-enabled camera serves a cached frame for one
+# step and renders on the second (27.1 ms then 249.3 ms), so lead 2 is measured, not assumed.
+PRO_EXPANDED_SKIP_RENDERS = True
+PRO_EXPANDED_RENDER_LEAD = 2
 
 
 def build_full_methods(schedules=SCHEDULES, k=K):
@@ -98,11 +103,15 @@ def build_pro_expanded_methods(k=PRO_EXPANDED_K, steps=PRO_EXPANDED_STEPS,
     """
     probe = dict(pnp_steps=tuple(steps), pnp_k=k)
     control_steps = BASE_INFERENCE_STEPS + k * len(steps)
-    methods = [(Method.UNCERTAINTY, RolloutConfig(**probe, save_pcp_features=True))]
+    # Performance-only, excluded from LOGICAL_FIELDS, so enabling this leaves every rollout_id
+    # untouched and already-collected rollouts are still skipped on resume.
+    perf = dict(skip_unused_renders=PRO_EXPANDED_SKIP_RENDERS,
+                render_lead=PRO_EXPANDED_RENDER_LEAD)
+    methods = [(Method.UNCERTAINTY, RolloutConfig(**probe, **perf, save_pcp_features=True))]
     if include_control:
         methods.append(
-            (Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=control_steps)))
-    methods.append((Method.REFINEMENT, RolloutConfig(**probe, refine=True)))
+            (Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=control_steps, **perf)))
+    methods.append((Method.REFINEMENT, RolloutConfig(**probe, **perf, refine=True)))
     expected = 3 if include_control else 2
     if len(methods) != expected:
         raise AssertionError(f"expected {expected} expanded PRO methods, got {len(methods)}")
@@ -169,8 +178,16 @@ def _prepare_libero_pro_episodes():
     return episodes
 
 
-def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODES):
-    """Install all 16 expanded-cohort PRO suites and build their episode manifest.
+def expanded_pro_suites():
+    """The expanded cohort minus the suites measured at 0% success (see ZERO_SR_PRO_SUITES)."""
+    from . import libero_pro
+    excluded = set(libero_pro.ZERO_SR_PRO_SUITES)
+    return [suite for suite in libero_pro.EXPANDED_PRO_SUITES if suite not in excluded]
+
+
+def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODES,
+                                          suites=None):
+    """Install the expanded-cohort PRO suites and build their episode manifest.
 
     Unlike the canonical path this asserts no fixed identity count: `_with_milk` suites ship 10
     init states per task while the rest ship more, so the total depends on the installed assets.
@@ -178,17 +195,17 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
     """
     from . import libero_pro
 
+    suites = list(suites) if suites is not None else expanded_pro_suites()
     captured = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
             pro_dir = libero_pro.clone_libero_pro()
-            libero_pro.install_assets(
-                suites=libero_pro.EXPANDED_PRO_SUITES, pro_dir=pro_dir)
+            libero_pro.install_assets(suites=suites, pro_dir=pro_dir)
             libero_pro.apply_env_patches(pro_dir=pro_dir)
             libero_pro.patch_torch_load()
             benchmark_dict = libero_pro.reload_benchmark()
             episodes = libero_pro.build_libero_pro_episodes(
-                benchmark_dict, suites=libero_pro.EXPANDED_PRO_SUITES,
+                benchmark_dict, suites=suites,
                 episode_idxs=range(episodes_per_task))
     finally:
         # Print even on failure: the states/task table and the alias/asset warnings are exactly
@@ -203,20 +220,25 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
         raise AssertionError(
             f"expanded PRO manifest has duplicate identities "
             f"({len(episodes)} rows / {len(identities)} identities)")
-    suites = sorted({ep["suite"] for ep in episodes})
-    if len(suites) != len(libero_pro.EXPANDED_PRO_SUITES):
-        missing = sorted(set(libero_pro.EXPANDED_PRO_SUITES) - set(suites))
+    collected = sorted({ep["suite"] for ep in episodes})
+    if len(collected) != len(suites):
+        missing = sorted(set(suites) - set(collected))
         raise AssertionError(f"expanded PRO manifest is missing suites: {missing}")
+    excluded = sorted(set(collected) & set(libero_pro.ZERO_SR_PRO_SUITES))
+    if excluded:
+        raise AssertionError(f"0%-SR suites must not be collected: {excluded}")
     if not all(ep["expanded_member"] for ep in episodes):
         raise AssertionError("expanded PRO manifest contains a non-expanded identity")
 
     per_suite = collections.Counter(ep["suite"] for ep in episodes)
     print(f'{"suite":<36}{"episodes":>9}{"max_steps":>11}')
-    for suite in libero_pro.EXPANDED_PRO_SUITES:
+    for suite in suites:
         steps = sorted({ep["max_steps"] for ep in episodes if ep["suite"] == suite})
         print(f"{suite:<36}{per_suite[suite]:>9}{str(steps[0] if steps else '-'):>11}")
-    print(f"LIBERO-PRO expanded manifest: {len(episodes)} identities x 3 configs = "
-          f"{len(episodes) * 3} rollouts")
+    print(f"excluded (0% SR, no F->S transitions to learn from): "
+          f"{', '.join(libero_pro.ZERO_SR_PRO_SUITES)}")
+    print(f"LIBERO-PRO expanded manifest: {len(episodes)} identities "
+          f"across {len(suites)} suites")
     return episodes
 
 
