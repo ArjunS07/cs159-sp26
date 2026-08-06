@@ -307,13 +307,33 @@ def measure_render_lag(env, ep, off_at=1, on_at=8, n_steps=12, camera="agentview
             out.append(None if value is None else np.asarray(value).copy())
         return out
 
+    # CONTROL FIRST. Everything below compares two separate replays, so it is meaningless unless
+    # an untouched replay reproduces itself frame for frame. Without this check a non-reproducible
+    # env looks exactly like a stale-frame bug.
     reference = replay()
+    control = replay()
+    reproducible = all(
+        (a is None and b is None) or (a is not None and b is not None and np.array_equal(a, b))
+        for a, b in zip(reference, control))
+    first_drift = next((i for i, (a, b) in enumerate(zip(reference, control))
+                        if not ((a is None and b is None)
+                                or (a is not None and b is not None and np.array_equal(a, b)))),
+                       None)
+    print(f"control: two untouched replays reproduce each other = {reproducible}"
+          + (f" (first drift at step {first_drift})" if first_drift is not None else ""))
+    if not reproducible:
+        print("=> replaying this episode is not frame-reproducible, so a stale-frame test on two\n"
+              "   separate replays cannot conclude anything. Fix or characterise the drift first.")
+        set_camera_observables(env, True)
+        return None
+
     probed = replay(off=off_at, on=on_at)
     set_camera_observables(env, True)
 
     lead = None
-    print(f"{'step':>5}{'state':>10}{'vs reference':>16}{'vs pre-disable':>17}")
-    stale = reference[off_at - 1] if off_at >= 1 else None
+    print(f"\n{'step':>5}{'state':>10}{'vs reference':>16}{'vs pre-disable':>17}")
+    # The probed run's OWN last rendered frame before the disable window.
+    stale = probed[off_at - 1] if off_at >= 1 else None
     for step in range(on_at, n_steps):
         image = probed[step]
         if image is None:
@@ -326,7 +346,7 @@ def measure_render_lag(env, ep, off_at=1, on_at=8, n_steps=12, camera="agentview
         if matches_ref and lead is None:
             lead = step - on_at + 1
     if lead is None:
-        print("never matched the reference -- rendering cannot be skipped on this robosuite")
+        print("\nnever matched the reference -- rendering cannot be skipped on this robosuite")
     else:
         print(f"\nmeasured render_lead = {lead}")
     return lead
