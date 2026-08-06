@@ -178,6 +178,46 @@ def _prepare_libero_pro_episodes():
     return episodes
 
 
+# Baseline success rates from the prior 16-suite run, for sanity-checking magnitude while a
+# collection is in flight. REFERENCE ONLY: that run used different K, probe steps and (for some
+# suites) a different horizon, so small differences are expected. What matters is that a suite
+# lands in the same ballpark rather than collapsing to 0.
+HISTORICAL_PRO_BASELINE_SR = {
+    "libero_object_temp_x0.1": 0.54, "libero_object_temp_x0.2": 0.04,
+    "libero_object_temp_x0.3": 0.00, "libero_object_temp_y0.1": 0.45,
+    "libero_object_temp_y0.2": 0.33, "libero_object_temp_y0.3": 0.12,
+    "libero_goal_swap": 0.09, "libero_object_swap": 0.04,
+    "libero_spatial_swap": 0.18, "libero_10_swap": 0.00,
+    "libero_goal_task": 0.10, "libero_object_task": 0.00,
+    "libero_goal_with_milk": 0.95, "libero_spatial_with_milk": 0.83,
+    "libero_object_with_mug": 0.95, "libero_goal_with_yellow_book": 0.90,
+}
+
+_METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
+                  Method.EXTRA_STEPS: "control"}
+
+
+def format_progress_table(tally, method_names) -> str:
+    """Running success rate per (suite, method), against the historical baseline.
+
+    `tally` maps (suite, method) -> [n_rollouts, n_successes]. Only the observed/no-op arm is
+    comparable to the historical column: it is an RNG-isolated no-op, so its SR *is* the vanilla
+    baseline, while the refine arm is the intervention.
+    """
+    labels = [(name, _METHOD_LABELS.get(name, name)) for name in method_names]
+    lines = [f"{'suite':<32}" + "".join(f"{label:>16}" for _, label in labels)
+             + f"{'historical':>12}"]
+    for suite in sorted({key[0] for key in tally}):
+        cells = ""
+        for name, _ in labels:
+            n, wins = tally.get((suite, name), (0, 0))
+            cells += f"{'-':>16}" if not n else f"{f'{wins / n:.0%} ({wins}/{n})':>16}"
+        reference = HISTORICAL_PRO_BASELINE_SR.get(suite)
+        lines.append(f"{suite:<32}{cells}"
+                     + (f"{'-':>12}" if reference is None else f"{reference:>11.0%} "))
+    return "\n".join(lines)
+
+
 def expanded_pro_suites():
     """The expanded cohort minus the suites measured at 0% success (see ZERO_SR_PRO_SUITES)."""
     from . import libero_pro
@@ -244,7 +284,8 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
 
 def _run_collection(*, store, policy, preprocess, postprocess, device, experiment, episodes,
                     methods, cohort, shard_count, shard_index,
-                    benchmark="libero", driver="hybrid_schedules", run_metadata=None):
+                    benchmark="libero", driver="hybrid_schedules", run_metadata=None,
+                    report_every=50):
     from tqdm.auto import tqdm
     from .rollout import iter_task_envs, run_episode
 
@@ -268,6 +309,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
         config=run_config,
     )
     completed = 0
+    method_names = [name for name, _ in methods]
+    tally = collections.defaultdict(lambda: [0, 0])   # (suite, method) -> [n, successes]
     try:
         with tqdm(total=pending, desc=f"{cohort}[{shard_index}]", unit="rollout",
                   dynamic_ncols=True) as progress:
@@ -278,14 +321,27 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                         env, ep, policy, preprocess, postprocess, device, cfg)
                     store.log_result(rid, ep, name, cfg, result)
                     completed += 1
+                    counts = tally[(ep["suite"], name)]
+                    counts[0] += 1
+                    counts[1] += int(result["success"])
                     progress.update()
-                    progress.set_postfix(
-                        success=int(result["success"]), method=name, refresh=False)
+                    # Running SR for this suite/arm, not just the last rollout's outcome.
+                    progress.set_postfix_str(
+                        f"{ep['suite'].removeprefix('libero_')} "
+                        f"{_METHOD_LABELS.get(name, name)} "
+                        f"sr={counts[1] / counts[0]:.0%} ({counts[1]}/{counts[0]})",
+                        refresh=False)
+                    if report_every and completed % report_every == 0:
+                        tqdm.write(f"\n--- {cohort}[{shard_index}] after {completed} rollouts "
+                                   f"({completed}/{pending}) ---")
+                        tqdm.write(format_progress_table(tally, method_names))
     except BaseException:
         store.finish_run(status="failed", n_rollouts=completed)
         raise
     store.finish_run(n_rollouts=completed)
     print(f"{cohort}: logged {completed} new rollouts")
+    if tally:
+        print(format_progress_table(tally, method_names))
 
 
 def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
