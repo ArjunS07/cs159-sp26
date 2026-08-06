@@ -136,6 +136,11 @@ class RolloutConfig:
     save_trajectory: bool = True                # executed actions + robot state -> Storage (cheap)
     save_generated_chunks: bool = False         # exact policy-space clean chunks at t=1
     video: str = "off"                          # "off" | "failures_only" | "all"
+    # ── performance (must not change the trajectory; excluded from LOGICAL_FIELDS) ──
+    # Render the cameras only on steps whose observation the policy actually consumes (chunk
+    # boundaries). Rendering is ~90% of a LIBERO step and 49 of 50 renders are discarded, so this
+    # is worth ~5x wall clock. Ignored when a sink needs every frame (save_observations/video).
+    skip_unused_renders: bool = False
 
     def __post_init__(self):
         n_actions = int(self.refine) + int(self.correction_lambda is not None) \

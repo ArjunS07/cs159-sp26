@@ -84,6 +84,32 @@ def make_env(bddl_path: str):
     )
 
 
+CAMERA_OBSERVABLES = ("agentview_image", "robot0_eye_in_hand_image")
+
+
+def set_camera_observables(env, enabled: bool) -> bool:
+    """Enable/disable robosuite's camera observables, i.e. offscreen rendering per step.
+
+    Measured on a Colab L4 with Mesa software EGL: a LIBERO step costs ~256 ms with both
+    360x360 cameras rendered and ~25 ms without, so rendering is ~90% of a step. The policy
+    consumes an observation only at chunk boundaries (once per 50 executed actions), so all but
+    one render in fifty is computed and discarded.
+
+    Returns False when the installed robosuite exposes no observable toggle, so callers can fall
+    back to always rendering rather than silently feeding the policy a missing image.
+    """
+    target = getattr(env, "env", env)
+    modify = getattr(target, "modify_observable", None)
+    if not callable(modify):
+        return False
+    try:
+        for name in CAMERA_OBSERVABLES:
+            modify(name, "enabled", bool(enabled))
+    except Exception:
+        return False
+    return True
+
+
 def build_final_episodes(benchmark_dict=None, episode_idxs=None, tasks=None):
     """Build the controlled slice episode list (8 stock tasks x 10 episodes by default)."""
     from libero.libero import get_libero_path

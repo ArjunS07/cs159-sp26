@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, VIDEO_FPS, RolloutConfig
-from .libero_env import make_env, obs_to_policy
+from .libero_env import make_env, obs_to_policy, set_camera_observables
 from .pnp import PnPRecorder, _pnp_seed_perturb, multi_sample_select
 from .tap import RolloutTap
 from . import sampler as _sampler
@@ -149,11 +149,26 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     inference_ms_total = 0.0
     t0 = time.time()
     step = 0
+    # Camera rendering is ~90% of a LIBERO step, and the policy reads an observation only at
+    # chunk boundaries. Skip the rest -- but only when no sink needs every frame, and only if the
+    # installed robosuite actually supports the toggle (otherwise the policy would get no image).
+    needs_every_frame = frames is not None
+    skipping = config.skip_unused_renders and not needs_every_frame
+    if skipping:
+        skipping = set_camera_observables(env, True)
+
+    def _render_next(needed: bool) -> None:
+        """Arm/disarm rendering for the NEXT env.step, whose obs is consumed if `needed`."""
+        if skipping:
+            set_camera_observables(env, needed)
+
     try:
         env.reset()
         policy.reset()
         obs = env.set_init_state(ep["init_state"])
-        for _ in range(NUM_STEPS_WAIT):
+        for wait_step in range(NUM_STEPS_WAIT):
+            # Only the final settling observation feeds the first policy call.
+            _render_next(wait_step == NUM_STEPS_WAIT - 1)
             obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
 
         for step in range(max_steps):
@@ -200,6 +215,9 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                 frames.append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
             robot_states.append(np.concatenate([
                 obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"]]).copy())
+            # The queue just emptied => the next iteration re-plans from the obs this step
+            # returns, so that one render is required. Every other render is discarded.
+            _render_next(not queue)
             obs, _, done, _ = env.step(a)
             if env.check_success():
                 success = True
@@ -211,6 +229,10 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     except Exception as e:                              # log errored episodes, don't drop them
         status, error_msg = "errored", f"{type(e).__name__}: {e}"
         terminated_reason = "error"
+    finally:
+        # Leave the env as we found it; iter_task_envs reuses one env across rollouts.
+        if skipping:
+            set_camera_observables(env, True)
 
     elapsed = time.time() - t0
     finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -258,6 +280,67 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
 # ─────────────────────────────────────────────────────────────────────────────
 # Env-lifecycle helper (the one loop convenience the repo provides)
 # ─────────────────────────────────────────────────────────────────────────────
+def assert_render_skip_equivalent(env, ep, policy, preprocess, postprocess, device,
+                                  config: RolloutConfig | None = None, raise_on_fail=True):
+    """Verify on the REAL simulator that skip_unused_renders changes nothing the policy sees.
+
+    Unit tests cover the step-selection logic against a fake env, but they cannot cover the part
+    that actually risks silence: robosuite caches observables, so re-enabling a disabled camera
+    might return a stale frame. If it did, the policy would receive a one-chunk-old image and the
+    success rate would quietly collapse -- no exception, no log line.
+
+    Runs `ep` twice under identical seeds, once with skipping off and once on, recording exactly
+    the tensors handed to the policy at each decision point (by wrapping `preprocess`, so
+    run_episode is untouched). Images must be bit-identical; actions are reported but compared
+    loosely because bf16 flow matching is not bit-reproducible across runs.
+    """
+    base = config or RolloutConfig()
+    if base.save_observations or base.video != "off":
+        raise ValueError("frame sinks force every render; test with them off")
+
+    def _record(sink):
+        def wrapped(raw):
+            for key in ("observation.images.image", "observation.images.image2"):
+                if key in raw:
+                    sink.append(np.asarray(raw[key].detach().cpu()).copy())
+            return preprocess(raw)
+        return wrapped
+
+    from dataclasses import replace
+    runs = {}
+    for label, skip in (("always", False), ("skipped", True)):
+        frames: list = []
+        result = run_episode(env, ep, policy, _record(frames), postprocess, device,
+                             replace(base, skip_unused_renders=skip))
+        runs[label] = (frames, result)
+
+    always_frames, always = runs["always"]
+    skipped_frames, skipped = runs["skipped"]
+    n = min(len(always_frames), len(skipped_frames))
+    identical = (len(always_frames) == len(skipped_frames)
+                 and all(np.array_equal(always_frames[i], skipped_frames[i]) for i in range(n)))
+    first_bad = next((i for i in range(n)
+                      if not np.array_equal(always_frames[i], skipped_frames[i])), None)
+    action_gap = float(np.abs(
+        always["trajectory"]["actions"][:min(always["n_steps"], skipped["n_steps"])]
+        - skipped["trajectory"]["actions"][:min(always["n_steps"], skipped["n_steps"])]
+    ).max()) if always.get("trajectory") and skipped.get("trajectory") else float("nan")
+
+    msg = (f"assert_render_skip_equivalent: decisions={len(always_frames)}/{len(skipped_frames)} "
+           f"images_identical={identical}"
+           + (f" first_mismatch_at={first_bad}" if first_bad is not None else "")
+           + f"  success {always['success']}->{skipped['success']}"
+           f"  n_steps {always['n_steps']}->{skipped['n_steps']}"
+           f"  max|action delta|={action_gap:.2e}"
+           f"  elapsed {always['elapsed_s']:.1f}s->{skipped['elapsed_s']:.1f}s "
+           f"({always['elapsed_s'] / max(skipped['elapsed_s'], 1e-9):.2f}x)"
+           f"  -> {'OK' if identical else 'FAIL'}")
+    if not identical and raise_on_fail:
+        raise AssertionError(msg)
+    print(msg)
+    return identical
+
+
 def iter_task_envs(episodes):
     """Yield (env, task_episodes) grouped by (suite, task_idx); closes each env in finally."""
     key = lambda e: (e["suite"], e["task_idx"])
