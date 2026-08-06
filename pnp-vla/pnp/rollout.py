@@ -294,6 +294,59 @@ def _sim_state(env):
         return None
 
 
+def measure_render_timing(env, ep, n_steps=8, settle=4):
+    """Decide fresh-vs-stale by COST, not by pixels.
+
+    This stack renders a different (internally consistent) image on every reset even though
+    physics is bit-identical, so no cross-run pixel comparison can act as an oracle. Timing can:
+    a cached observable returns in microseconds, a real render of two 360x360 cameras costs
+    ~230 ms on Mesa software EGL. So if the step on which the cameras are re-enabled costs about
+    as much as an always-rendered step, it rendered; if it costs about as much as a
+    cameras-off step, it served a cache and skipping is unsafe at that lead.
+    """
+    def timed_steps(count):
+        out = []
+        for _ in range(count):
+            start = time.perf_counter()
+            env.step(LIBERO_DUMMY_ACTION)
+            out.append((time.perf_counter() - start) * 1000.0)
+        return out
+
+    set_camera_observables(env, True)
+    env.reset()
+    env.set_init_state(ep["init_state"])
+    timed_steps(settle)
+    on = timed_steps(n_steps)
+
+    set_camera_observables(env, False)
+    timed_steps(settle)
+    off = timed_steps(n_steps)
+
+    # Re-enable, then time the very next step (lead 1) and the one after (lead 2).
+    set_camera_observables(env, True)
+    after_enable = timed_steps(2)
+    set_camera_observables(env, True)
+
+    on_ms, off_ms = float(np.median(on)), float(np.median(off))
+    midpoint = (on_ms + off_ms) / 2
+    print(f"cameras on   (median): {on_ms:7.1f} ms/step")
+    print(f"cameras off  (median): {off_ms:7.1f} ms/step")
+    print(f"render cost          : {on_ms - off_ms:7.1f} ms/step "
+          f"({100 * (on_ms - off_ms) / max(on_ms, 1e-9):.0f}% of a step)")
+    verdicts = []
+    for offset, value in enumerate(after_enable, start=1):
+        rendered = value > midpoint
+        verdicts.append(rendered)
+        print(f"step {offset} after re-enable: {value:7.1f} ms -> "
+              f"{'RENDERED' if rendered else 'served cache'}")
+    lead = next((i for i, rendered in enumerate(verdicts, start=1) if rendered), None)
+    if lead is None:
+        print("=> no step after re-enabling paid for a render; skipping is unsafe here")
+    else:
+        print(f"=> a re-enabled camera renders on step {lead}, so render_lead = {lead}")
+    return {"on_ms": on_ms, "off_ms": off_ms, "after_enable_ms": after_enable, "lead": lead}
+
+
 def diagnose_frame_mismatch(env, ep, n_steps=6, camera="agentview_image", n_replays=3):
     """Locate WHY two replays render differently when their physics is identical.
 
