@@ -171,6 +171,7 @@ def build_candidate_table(examples, model=None, device=None, *, prefix_length: i
                 "success": int(example.success),
                 "prefix": prefix_features(example, prefix_length),
                 "return_target": example.return_target,
+                "n_steps": example.n_steps,  # steps to the outcome (speed); may be None
                 "chunk_position": float(example.chunk_position),
             })
     return pd.DataFrame(rows)
@@ -360,29 +361,40 @@ def stratify_by_u_level(cand: pd.DataFrame, u_col: str, *, n_buckets: int = 3,
 # --------------------------------------------------------------------------- #
 # Wave-0 model-free screening (no verifier scores; runs before any model is trusted)
 # --------------------------------------------------------------------------- #
-def prefix_distance_disagreement(cand: pd.DataFrame, *, n_bins: int = 8) -> tuple:
-    """Label disagreement vs prefix distance within groups (the H-chaos probe).
+def prefix_distance_disagreement(cand: pd.DataFrame, *, n_bins: int = 8,
+                                 value_col: str | None = None) -> tuple:
+    """Outcome disagreement vs prefix distance within groups (the H-chaos probe).
 
     For every unordered candidate pair inside a group, record the Euclidean distance
-    between their executed-prefix vectors and whether their success labels differ. Pairs
-    are pooled across groups and binned by distance (equal-mass quantile bins). A curve of
-    P(labels differ) that RISES with distance means outcomes vary smoothly with the prefix
-    (a learnable causal structure); a FLAT curve means disagreement is independent of the
-    prefix, i.e. within-group labels are coin flips (chaos dominates).
+    between their executed-prefix vectors and how much their outcomes differ. Pairs are
+    pooled across groups and binned by distance (equal-mass quantile bins). A curve that
+    RISES with distance means outcomes vary smoothly with the prefix (a learnable causal
+    structure); a FLAT curve means disagreement is independent of the prefix, i.e. within-group
+    outcomes are coin flips (chaos dominates).
 
-    Returns ``(table, slope)`` where ``table`` has ``{distance_bin, dist_mid, p_disagree,
-    n}`` and ``slope`` is the least-squares slope of ``p_disagree`` vs ``dist_mid`` (>0
-    rising, ~0 flat). Model-free: uses only stored prefixes and success labels.
+    By default the outcome gap is the binary ``P(success labels differ)``. When ``value_col``
+    is given (e.g. ``"return_target"`` or ``"n_steps"``), the gap is instead the mean
+    ``|Δ value|`` per bin -- a continuous quality-gap curve that can reveal smooth structure the
+    coarse binary label washes out. Returns ``(table, slope)`` where ``table`` has
+    ``{distance_bin, dist_mid, p_disagree, n}`` (``p_disagree`` holds the mean gap, binary or
+    continuous) and ``slope`` is the least-squares slope of the gap vs ``dist_mid`` (>0 rising,
+    ~0 flat). Model-free: uses only stored prefixes and outcomes.
     """
     distances, disagree = [], []
     for _, group in cand.groupby("group_id"):
         features = np.stack([np.asarray(p, dtype=float) for p in group["prefix"]])
-        success = group["success"].to_numpy()
+        if value_col is None:
+            outcome = group["success"].to_numpy(dtype=float)
+        else:
+            outcome = pd.to_numeric(group[value_col], errors="coerce").to_numpy(dtype=float)
         n = len(group)
         for i in range(n):
             for j in range(i + 1, n):
+                gap = abs(outcome[i] - outcome[j])
+                if np.isnan(gap):  # skip pairs with a missing continuous value
+                    continue
                 distances.append(float(np.linalg.norm(features[i] - features[j])))
-                disagree.append(int(success[i] != success[j]))
+                disagree.append(float(gap))
     columns = ["distance_bin", "dist_mid", "p_disagree", "n"]
     if not distances:
         return pd.DataFrame(columns=columns), float("nan")
@@ -552,11 +564,15 @@ def selector_zoo(cand: pd.DataFrame, *, score_cols=("score",), quantile: float =
 
     Each selector maps a candidate group to the success of the candidate it would execute (or
     an expected success for stochastic selectors). Aggregated across groups into deployed
-    success + uplift over the default candidate, with a bootstrap CI. Score-based selectors
-    are evaluated for BOTH operators -- pick-best (argmax score) and reject-worst (drop the
-    bottom ``quantile`` by score, then a uniform pick from survivors) -- for every column in
-    ``score_cols``, so any scorer (GBT, current verifier, a future rebuild) can be compared.
-    Requires ``mode`` (call ``add_mode_structure`` first) for the mode-based selectors.
+    success (with ``ci_lo``/``ci_hi``) and the PAIRED uplift over the default candidate --
+    ``uplift_vs_default`` is the mean per-group ``selector_success - default_success``, with a
+    bootstrap CI in ``uplift_ci_lo``/``uplift_ci_hi``. A selector beats the default only when
+    ``uplift_ci_lo > 0`` (the deployed-success ``ci_lo`` is NOT an uplift test -- it is always
+    positive). Score-based selectors are evaluated for BOTH operators -- pick-best (argmax
+    score) and reject-worst (drop the bottom ``quantile`` by score, then a uniform pick from
+    survivors) -- for every column in ``score_cols``, so any scorer (GBT, current verifier, a
+    future rebuild) can be compared. Requires ``mode`` (call ``add_mode_structure`` first) for
+    the mode-based selectors.
     """
     from .train import bootstrap_interval
 
@@ -565,14 +581,23 @@ def selector_zoo(cand: pd.DataFrame, *, score_cols=("score",), quantile: float =
     rows = []
 
     def _record(name, score_col, selector):
-        values = [v for _, group in groups if not np.isnan(v := selector(group))]
+        values, paired = [], []
+        for _, group in groups:
+            v = selector(group)
+            if np.isnan(v):
+                continue
+            values.append(v)
+            paired.append(v - default_success(group))  # per-group difference vs the default
         if not values:
             return
         ci = bootstrap_interval(values, seed, n_bootstrap)
+        uci = bootstrap_interval(paired, seed, n_bootstrap)  # CI on the PAIRED uplift
         rows.append({"selector": name, "score_col": score_col or "-",
                      "deployed_success": float(np.mean(values)),
-                     "uplift_vs_default": float(np.mean(values)) - default_mean,
-                     "ci_lo": float(ci[0]), "ci_hi": float(ci[1]), "n_groups": len(values)})
+                     "uplift_vs_default": float(np.mean(paired)),
+                     "ci_lo": float(ci[0]), "ci_hi": float(ci[1]),
+                     "uplift_ci_lo": float(uci[0]), "uplift_ci_hi": float(uci[1]),
+                     "n_groups": len(values)})
 
     _record("random", None, _select_random)
     _record("majority_mode", None, majority_mode_success)
@@ -625,6 +650,73 @@ def simulate_selector_uplift(cand: pd.DataFrame, *,
             rows.append({"k": k, "r": r, "deployed_success": success,
                          "uplift_vs_default": success - default_mean, "n_groups": len(eligible)})
     return pd.DataFrame(rows)
+
+
+def decidable_mass(cand: pd.DataFrame, *, value_col: str | None = None,
+                   group_col: str = "group_id", atol: float = 0.0) -> dict:
+    """How many groups a selector can actually act on (the ceiling on deployed uplift).
+
+    A group is **binary-decidable** when it holds both a success and a failure -- otherwise its
+    outcome is fixed no matter which candidate you pick, so a selector cannot change it. This is
+    the structural cap the binary-label experiments kept hitting (the GBT scored only ~211/1183
+    groups). When ``value_col`` is given (e.g. ``"return_target"`` or ``"n_steps"``), also report
+    **value-decidable** groups -- those whose within-group spread of that continuous outcome
+    exceeds ``atol`` -- since a continuous quality signal can rank candidates even inside a
+    unanimous-success group. Returns counts and fractions; model-free.
+    """
+    groups = list(cand.groupby(group_col))
+    n_groups = len(groups)
+    binary = sum(int(0 < int(g["success"].sum()) < len(g)) for _, g in groups)
+    out = {"n_groups": n_groups, "binary_decidable": binary,
+           "binary_fraction": (binary / n_groups) if n_groups else float("nan")}
+    if value_col is not None:
+        def _spread(g):
+            vals = pd.to_numeric(g[value_col], errors="coerce").dropna().to_numpy()
+            return float(vals.max() - vals.min()) if len(vals) else 0.0
+        value = sum(int(_spread(g) > atol) for _, g in groups)
+        out.update({"value_col": value_col, "value_decidable": value,
+                    "value_fraction": (value / n_groups) if n_groups else float("nan")})
+    return out
+
+
+def decidable_groups(cand: pd.DataFrame, *, group_col: str = "group_id") -> pd.DataFrame:
+    """Subset ``cand`` to binary-decidable groups (both a success and a failure present)."""
+    keep = [gid for gid, g in cand.groupby(group_col) if 0 < int(g["success"].sum()) < len(g)]
+    return cand[cand[group_col].isin(keep)].copy()
+
+
+def speed_selection_uplift(cand: pd.DataFrame, *, n_steps_col: str = "n_steps",
+                           group_col: str = "group_id", seed: int = 42,
+                           n_bootstrap: int = 10_000) -> dict:
+    """Continuous-outcome headroom the binary success label hides: completion speed.
+
+    Restricts to groups where the DEFAULT succeeds and ``n_steps`` is available, then asks
+    whether a faster successful candidate exists that a speed-aware selector would pick. Per
+    group, ``savings = default_steps - min_successful_candidate_steps`` (>= 0). Reports the mean
+    step-savings with a bootstrap CI and the fraction of groups with a strictly faster option.
+    This is uplift *on top of* binary decidability: it turns unanimous-success groups -- useless
+    to a binary selector -- into decidable ones. Model-free.
+    """
+    from .train import bootstrap_interval
+
+    savings, faster, n_eligible = [], 0, 0
+    for _, g in cand.groupby(group_col):
+        succ = g[g["success"] == 1].copy()
+        succ["_steps"] = pd.to_numeric(succ[n_steps_col], errors="coerce")
+        succ = succ[succ["_steps"].notna()]
+        default_rows = succ[succ["is_default"]]
+        if succ.empty or default_rows.empty:  # default must succeed with a known step count
+            continue
+        n_eligible += 1
+        default_steps = float(default_rows["_steps"].iloc[0])
+        best_steps = float(succ["_steps"].min())
+        savings.append(default_steps - best_steps)
+        faster += int(best_steps < default_steps - 1e-9)
+    ci = bootstrap_interval(savings, seed, n_bootstrap) if savings else [float("nan")] * 2
+    return {"n_eligible_groups": n_eligible,
+            "mean_step_savings": float(np.mean(savings)) if savings else float("nan"),
+            "savings_ci_lo": float(ci[0]), "savings_ci_hi": float(ci[1]),
+            "fraction_with_faster_option": (faster / n_eligible) if n_eligible else float("nan")}
 
 
 # --------------------------------------------------------------------------- #

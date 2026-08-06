@@ -5,7 +5,7 @@ from pnp.verifier.data import CleanChunkExample
 from pnp.verifier import diagnostics as dg
 
 
-def _candidate(group, kind, success, prefix_value, *, stratum="high"):
+def _candidate(group, kind, success, prefix_value, *, stratum="high", n_steps=None):
     actions = np.full((50, 7), float(prefix_value), np.float32)
     return CleanChunkExample(
         rollout_id=f"{group}-{kind}", experiment="e", benchmark="libero",
@@ -13,7 +13,7 @@ def _candidate(group, kind, success, prefix_value, *, stratum="high"):
         obs_enc=np.zeros(8, np.float32), actions=actions,
         action_mask=np.ones(50, bool), success=success,
         candidate_group_id=group, candidate_kind=kind, uncertainty_stratum=stratum,
-        return_target=float(success))
+        return_target=float(success), n_steps=n_steps)
 
 
 def _group(group, outcomes, *, stratum="high"):
@@ -210,6 +210,73 @@ def test_simulate_selector_uplift_monotonic_in_r_and_k():
             assert col[-1] > col[0]
     oracle = surf[surf.r == 1.0].sort_values("k")["deployed_success"].to_numpy()
     assert np.all(np.diff(oracle) >= -1e-12) and oracle[-1] > oracle[0]  # best-of-k grows with k
+
+
+def test_selector_zoo_paired_uplift_ci():
+    # 5 groups, default always fails, fresh_noise_1 always succeeds; score picks the winner.
+    cand = dg.build_candidate_table(
+        sum((_group(f"g{i}", [0, 1, 0]) for i in range(5)), []), model=None)
+    dg.add_mode_structure(cand)
+    cand["score"] = cand["kind"].map(
+        {"default": 0.1, "fresh_noise_1": 0.9, "fresh_noise_2": 0.5})
+    zoo = dg.selector_zoo(cand, score_cols=("score",), n_bootstrap=500)
+    assert {"uplift_ci_lo", "uplift_ci_hi"} <= set(zoo.columns)
+    pick = zoo[zoo.selector == "pick_best"].iloc[0]
+    assert pick["uplift_vs_default"] == 1.0 and pick["uplift_ci_lo"] > 0  # beats default
+
+    # all-success groups -> every selector ties the default -> uplift CI includes 0.
+    flat = dg.build_candidate_table(
+        sum((_group(f"h{i}", [1, 1, 1]) for i in range(5)), []), model=None)
+    dg.add_mode_structure(flat)
+    zoo_flat = dg.selector_zoo(flat, n_bootstrap=500)
+    rnd = zoo_flat[zoo_flat.selector == "random"].iloc[0]
+    assert rnd["uplift_vs_default"] == 0.0 and rnd["uplift_ci_lo"] == 0.0  # does not beat default
+
+
+def test_decidable_mass_binary_and_continuous():
+    examples = (
+        [_candidate("mixed", "default", 0, 0.0, n_steps=280),         # decidable (0 and 1);
+         _candidate("mixed", "fresh_noise_1", 1, 1.0, n_steps=90),    # success finishes early,
+         _candidate("mixed", "fresh_noise_2", 0, 2.0, n_steps=280)]   # failures run to the cap
+        + [_candidate("allwin", "default", 1, 0.0, n_steps=100),      # unanimous success...
+           _candidate("allwin", "fresh_noise_1", 1, 1.0, n_steps=80)]  # ...but faster candidate
+        + [_candidate("allfail", "default", 0, 0.0, n_steps=280),     # unanimous failure,
+           _candidate("allfail", "fresh_noise_1", 0, 1.0, n_steps=280)])  # identical n_steps
+    cand = dg.build_candidate_table(examples, model=None)
+    binary = dg.decidable_mass(cand)
+    assert binary["n_groups"] == 3 and binary["binary_decidable"] == 1
+    assert np.isclose(binary["binary_fraction"], 1 / 3)
+    cont = dg.decidable_mass(cand, value_col="n_steps")
+    # "allwin" has a within-group n_steps spread -> value-decidable on top of the binary one.
+    assert cont["value_decidable"] == 2 and np.isclose(cont["value_fraction"], 2 / 3)
+    assert len(dg.decidable_groups(cand).group_id.unique()) == 1  # only "mixed"
+
+
+def test_prefix_distance_disagreement_continuous_rises():
+    # near pairs share n_steps, far pairs differ by 100 -> continuous gap rises with distance.
+    examples = [_candidate("g", "default", 1, 0.0, n_steps=100),
+                _candidate("g", "fresh_noise_1", 1, 0.0, n_steps=100),
+                _candidate("g", "fresh_noise_2", 1, 5.0, n_steps=200),
+                _candidate("g", "fresh_noise_3", 1, 5.0, n_steps=200)]
+    cand = dg.build_candidate_table(examples, model=None)
+    _, slope = dg.prefix_distance_disagreement(cand, value_col="n_steps")
+    assert slope > 0  # smooth structure the all-success binary label completely hides
+    _, binary_slope = dg.prefix_distance_disagreement(cand)  # all success -> flat binary
+    assert binary_slope == 0.0
+
+
+def test_speed_selection_uplift():
+    examples = (
+        [_candidate("a", "default", 1, 0.0, n_steps=100),   # default succeeds in 100...
+         _candidate("a", "fresh_noise_1", 1, 1.0, n_steps=80),  # ...faster success available
+         _candidate("a", "fresh_noise_2", 0, 2.0, n_steps=200)]
+        + [_candidate("b", "default", 1, 0.0, n_steps=50),  # default already the fastest
+           _candidate("b", "fresh_noise_1", 1, 1.0, n_steps=50)])
+    cand = dg.build_candidate_table(examples, model=None)
+    out = dg.speed_selection_uplift(cand, n_bootstrap=500)
+    assert out["n_eligible_groups"] == 2
+    assert np.isclose(out["mean_step_savings"], 10.0)          # (20 + 0) / 2
+    assert np.isclose(out["fraction_with_faster_option"], 0.5)  # only group "a"
 
 
 def test_stratify_by_u_level_buckets_into_terciles():
