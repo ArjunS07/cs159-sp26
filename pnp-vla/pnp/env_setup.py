@@ -23,6 +23,66 @@ _QUANTIZATION_CONSTANTS = (
     ("FROM_NODE_KEY", "from_node"),
 )
 
+EGL_VENDOR_DIR = "/usr/share/glvnd/egl_vendor.d"
+# The GLVND dispatcher picks vendors in filename order, so 10_ outranks Colab's 50_mesa.json.
+_NVIDIA_EGL_ICD_NAME = "10_nvidia.json"
+_NVIDIA_EGL_ICD = {"file_format_version": "1.0.0",
+                   "ICD": {"library_path": "libEGL_nvidia.so.0"}}
+_NVIDIA_EGL_SEARCH_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib",
+                           "/usr/lib/aarch64-linux-gnu")
+
+
+def _find_nvidia_egl_library(search_dirs=_NVIDIA_EGL_SEARCH_DIRS) -> str | None:
+    import glob as _glob
+    for directory in search_dirs:
+        matches = sorted(_glob.glob(os.path.join(directory, "libEGL_nvidia.so*")))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _ensure_nvidia_egl_vendor(vendor_dir: str = EGL_VENDOR_DIR, search_dirs=None) -> bool:
+    """Register the NVIDIA EGL vendor ICD so MuJoCo renders offscreen on the GPU.
+
+    Colab images ship only ``50_mesa.json``, so ``MUJOCO_GL=egl`` resolves to Mesa's SOFTWARE
+    renderer and every camera render runs on CPU. Measured on an L4: ~142 ms per LIBERO step
+    versus ~6 ms of policy inference, i.e. the simulator becomes >90% of a rollout. Writing this
+    one file is what the pre-refactor notebook's apt cell did, and it needs no packages -- the
+    dispatcher and the NVIDIA driver library are already installed.
+
+    Never registers an ICD whose library is absent: pointing EGL at a missing vendor is worse
+    than leaving Mesa in place.
+    """
+    path = os.path.join(vendor_dir, _NVIDIA_EGL_ICD_NAME)
+    if os.path.exists(path):
+        return False
+    library = _find_nvidia_egl_library(search_dirs or _NVIDIA_EGL_SEARCH_DIRS)
+    if library is None:
+        print("WARNING: libEGL_nvidia.so not found; MuJoCo will render on CPU (Mesa software "
+              "EGL). Expect the simulator to dominate rollout time.")
+        return False
+    try:
+        os.makedirs(vendor_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(_NVIDIA_EGL_ICD, handle)
+    except OSError as exc:
+        print(f"WARNING: could not write {path} ({exc}); MuJoCo will render on CPU (Mesa).")
+        return False
+    print(f"Registered NVIDIA EGL vendor ICD at {path} -> GPU offscreen rendering.")
+    return True
+
+
+def egl_vendors_label(vendor_dir: str = EGL_VENDOR_DIR) -> str:
+    """The EGL vendor ICDs on disk, in the order the dispatcher will prefer them."""
+    try:
+        vendors = sorted(name for name in os.listdir(vendor_dir) if name.endswith(".json"))
+    except OSError:
+        return "none"
+    if not vendors:
+        return "none"
+    label = "+".join(name[:-5] for name in vendors)
+    return label if any(name.startswith("10_nvidia") for name in vendors) else f"{label}(CPU!)"
+
 
 def _ensure_libero_config(config_dir: str | None = None) -> bool:
     """Create LIBERO's default path config before its import-time input prompt runs.
@@ -222,6 +282,8 @@ def setup_environment(hf_home: str = "/content/hf_home") -> None:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     # Google Drive FUSE has corrupted multi-GB model shards; always use local disk.
     os.environ["HF_HOME"] = hf_home
+    # Must happen before any MuJoCo render context exists, i.e. before the first env is built.
+    _ensure_nvidia_egl_vendor()
 
     torch, torchvision = _require_core_runtime()
     _configure_runtime_output(torch)
@@ -244,6 +306,9 @@ def setup_environment(hf_home: str = "/content/hf_home") -> None:
         "CUDA": str(getattr(getattr(torch, "version", None), "cuda", "unknown")),
         "TorchVision": _version(torchvision, "torchvision"),
         **{name: _version(module, name.lower()) for name, module in modules.items()},
+        # Surfaced because a Mesa-only list means CPU rendering, which silently costs ~7x
+        # per rollout without failing anything.
+        "EGL": egl_vendors_label(),
     }
     print("Environment versions: " + ", ".join(f"{key}={value}" for key, value in versions.items()))
     print("Environment ready.")
