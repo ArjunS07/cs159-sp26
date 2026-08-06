@@ -209,11 +209,21 @@ class SupabaseStore:
 
     # ── resume ─────────────────────────────────────────────────────────────
     def existing_keys(self, experiment: str, **eq) -> set[str]:
-        q = self.client.table("rollouts").select("rollout_id").eq("experiment", experiment)
-        for k, v in eq.items():
-            q = q.eq(k, v)
-        rows = q.execute().data or []
-        return {r["rollout_id"] for r in rows}
+        """Every already-logged rollout_id for `experiment`, paged past PostgREST's row cap.
+
+        This MUST paginate. A single .execute() is capped (Supabase defaults to 1000 rows), so
+        once an experiment exceeds the cap the unseen rollouts look un-collected and a resumed
+        worker recollects them -- idempotent thanks to the upsert, but hours of wasted GPU.
+        """
+        def configure(query):
+            query = query.eq("experiment", experiment)
+            for key, value in eq.items():
+                query = query.eq(key, value)
+            return query
+
+        rows = self.fetch_all("rollouts", "rollout_id", configure=configure,
+                              order_by=("rollout_id",))
+        return {row["rollout_id"] for row in rows}
 
     def iter_todo(self, experiment: str, episodes, methods, done: set | None = None):
         """Yield (ep, method, config, rid) for each (episode x method) not already logged.
