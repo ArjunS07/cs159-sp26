@@ -141,6 +141,12 @@ class RolloutConfig:
     # boundaries). Rendering is ~90% of a LIBERO step and 49 of 50 renders are discarded, so this
     # is worth ~5x wall clock. Ignored when a sink needs every frame (save_observations/video).
     skip_unused_renders: bool = False
+    # Steps of lead time before a consumed observation to re-enable the cameras. Robosuite
+    # returns the LAST cached image on a freshly re-enabled observable rather than a fresh
+    # render, so a lead of 1 hands the policy a stale frame (verified on the real simulator:
+    # assert_render_skip_equivalent failed at the first decision). Determine the true lag with
+    # the render-lag probe and set this from data, never by guessing.
+    render_lead: int = 2
 
     def __post_init__(self):
         n_actions = int(self.refine) + int(self.correction_lambda is not None) \
@@ -161,6 +167,8 @@ class RolloutConfig:
                 raise ValueError(f"{sink} requires a probe (its data comes from the probe)")
         if self.save_uncertainty and not self.has_probe:
             raise ValueError("save_uncertainty=True requires a probe")
+        if self.render_lead < 1:
+            raise ValueError("render_lead must be >= 1 (the consumed step itself)")
 
     @property
     def has_probe(self) -> bool:

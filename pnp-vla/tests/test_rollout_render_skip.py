@@ -26,14 +26,22 @@ LIVE_STAMPS = [NUM_STEPS_WAIT - 1 + CHUNK * i for i in range(N_DECISIONS)]
 
 
 class _Env:
-    """Records which steps rendered, and stamps each image with the step that produced it."""
+    """Records which steps rendered, and stamps each image with the step that produced it.
 
-    def __init__(self, supports_toggle=True):
+    `warmup` reproduces robosuite's real behaviour: a freshly re-enabled observable serves the
+    LAST CACHED value for `warmup - 1` steps before rendering fresh again. warmup=1 means a
+    re-enabled camera is immediately fresh; warmup=2 matches what the simulator actually does.
+    """
+
+    def __init__(self, supports_toggle=True, warmup=1):
         self.supports_toggle = supports_toggle
+        self.warmup = warmup
         self.cameras_on = True
         self.render_steps = []
         self.actions = []
         self.toggles = []
+        self._enabled_for = warmup      # steps the cameras have been continuously enabled
+        self._cached = None
         self._step = -1        # -1 == set_init_state, 0..n-1 == settle steps, then main loop
 
     # robosuite exposes the toggle on the wrapped env; mirror that shape.
@@ -45,8 +53,11 @@ class _Env:
         if not self.supports_toggle:
             raise NotImplementedError("no observable toggle")
         assert attribute == "enabled"
-        self.cameras_on = bool(value)
-        self.toggles.append((name, bool(value)))
+        value = bool(value)
+        if value and not self.cameras_on:
+            self._enabled_for = 0        # re-enabled: needs warm-up before it is fresh
+        self.cameras_on = value
+        self.toggles.append((name, value))
 
     def _observation(self):
         obs = {
@@ -55,10 +66,12 @@ class _Env:
             "robot0_gripper_qpos": np.zeros(2),
         }
         if self.cameras_on:
-            self.render_steps.append(self._step)
-            stamp = np.full((4, 4, 3), self._step, dtype=np.uint8)
-            obs["agentview_image"] = stamp
-            obs["robot0_eye_in_hand_image"] = stamp
+            self._enabled_for += 1
+            if self._enabled_for >= self.warmup or self._cached is None:
+                self.render_steps.append(self._step)
+                self._cached = np.full((4, 4, 3), self._step, dtype=np.uint8)
+            obs["agentview_image"] = self._cached
+            obs["robot0_eye_in_hand_image"] = self._cached
         return obs
 
     def reset(self):
@@ -110,9 +123,30 @@ def _run(env, policy, **config_kwargs):
                            torch.device("cpu"), RolloutConfig(**config_kwargs))
 
 
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("warmup", [1, 2, 3])
+def test_policy_sees_a_live_image_when_lead_covers_the_warmup(warmup):
+    """A lead >= the simulator's warm-up must deliver fresh frames; this is the property that
+    the real-sim check failed at lead=1, where robosuite served a stale cached image."""
+    env, policy = _Env(warmup=warmup), _Policy()
+    _run(env, policy, skip_unused_renders=True, render_lead=warmup)
+    assert len(policy.seen) == N_DECISIONS
+    assert policy.seen == LIVE_STAMPS
+
+
+def test_too_short_a_lead_is_detected_as_a_stale_frame():
+    """Guards the guard: with warm-up 2 and lead 1 the policy must NOT see live frames, or the
+    test above would pass for the wrong reason."""
+    env, policy = _Env(warmup=2), _Policy()
+    _run(env, policy, skip_unused_renders=True, render_lead=1)
+    assert policy.seen != LIVE_STAMPS
+
+
 def test_policy_sees_a_live_image_at_every_decision_point():
     env, policy = _Env(), _Policy()
-    _run(env, policy, skip_unused_renders=True)
+    _run(env, policy, skip_unused_renders=True, render_lead=1)
 
     # One decision per chunk boundary over MAX_STEPS executed actions.
     assert len(policy.seen) == N_DECISIONS
@@ -122,10 +156,10 @@ def test_policy_sees_a_live_image_at_every_decision_point():
 
 
 def test_skipping_matches_always_rendering_exactly():
-    baseline_env, baseline_policy = _Env(), _Policy()
+    baseline_env, baseline_policy = _Env(warmup=2), _Policy()
     _run(baseline_env, baseline_policy, skip_unused_renders=False)
-    skipped_env, skipped_policy = _Env(), _Policy()
-    _run(skipped_env, skipped_policy, skip_unused_renders=True)
+    skipped_env, skipped_policy = _Env(warmup=2), _Policy()
+    _run(skipped_env, skipped_policy, skip_unused_renders=True, render_lead=2)
 
     assert skipped_policy.seen == baseline_policy.seen
     assert len(skipped_env.actions) == len(baseline_env.actions)

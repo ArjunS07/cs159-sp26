@@ -156,6 +156,7 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     skipping = config.skip_unused_renders and not needs_every_frame
     if skipping:
         skipping = set_camera_observables(env, True)
+    lead = max(1, int(config.render_lead))
 
     def _render_next(needed: bool) -> None:
         """Arm/disarm rendering for the NEXT env.step, whose obs is consumed if `needed`."""
@@ -167,8 +168,9 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
         policy.reset()
         obs = env.set_init_state(ep["init_state"])
         for wait_step in range(NUM_STEPS_WAIT):
-            # Only the final settling observation feeds the first policy call.
-            _render_next(wait_step == NUM_STEPS_WAIT - 1)
+            # Only the final settling observation feeds the first policy call, but the cameras
+            # need `lead` steps of warm-up before they return a freshly rendered frame.
+            _render_next(wait_step >= NUM_STEPS_WAIT - lead)
             obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
 
         for step in range(max_steps):
@@ -215,9 +217,9 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                 frames.append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
             robot_states.append(np.concatenate([
                 obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"]]).copy())
-            # The queue just emptied => the next iteration re-plans from the obs this step
-            # returns, so that one render is required. Every other render is discarded.
-            _render_next(not queue)
+            # The queue empties in `len(queue)` more steps, and the step that empties it returns
+            # the obs the next re-plan consumes. Arm the cameras `lead` steps ahead of it.
+            _render_next(len(queue) < lead)
             obs, _, done, _ = env.step(a)
             if env.check_success():
                 success = True
@@ -280,6 +282,56 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
 # ─────────────────────────────────────────────────────────────────────────────
 # Env-lifecycle helper (the one loop convenience the repo provides)
 # ─────────────────────────────────────────────────────────────────────────────
+def measure_render_lag(env, ep, off_at=1, on_at=8, n_steps=12, camera="agentview_image"):
+    """Measure how many steps a re-enabled camera needs before it renders fresh again.
+
+    Robosuite serves the last cached value for a disabled observable, so re-enabling does not
+    guarantee a current frame. Replays one fixed dummy-action sequence twice -- always rendering,
+    then disabled over [off_at, on_at) -- and reports the first step after `on_at` whose image
+    matches the always-rendered reference. That count is `RolloutConfig.render_lead`.
+
+    Needs no policy, so it costs seconds. Returns the measured lead, or None if it never matches.
+    """
+    def replay(off=None, on=None):
+        set_camera_observables(env, True)
+        env.reset()
+        env.set_init_state(ep["init_state"])
+        out = []
+        for step in range(n_steps):
+            if off is not None and step == off:
+                set_camera_observables(env, False)
+            if on is not None and step == on:
+                set_camera_observables(env, True)
+            obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+            value = obs.get(camera)
+            out.append(None if value is None else np.asarray(value).copy())
+        return out
+
+    reference = replay()
+    probed = replay(off=off_at, on=on_at)
+    set_camera_observables(env, True)
+
+    lead = None
+    print(f"{'step':>5}{'state':>10}{'vs reference':>16}{'vs pre-disable':>17}")
+    stale = reference[off_at - 1] if off_at >= 1 else None
+    for step in range(on_at, n_steps):
+        image = probed[step]
+        if image is None:
+            state, matches_ref, matches_stale = "missing", False, False
+        else:
+            state = "present"
+            matches_ref = np.array_equal(image, reference[step])
+            matches_stale = stale is not None and np.array_equal(image, stale)
+        print(f"{step:>5}{state:>10}{str(matches_ref):>16}{str(matches_stale):>17}")
+        if matches_ref and lead is None:
+            lead = step - on_at + 1
+    if lead is None:
+        print("never matched the reference -- rendering cannot be skipped on this robosuite")
+    else:
+        print(f"\nmeasured render_lead = {lead}")
+    return lead
+
+
 def assert_render_skip_equivalent(env, ep, policy, preprocess, postprocess, device,
                                   config: RolloutConfig | None = None, raise_on_fail=True):
     """Verify on the REAL simulator that skip_unused_renders changes nothing the policy sees.
