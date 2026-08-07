@@ -1,0 +1,87 @@
+import copy
+
+import numpy as np
+import pandas as pd
+
+from pnp.diversity import (analyze_diversity_signal, bootstrap_manifest_summary,
+                           bootstrap_sampler_class, build_bootstrap_manifest,
+                           validate_bootstrap_manifest)
+
+
+def _episode_rows():
+    return [
+        {"episode_index": 0, "tasks": ["task a"]},
+        {"episode_index": 1, "tasks": ["task a"]},
+        {"episode_index": 2, "tasks": ["task b"]},
+        {"episode_index": 3, "tasks": ["task b"]},
+        {"episode_index": 4, "tasks": ["task b"]},
+    ]
+
+
+def test_task_stratified_bootstrap_is_deterministic_and_preserves_every_task():
+    first = build_bootstrap_manifest(_episode_rows(), seed=159)
+    second = build_bootstrap_manifest(_episode_rows(), seed=159)
+    assert first == second
+    validate_bootstrap_manifest(first)
+    assert first["n_tasks"] == 2
+    assert first["n_source_episodes"] == 5
+    assert first["source_model"] == "lerobot/pi05_base"
+    for member in first["members"]:
+        assert len(member["task_draws"]["task a"]) == 2
+        assert len(member["task_draws"]["task b"]) == 3
+        assert set(member["task_draws"]["task a"]) <= {0, 1}
+        assert set(member["task_draws"]["task b"]) <= {2, 3, 4}
+    summary = bootstrap_manifest_summary(first)
+    assert len(summary) == 2
+    assert (summary.draws == 5).all()
+
+    tampered = copy.deepcopy(first)
+    tampered["source_model"] = "lerobot/pi05_libero"
+    with np.testing.assert_raises_regex(ValueError, "manifest hash"):
+        validate_bootstrap_manifest(tampered)
+
+
+def test_bootstrap_sampler_repeats_whole_episode_frame_ranges():
+    manifest = build_bootstrap_manifest(_episode_rows(), seed=7)
+    sampler_type = bootstrap_sampler_class(manifest, 0)
+    starts = [0, 4, 9, 12, 18]
+    ends = [4, 9, 12, 18, 23]
+    sampler = sampler_type(starts, ends, drop_n_last_frames=1, shuffle=False)
+    counts = {int(key): int(value)
+              for key, value in manifest["members"][0]["multiplicities"].items()}
+    expected = sum(count * (ends[index] - starts[index] - 1)
+                   for index, count in counts.items())
+    assert len(sampler) == expected
+    assert list(iter(sampler)) == sampler.indices
+
+
+def test_diversity_signal_reports_oracle_and_first_chunk_selector():
+    identities = [
+        {"suite": "libero_goal_swap", "task_idx": 0, "episode_idx": index,
+         "init_state_hash": str(index)} for index in range(4)
+    ]
+    outcomes = {0: [True, False, True, False], 1: [True, True, False, False]}
+    first_u = {0: [.1, .3, .1, .2], 1: [.2, .1, .3, .2]}
+    rows, steps = [], []
+    for member in (0, 1):
+        for index, identity in enumerate(identities):
+            rollout_id = f"m{member}-{index}"
+            rows.append({
+                **identity, "member_index": member, "rollout_id": rollout_id,
+                "success": outcomes[member][index], "status": "completed",
+                "u_mean_episode": first_u[member][index],
+                "generated_chunks_path": f"chunks/{rollout_id}.npz", "n_steps": 100,
+            })
+            for euler_step in (3, 4):
+                steps.append({"member_index": member, "rollout_id": rollout_id,
+                              "chunk_idx": 0, "euler_step": euler_step,
+                              "u_mean": first_u[member][index]})
+    tables = analyze_diversity_signal(pd.DataFrame(rows), pd.DataFrame(steps))
+    summary = tables["diversity_signal_overall"].iloc[0]
+    assert summary.n_pairs == 4
+    assert summary.n_discordant == 2
+    assert np.isclose(summary.best_member_sr, .5)
+    assert np.isclose(summary.oracle_either_success_sr, .75)
+    assert np.isclose(summary.lower_first_chunk_u_sr, .75)
+    assert np.isclose(summary.lower_first_chunk_u_accuracy_discordant, 1.)
+    assert np.isclose(summary.lower_first_chunk_u_win_auc, 1.)

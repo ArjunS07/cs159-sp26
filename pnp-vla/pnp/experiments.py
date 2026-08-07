@@ -287,7 +287,7 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
 def _run_collection(*, store, policy, preprocess, postprocess, device, experiment, episodes,
                     methods, cohort, shard_count, shard_index,
                     benchmark="libero", driver="hybrid_schedules", run_metadata=None,
-                    report_every=50):
+                    report_every=50, provenance=None):
     from tqdm.auto import tqdm
     from .rollout import iter_task_envs, run_episode
 
@@ -308,7 +308,7 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     run_config.update(run_metadata or {})
     store.start_run(
         driver=driver, benchmark=benchmark, experiment=experiment,
-        config=run_config,
+        config=run_config, provenance=provenance,
     )
     completed = 0
     method_names = [name for name, _ in methods]

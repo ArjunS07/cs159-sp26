@@ -18,7 +18,7 @@ def default_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _ensure_hf_weights(repo_id: str) -> str:
+def _ensure_hf_weights(repo_id: str, revision: str | None = None) -> str:
     """Fully download repo_id and validate every safetensors shard.
 
     lerobot's from_pretrained silently falls back to RANDOM weights when a cached .safetensors
@@ -31,7 +31,8 @@ def _ensure_hf_weights(repo_id: str) -> str:
     tok = os.getenv("HF_TOKEN")
     last_err = None
     for force in (False, True):
-        path = snapshot_download(repo_id, token=tok, force_download=force)
+        path = snapshot_download(
+            repo_id, revision=revision, token=tok, force_download=force)
         shards = glob.glob(os.path.join(path, "**", "*.safetensors"), recursive=True)
         if not shards:
             return path
@@ -62,16 +63,17 @@ def apply_pnp_patch(policy) -> None:
     print(f"Patched pi05 sample_actions (action_dim={adim})")
 
 
-def load_pi05(device=None, repo_id: str = PI05_REPO_ID):
-    """Load the pi0.5 LIBERO-finetuned policy and its pre/post processors, patched for P&P."""
+def load_pi05(device=None, repo_id: str = PI05_REPO_ID,
+              revision: str | None = None):
+    """Load a pinned pi0.5 policy and its pre/post processors, patched for P&P."""
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy
     from lerobot.policies.factory import make_pre_post_processors
 
     device = device or default_device()
-    _ensure_hf_weights(repo_id)
-    policy = PI05Policy.from_pretrained(repo_id).to(device).eval()
+    snapshot_path = _ensure_hf_weights(repo_id, revision=revision)
+    policy = PI05Policy.from_pretrained(snapshot_path).to(device).eval()
     preprocess, postprocess = make_pre_post_processors(
-        policy.config, repo_id,
+        policy.config, snapshot_path,
         preprocessor_overrides={"device_processor": {"device": str(device)}},
     )
     apply_pnp_patch(policy)

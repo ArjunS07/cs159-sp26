@@ -25,6 +25,13 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
 - `16_analyze_expanded_pro.ipynb` — zero-GPU Supabase analysis for expanded PRO workers 0–5,
   including paired rollout results and consecutive-uncertainty contraction.
 
+- `17_train_diverse_pi05.ipynb` — create one shared task-stratified episode-bootstrap manifest
+  and full-fine-tune member 0 or 1 on an 80GB A100/H100.
+- `workers/18_diversity_signal_model_{0,1}.ipynb` — matched 13-suite PRO signal workers for the
+  two trained models (K=5 uncertainty plus exact first-decision chunks).
+- `19_analyze_diversity_signal.ipynb` — paired complementarity, uncertainty-selection, and
+  first-action diversity analysis for the two model workers.
+
 Superseded verifier notebooks and workers are retained under `archive/verifier_v1/` for
 provenance. They should not be used for new collection or model selection.
 
