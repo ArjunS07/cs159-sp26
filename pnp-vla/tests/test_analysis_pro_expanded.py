@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 
-from analysis.pro_expanded import (episode_contraction,
+from analysis.pro_expanded import (dimensional_isolation, episode_contraction,
+                                   optimal_window_tables,
                                    refinement_effect_by_uncertainty_bin,
                                    uncertainty_window_sweep)
 from analysis.validate import validate_pro_expanded
@@ -125,13 +126,34 @@ def test_uncertainty_threshold_tables_are_paired_and_cover_every_identity():
         ]
     rollouts = pd.DataFrame(rows)
     sweep = uncertainty_window_sweep(rollouts, grid_size=5)
-    assert len(sweep) == 15
+    assert len(sweep) == 17
     assert sweep.n_refined.max() == 20
     assert set(sweep.analysis_type) == {"exploratory_in_sample"}
+    assert sweep.loc[sweep.n_refined < 10, "delta_pp"].isna().all()
+    selected = optimal_window_tables(rollouts, sweep, minimum_selected=10)
+    assert len(selected["expanded_uncertainty_optimal_window"]) == 1
+    assert len(selected["expanded_uncertainty_optimal_by_suite"]) == 1
+    assert set(selected["expanded_uncertainty_window_extrema"].rank_group) == {"top", "bottom"}
     effect = refinement_effect_by_uncertainty_bin(rollouts, n_bins=5)
     assert len(effect) == 5
     assert effect.n.sum() == 20
     assert {"F_to_S", "S_to_F", "delta_pp"}.issubset(effect.columns)
+
+
+def test_dimensional_isolation_reports_dimensions_and_subspaces():
+    rows = []
+    for suite_index, suite in enumerate(("libero_goal_swap", "libero_object_swap")):
+        for episode in range(20):
+            fail = episode >= 10
+            row = {"suite": suite, "method": Method.UNCERTAINTY,
+                   "success": not fail}
+            for dim in range(7):
+                row[f"u_mean_d{dim}"] = float(fail) + .01 * episode + suite_index
+            rows.append(row)
+    result = dimensional_isolation(pd.DataFrame(rows))["expanded_dimensional_isolation"]
+    assert set(("x", "y", "z", "roll", "pitch", "yaw", "gripper")).issubset(result.score)
+    assert {"position", "rotation", "position+gripper", "all_dims"}.issubset(result.score)
+    assert (result.n_suites == 2).all()
 
 
 def test_expanded_report_renders_threshold_auc_and_contraction_figures(tmp_path):
@@ -148,10 +170,19 @@ def test_expanded_report_renders_threshold_auc_and_contraction_figures(tmp_path)
          **{f"u_iter_{j}": .4 - .05 * j + .01 * i for j in range(4)}}
         for i in range(8)
     ])
-    quartiles = pd.DataFrame([
-        {"window": window, "contraction_quartile": q, "correction_rate": .1 * q,
-         "ci_low": .05 * q, "ci_high": .15 * q}
+    trend = pd.DataFrame([
+        {"window": window, "contraction_bin": q, "score_median": -.2 + .1 * q,
+         "correction_rate": .1 * q, "ci_low": .05 * q, "ci_high": .15 * q}
         for window in ("first_4_chunks", "full_episode") for q in range(1, 5)
+    ])
+    contraction_summary = pd.DataFrame([
+        {"window": window, "metric": "contraction_normalized_slope", "roc_auc": .6}
+        for window in ("first_4_chunks", "full_episode")
+    ])
+    contraction_curves = pd.DataFrame([
+        {"window": window, "metric": "contraction_normalized_slope",
+         "fpr": point, "tpr": min(1, point + .1), "threshold": 1 - point}
+        for window in ("first_4_chunks", "full_episode") for point in (0., .5, 1.)
     ])
     effect = pd.DataFrame([
         {"uncertainty_bin": i, "delta_pp": i - 5,
@@ -159,28 +190,53 @@ def test_expanded_report_renders_threshold_auc_and_contraction_figures(tmp_path)
         for i in range(1, 11)
     ])
     sweep = pd.DataFrame([
-        {"lower_grid_index": low, "upper_grid_index": high,
-         "delta_pp": high - low, "n_refined": 5 * (high - low + 1)}
-        for low in range(3) for high in range(low, 3)
+        {"lower": low, "upper": high, "delta_pp": 100 * (high - low),
+         "n_refined": 5 + int(100 * (high - low))}
+        for low in (0., .01, .02) for high in (.03, .04, .05) if high > low
     ])
+    detector_curves = pd.DataFrame([
+        {"suite": curve_suite, "fpr": point, "tpr": min(1, point + .2),
+         "threshold": 1 - point}
+        for curve_suite in (suite, "pooled") for point in (0., .5, 1.)
+    ])
+    isolation = pd.DataFrame([
+        {"score": score, "score_group": "dimension", "mean_within_suite_auc": .6}
+        for score in ("x", "y", "z", "roll", "pitch", "yaw", "gripper")
+    ] + [
+        {"score": score, "score_group": "subspace", "mean_within_suite_auc": .65}
+        for score in ("position", "rotation", "position+gripper", "all_dims")
+    ])
+    optimal = pd.DataFrame([{"lower": .01, "upper": .04, "delta_pp": 2., "n_refined": 10}])
+    optimal_suite = pd.DataFrame([{
+        "suite": suite, "observed_sr": .2, "selective_sr": .3, "delta_pp": 10.,
+        "n": 20, "n_refined": 10,
+    }])
     tables = {
         "pro_success_by_suite": success, "pro_paired_by_suite": paired,
         "expanded_contraction_episode": episodes,
-        "expanded_contraction_quartiles": quartiles,
+        "expanded_contraction_trend": trend,
+        "expanded_contraction_summary": contraction_summary,
+        "expanded_contraction_roc_curves": contraction_curves,
         "pro_detector_by_suite": pd.DataFrame([{
             "suite": suite, "roc_auc": .7, "roc_ci_low": .6, "roc_ci_high": .8}]),
         "pro_detector_summary": pd.DataFrame([{
             "estimate_scope": "pooled", "roc_auc": .72,
             "roc_ci_low": .65, "roc_ci_high": .79}]),
+        "pro_detector_roc_curves": detector_curves,
+        "expanded_dimensional_isolation": isolation,
         "expanded_refinement_effect_by_uncertainty_bin": effect,
         "expanded_uncertainty_window_sweep": sweep,
+        "expanded_uncertainty_optimal_window": optimal,
+        "expanded_uncertainty_optimal_by_suite": optimal_suite,
     }
     expanded_pro_figures(tables, tmp_path)
     expected = {
         "expanded_pro_success_by_suite", "expanded_pro_paired_transitions",
-        "expanded_contraction_profiles", "expanded_contraction_quartiles",
-        "expanded_uncertainty_failure_auc",
+        "expanded_contraction_profiles", "expanded_contraction_correction_trend",
+        "expanded_contraction_correction_roc",
+        "expanded_uncertainty_failure_auc_by_suite", "expanded_uncertainty_failure_roc",
+        "expanded_uncertainty_per_dimension_auc", "expanded_uncertainty_subspace_auc",
         "expanded_refinement_effect_by_uncertainty",
-        "expanded_uncertainty_window_sweep",
+        "expanded_optimal_window_success_by_suite", "expanded_uncertainty_window_sweep",
     }
     assert expected == {path.stem for path in (tmp_path / "figures").glob("*.png")}

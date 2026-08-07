@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from pnp.config import Method
+from pnp.config import DIM_NAMES, Method
 from .conditions import PAIR_KEYS
 from . import pro
 from .statistics import (bootstrap_auc, paired_bootstrap_ci, paired_counts,
@@ -152,7 +152,7 @@ def contraction_analysis(features: pd.DataFrame) -> dict[str, pd.DataFrame]:
                            "correction_rate": float(suite_group.corrected.mean()),
                            "spearman_rho": rho, "spearman_p": p_value, **auc})
 
-    quartile_rows = []
+    quartile_rows, trend_rows, roc_rows = [], [], []
     for window, group in failures.groupby("window", sort=True):
         group = group.copy()
         group["contraction_quartile"] = pd.qcut(
@@ -167,11 +167,38 @@ def contraction_analysis(features: pd.DataFrame) -> dict[str, pd.DataFrame]:
                                   "ci_low": lo, "ci_high": hi,
                                   "mean_within_suite_rank":
                                       part.contraction_within_suite_rank.mean()})
+        trend = group.copy()
+        n_trend_bins = min(10, len(trend))
+        trend["contraction_bin"] = pd.qcut(
+            trend.contraction_normalized_slope.rank(method="first"), n_trend_bins,
+            labels=False) + 1
+        for bin_index, part in trend.groupby("contraction_bin", sort=True):
+            wins, n = int(part.corrected.sum()), len(part)
+            lo, hi = wilson_interval(wins, n)
+            trend_rows.append({
+                "window": window, "contraction_bin": int(bin_index),
+                "n_failures": n, "n_corrected": wins,
+                "correction_rate": wins / n, "ci_low": lo, "ci_high": hi,
+                "score_min": float(part.contraction_normalized_slope.min()),
+                "score_median": float(part.contraction_normalized_slope.median()),
+                "score_max": float(part.contraction_normalized_slope.max()),
+            })
+        from sklearn.metrics import roc_curve
+        for metric in ("contraction_normalized_slope", "contraction_within_suite_rank"):
+            valid = group[["corrected", metric]].dropna()
+            if valid.corrected.nunique() != 2:
+                continue
+            fpr, tpr, thresholds = roc_curve(valid.corrected.astype(int), valid[metric])
+            roc_rows.extend({"window": window, "metric": metric,
+                             "fpr": x, "tpr": y, "threshold": threshold}
+                            for x, y, threshold in zip(fpr, tpr, thresholds))
     return {
         "expanded_contraction_episode": features,
         "expanded_contraction_summary": pd.DataFrame(summaries),
         "expanded_contraction_by_suite": pd.DataFrame(suites),
         "expanded_contraction_quartiles": pd.DataFrame(quartile_rows),
+        "expanded_contraction_trend": pd.DataFrame(trend_rows),
+        "expanded_contraction_roc_curves": pd.DataFrame(roc_rows),
     }
 
 
@@ -183,31 +210,141 @@ def _paired_uncertainty(rollouts: pd.DataFrame) -> pd.DataFrame:
         suffixes=("_observed", "_refined"))
 
 
-def uncertainty_window_sweep(rollouts: pd.DataFrame, *, grid_size: int = 21) -> pd.DataFrame:
-    """Exploratory selective-refinement sweep over observed uncertainty windows."""
+def uncertainty_window_sweep(rollouts: pd.DataFrame, *, grid_size: int = 25,
+                             min_window: int = 10) -> pd.DataFrame:
+    """Reproduce the old notebook's fixed-grid selective-refinement sweep.
+
+    The lower grid spans [0, .06] and the upper grid spans [.01, .08]. Results with fewer
+    than ``min_window`` selected identities retain their sample size but have no SR estimate.
+    """
     paired = _paired_uncertainty(rollouts)
     score = paired.u_mean_episode.to_numpy(float)
     observed = paired.success_observed.to_numpy(bool)
     refined = paired.success_refined.to_numpy(bool)
-    thresholds = np.unique(np.quantile(score, np.linspace(0, 1, grid_size)))
+    lower_bounds = np.linspace(0., .06, grid_size)
+    upper_bounds = np.linspace(.01, .08, grid_size)
     baseline_sr = float(observed.mean())
     rows = []
-    for lower_index, lower in enumerate(thresholds):
-        for upper_index in range(lower_index, len(thresholds)):
-            upper = thresholds[upper_index]
+    for lower_index, lower in enumerate(lower_bounds):
+        for upper_index, upper in enumerate(upper_bounds):
+            if upper <= lower:
+                continue
             selected = (score >= lower) & (score <= upper)
             policy = np.where(selected, refined, observed)
+            eligible = int(selected.sum()) >= min_window
             rows.append({
                 "lower": float(lower), "upper": float(upper),
                 "lower_grid_index": lower_index, "upper_grid_index": upper_index,
                 "n_refined": int(selected.sum()), "coverage_refined": float(selected.mean()),
-                "baseline_sr": baseline_sr, "selective_sr": float(policy.mean()),
-                "delta_pp": float(100 * (policy.mean() - baseline_sr)),
+                "eligible": eligible, "baseline_sr": baseline_sr,
+                "base_sr_window": float(observed[selected].mean()) if selected.any() else math.nan,
+                "ref_sr_window": float(refined[selected].mean()) if selected.any() else math.nan,
+                "selective_sr": float(policy.mean()) if eligible else math.nan,
+                "total_sr_policy": float(policy.mean()) if eligible else math.nan,
+                "total_sr_change": float(policy.mean() - baseline_sr) if eligible else math.nan,
+                "delta_pp": float(100 * (policy.mean() - baseline_sr)) if eligible else math.nan,
                 "selected_F_to_S": int((selected & ~observed & refined).sum()),
                 "selected_S_to_F": int((selected & observed & ~refined).sum()),
                 "analysis_type": "exploratory_in_sample",
             })
     return pd.DataFrame(rows)
+
+
+def optimal_window_tables(rollouts: pd.DataFrame, sweep: pd.DataFrame,
+                          *, minimum_selected: int = 20) -> dict[str, pd.DataFrame]:
+    """Select the best in-sample window and summarize its 13-suite policy effect."""
+    eligible = sweep[(sweep.n_refined >= minimum_selected) & sweep.delta_pp.notna()].copy()
+    if eligible.empty:
+        raise ValueError(f"no uncertainty window selected at least {minimum_selected} identities")
+    ranked = eligible.sort_values(
+        ["delta_pp", "n_refined", "lower", "upper"],
+        ascending=[False, False, True, True]).reset_index(drop=True)
+    top = ranked.head(10).copy()
+    top.insert(0, "rank", np.arange(1, len(top) + 1))
+    bottom = ranked.tail(10).sort_values(
+        ["delta_pp", "n_refined"], ascending=[True, False]).reset_index(drop=True)
+    bottom.insert(0, "rank", np.arange(1, len(bottom) + 1))
+    extrema = pd.concat([top.assign(rank_group="top"),
+                         bottom.assign(rank_group="bottom")], ignore_index=True)
+
+    best = ranked.iloc[0]
+    paired = _paired_uncertainty(rollouts).copy()
+    paired["selected"] = paired.u_mean_episode.between(best.lower, best.upper)
+    paired["selective_success"] = np.where(
+        paired.selected, paired.success_refined, paired.success_observed).astype(bool)
+    rows = []
+    for suite, group in paired.groupby("suite", sort=True):
+        observed = group.success_observed.astype(bool).to_numpy()
+        refined = group.success_refined.astype(bool).to_numpy()
+        policy = group.selective_success.astype(bool).to_numpy()
+        selected = group.selected.to_numpy(bool)
+        counts = paired_counts(observed, policy)
+        lo, hi = paired_bootstrap_ci(observed, policy, n_boot=5000)
+        rows.append({
+            "suite": suite, "n": len(group), "n_refined": int(selected.sum()),
+            "coverage_refined": float(selected.mean()),
+            "observed_sr": float(observed.mean()), "refine_all_sr": float(refined.mean()),
+            "selective_sr": float(policy.mean()),
+            "delta_pp": float(100 * (policy.mean() - observed.mean())),
+            "delta_ci_low_pp": float(100 * lo), "delta_ci_high_pp": float(100 * hi),
+            **counts, "lower": float(best.lower), "upper": float(best.upper),
+            "analysis_type": "exploratory_in_sample",
+        })
+    optimal = pd.DataFrame([best.to_dict()])
+    optimal.insert(0, "selection_rule", f"max delta_pp among n_refined >= {minimum_selected}")
+    return {
+        "expanded_uncertainty_window_extrema": extrema,
+        "expanded_uncertainty_optimal_window": optimal,
+        "expanded_uncertainty_optimal_by_suite": pd.DataFrame(rows),
+    }
+
+
+def dimensional_isolation(rollouts: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Old-notebook per-dimension AUC plus compact action-subspace comparisons."""
+
+    def rank_auc(labels, scores) -> float:
+        labels = np.asarray(labels, bool)
+        scores = pd.Series(np.asarray(scores, float))
+        positive, negative = int(labels.sum()), int((~labels).sum())
+        if not positive or not negative:
+            return math.nan
+        rank_sum = float(scores.rank(method="average").to_numpy()[labels].sum())
+        return (rank_sum - positive * (positive + 1) / 2) / (positive * negative)
+
+    observed = rollouts[rollouts.method == Method.UNCERTAINTY].copy()
+    observed["fail"] = (~observed.success.astype(bool)).astype(int)
+    definitions = {
+        **{name: [index] for index, name in enumerate(DIM_NAMES)},
+        "position": [0, 1, 2], "rotation": [3, 4, 5],
+        "position+gripper": [0, 1, 2, 6], "all_dims": list(range(7)),
+    }
+    summary_rows, suite_rows = [], []
+    for score_name, indices in definitions.items():
+        columns = [f"u_mean_d{index}" for index in indices]
+        score = observed[columns].mean(axis=1)
+        values = []
+        for suite, group in observed.assign(_score=score).groupby("suite", sort=True):
+            valid = group[["fail", "_score"]].dropna()
+            auc = (rank_auc(valid.fail, valid._score)
+                   if len(valid) >= 10 and valid.fail.nunique() == 2 else math.nan)
+            suite_rows.append({"score": score_name, "suite": suite, "n": len(valid),
+                               "roc_auc": auc})
+            if np.isfinite(auc):
+                values.append(auc)
+        valid = observed.assign(_score=score)[["fail", "_score"]].dropna()
+        pooled_auc = (rank_auc(valid.fail, valid._score)
+                      if valid.fail.nunique() == 2 else math.nan)
+        summary_rows.append({
+            "score": score_name,
+            "score_group": "dimension" if len(indices) == 1 else "subspace",
+            "dimensions": "+".join(DIM_NAMES[index] for index in indices),
+            "n": len(valid), "n_suites": len(values),
+            "mean_within_suite_auc": float(np.mean(values)) if values else math.nan,
+            "sd_within_suite_auc": float(np.std(values, ddof=1)) if len(values) > 1 else math.nan,
+            "pooled_auc": pooled_auc,
+        })
+    return {"expanded_dimensional_isolation": pd.DataFrame(summary_rows),
+            "expanded_dimensional_isolation_by_suite": pd.DataFrame(suite_rows)}
 
 
 def refinement_effect_by_uncertainty_bin(rollouts: pd.DataFrame,
@@ -239,17 +376,22 @@ def analyze(rollouts: pd.DataFrame, steps: pd.DataFrame,
             vectors: pd.DataFrame) -> tuple[dict[str, pd.DataFrame], dict]:
     frame = pro.annotate(rollouts)
     features = episode_contraction(frame, vectors)
+    sweep = uncertainty_window_sweep(frame)
     tables = {
         **pro.success_and_pairs(frame),
         **pro.detector(frame, steps),
         **contraction_analysis(features),
-        "expanded_uncertainty_window_sweep": uncertainty_window_sweep(frame),
+        **dimensional_isolation(frame),
+        "expanded_uncertainty_window_sweep": sweep,
+        **optimal_window_tables(frame, sweep),
         "expanded_refinement_effect_by_uncertainty_bin":
             refinement_effect_by_uncertainty_bin(frame),
     }
     state = {
         "status": "available", "cohort": "expanded_13_suite_k5",
         "contraction": "available_from_observed_arm_u_iter",
+        "dimensional_isolation": "available_from_rollout_u_mean_d0_to_d6",
+        "multimodal_pca": "not_available_compute_multimodal_false",
         "raw_ahats_geometry": "not_needed",
         "matched_compute_control": (
             "available" if (frame.method == Method.EXTRA_STEPS).any() else "deferred"),

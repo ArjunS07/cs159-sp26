@@ -502,6 +502,45 @@ def expanded_pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     ax.legend(fontsize=8)
     _save_figure(fig, "expanded_pro_success_by_suite", output)
 
+    if "pro_success_by_perturbation" in tables:
+        position = tables["pro_success_by_perturbation"]
+        position = position[position.suite_family == "position_perturb"]
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
+        for ax, axis_name in zip(axes, ("x", "y")):
+            group = position[position.perturb_axis == axis_name]
+            for condition, line in group.groupby("condition_label"):
+                line = line.sort_values("perturb_strength")
+                ax.plot(line.perturb_strength, 100 * line.sr, marker="o", label=condition)
+            ax.set(xlabel=f"Position perturbation strength ({axis_name})", ylim=(0, 100))
+        axes[0].set_ylabel("Success rate (%)")
+        axes[1].legend(fontsize=7)
+        fig.suptitle("Expanded PRO position-perturbation robustness")
+        _save_figure(fig, "expanded_position_strength", output)
+
+    if "pro_success_by_task" in tables:
+        task = tables["pro_success_by_task"]
+        observed_task = task[task.condition_label.str.startswith("observed/no-op")]
+        refined_task = task[task.condition_label.str.startswith("refine-last")]
+        observed_pivot = observed_task.pivot(
+            index="suite", columns="task_idx", values="sr").sort_index()
+        refined_pivot = refined_task.pivot(
+            index="suite", columns="task_idx", values="sr").reindex(observed_pivot.index)
+        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+        im0 = axes[0].imshow(100 * observed_pivot.to_numpy(), vmin=0, vmax=100,
+                             aspect="auto", cmap="Blues")
+        im1 = axes[1].imshow(100 * (refined_pivot - observed_pivot).to_numpy(),
+                             vmin=-50, vmax=50, aspect="auto", cmap="RdYlGn")
+        for ax in axes:
+            ax.set_yticks(np.arange(len(observed_pivot)),
+                          [name.replace("libero_", "") for name in observed_pivot.index])
+            ax.set_xticks(np.arange(len(observed_pivot.columns)), observed_pivot.columns)
+            ax.set_xlabel("Task index")
+        axes[0].set_title("Observed/no-op SR")
+        axes[1].set_title("Refinement lift")
+        fig.colorbar(im0, ax=axes[0], label="Success rate (%)")
+        fig.colorbar(im1, ax=axes[1], label="SR change (pp)")
+        _save_figure(fig, "expanded_task_success_and_lift", output)
+
     transitions = tables["pro_paired_by_suite"]
     transitions = transitions[transitions.condition_label.str.startswith("refine-last")]
     transitions = transitions.set_index("suite").reindex(suites)
@@ -534,19 +573,37 @@ def expanded_pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     ax.legend()
     _save_figure(fig, "expanded_contraction_profiles", output)
 
-    quartiles = tables["expanded_contraction_quartiles"]
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    for window, group in quartiles.groupby("window"):
-        group = group.sort_values("contraction_quartile")
-        ax.errorbar(group.contraction_quartile, 100 * group.correction_rate,
+    trend = tables["expanded_contraction_trend"]
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    for window, group in trend.groupby("window"):
+        group = group.sort_values("score_median")
+        ax.errorbar(group.score_median, 100 * group.correction_rate,
                     yerr=np.vstack((100 * (group.correction_rate - group.ci_low),
                                     100 * (group.ci_high - group.correction_rate))),
                     marker="o", capsize=3, label=window.replace("_", " "))
-    ax.set(xticks=[1, 2, 3, 4], xlabel="Within-suite contraction quartile",
+    ax.axvline(0, color="black", ls="--", lw=1)
+    ax.set(xlabel="Consecutive uncertainty trend (positive = decreases across perturbations)",
            ylabel="Paired correction rate among observed failures (%)",
-           title="Does stronger contraction predict successful refinement?")
+           title="Does uncertainty contraction predict successful refinement?")
     ax.legend()
-    _save_figure(fig, "expanded_contraction_quartiles", output)
+    _save_figure(fig, "expanded_contraction_correction_trend", output)
+
+    contraction_curves = tables["expanded_contraction_roc_curves"]
+    contraction_auc = tables["expanded_contraction_summary"]
+    contraction_auc = contraction_auc[
+        contraction_auc.metric == "contraction_normalized_slope"].set_index("window")
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    for window, group in contraction_curves[
+            contraction_curves.metric == "contraction_normalized_slope"].groupby("window"):
+        auc = contraction_auc.loc[window, "roc_auc"]
+        ax.plot(group.fpr, group.tpr, lw=1.8,
+                label=f"{window.replace('_', ' ')} (AUC={auc:.3f})")
+    ax.plot([0, 1], [0, 1], "k--", lw=.8)
+    ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="False-positive rate",
+           ylabel="True-positive rate",
+           title="Contraction as a predictor of failure-to-success correction")
+    ax.legend(fontsize=8, loc="lower right")
+    _save_figure(fig, "expanded_contraction_correction_roc", output)
 
     detector_suite = tables["pro_detector_by_suite"].copy()
     pooled = tables["pro_detector_summary"].query("estimate_scope == 'pooled'").iloc[0]
@@ -564,7 +621,84 @@ def expanded_pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
     ax.axvline(.5, color="black", ls="--", lw=1)
     ax.set(xlim=(0, 1), xlabel="Failure ROC-AUC (95% bootstrap CI)",
            title="Observed P&P uncertainty as a failure detector")
-    _save_figure(fig, "expanded_uncertainty_failure_auc", output)
+    _save_figure(fig, "expanded_uncertainty_failure_auc_by_suite", output)
+
+    curves = tables["pro_detector_roc_curves"]
+    auc_lookup = dict(zip(detector_suite.suite, detector_suite.roc_auc))
+    auc_lookup["pooled"] = pooled.roc_auc
+    fig, ax = plt.subplots(figsize=(8, 6.5))
+    for name, group in curves.groupby("suite"):
+        if not np.isfinite(auc_lookup.get(name, np.nan)):
+            continue
+        ax.plot(group.fpr, group.tpr, lw=2.4 if name == "pooled" else 1.1,
+                alpha=1 if name == "pooled" else .8,
+                label=f"{name.replace('libero_', '')} (AUC={auc_lookup[name]:.3f})")
+    ax.plot([0, 1], [0, 1], "k--", lw=.8)
+    ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="False-positive rate",
+           ylabel="True-positive rate",
+           title="Observed uncertainty as a failure detector")
+    ax.legend(fontsize=6.7, loc="lower right", ncol=2)
+    _save_figure(fig, "expanded_uncertainty_failure_roc", output)
+
+    isolation = tables["expanded_dimensional_isolation"]
+    dimensions = isolation[isolation.score_group == "dimension"]
+    all_dims_auc = isolation.loc[isolation.score == "all_dims", "mean_within_suite_auc"].iloc[0]
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    ax.bar(dimensions.score, dimensions.mean_within_suite_auc,
+           color="#4C78A8", alpha=.85)
+    ax.axhline(all_dims_auc, color="black", ls="--", lw=1,
+               label=f"all-dims baseline ({all_dims_auc:.3f})")
+    ax.axhline(.5, color="gray", ls=":", lw=1, label="chance")
+    upper = max(.85, float(dimensions.mean_within_suite_auc.max()) + .05)
+    ax.set(ylim=(.4, min(1., upper)), xlabel="Action dimension",
+           ylabel="Mean within-suite failure ROC-AUC",
+           title="Which action dimension carries the uncertainty signal?")
+    ax.legend(fontsize=8)
+    _save_figure(fig, "expanded_uncertainty_per_dimension_auc", output)
+
+    subspaces = isolation[isolation.score_group == "subspace"]
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    ax.bar(subspaces.score, subspaces.mean_within_suite_auc,
+           color="#72B7B2", alpha=.9)
+    ax.axhline(.5, color="gray", ls=":", lw=1, label="chance")
+    ax.set(ylim=(.4, 1), xlabel="Action subspace",
+           ylabel="Mean within-suite failure ROC-AUC",
+           title="Failure-detector signal by action subspace")
+    ax.tick_params(axis="x", labelrotation=15)
+    ax.legend(fontsize=8)
+    _save_figure(fig, "expanded_uncertainty_subspace_auc", output)
+
+    if "pro_detector_score_distribution" in tables:
+        scores = tables["pro_detector_score_distribution"].sort_values("fail")
+        outcome_labels = np.where(scores.fail.astype(bool), "failure", "success")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.errorbar(outcome_labels, scores["median"],
+                    yerr=np.vstack((scores["median"] - scores.q25,
+                                    scores.q75 - scores["median"])),
+                    fmt="o", capsize=5)
+        ax.set(ylabel="Observed episode uncertainty (median and IQR)",
+               title="Observed uncertainty by rollout outcome")
+        _save_figure(fig, "expanded_uncertainty_by_outcome", output)
+
+    time_profile = tables.get("pro_detector_time_profile", pd.DataFrame())
+    if not time_profile.empty:
+        fig, axes = plt.subplots(4, 4, figsize=(15, 12), sharey=True)
+        for ax, suite_name in zip(axes.ravel(), suites):
+            group = time_profile[time_profile.suite == suite_name]
+            for fail, label, color in [(0, "success", "#4C78A8"),
+                                        (1, "failure", "#E45756")]:
+                line = group[group.fail == fail]
+                ax.plot(line.episode_progress_bin, line["mean"], marker="o",
+                        label=label, color=color)
+            ax.set_title(suite_name.replace("libero_", ""), fontsize=8)
+            ax.set_xlabel("Episode progress bin")
+        for ax in axes.ravel()[len(suites):]:
+            ax.axis("off")
+        for ax in axes[:, 0]:
+            ax.set_ylabel("Mean uncertainty")
+        axes[0, 0].legend(fontsize=7)
+        fig.suptitle("Observed uncertainty over episode progress")
+        _save_figure(fig, "expanded_uncertainty_over_time", output)
 
     effect = tables["expanded_refinement_effect_by_uncertainty_bin"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
@@ -579,22 +713,41 @@ def expanded_pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
            title="Refinement effect by observed uncertainty")
     _save_figure(fig, "expanded_refinement_effect_by_uncertainty", output)
 
+    optimal = tables["expanded_uncertainty_optimal_by_suite"].sort_values("suite")
+    best = tables["expanded_uncertainty_optimal_window"].iloc[0]
+    labels = optimal.suite.str.replace("libero_", "", regex=False)
+    x = np.arange(len(optimal)); width = .38
+    fig, ax = plt.subplots(figsize=(15, 5.5))
+    ax.bar(x - width / 2, 100 * optimal.observed_sr, width,
+           label="observed/no-op", color="#4C78A8")
+    ax.bar(x + width / 2, 100 * optimal.selective_sr, width,
+           label="thresholded selective refinement", color="#54A24B")
+    for index, row in optimal.reset_index(drop=True).iterrows():
+        ax.text(index + width / 2, 100 * row.selective_sr + 1,
+                f"{row.delta_pp:+.1f}", ha="center", va="bottom", fontsize=7)
+    ax.set_xticks(x, labels, rotation=35, ha="right")
+    ax.set(ylabel="Success rate (%)", ylim=(0, 105),
+           title=(f"Exploratory optimal window [{best.lower:.4f}, {best.upper:.4f}] "
+                  "— per-suite selective-policy SR"))
+    ax.legend(fontsize=8)
+    _save_figure(fig, "expanded_optimal_window_success_by_suite", output)
+
     sweep = tables["expanded_uncertainty_window_sweep"]
-    delta = sweep.pivot(index="lower_grid_index", columns="upper_grid_index",
-                        values="delta_pp").sort_index(ascending=False)
-    count = sweep.pivot(index="lower_grid_index", columns="upper_grid_index",
-                        values="n_refined").reindex_like(delta)
+    delta = sweep.pivot(index="lower", columns="upper", values="delta_pp").sort_index()
+    count = sweep.pivot(index="lower", columns="upper", values="n_refined").reindex_like(delta)
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
-    finite_delta = np.abs(delta.to_numpy(float)[np.isfinite(delta.to_numpy(float))])
-    limit = max(1.0, float(finite_delta.max())) if len(finite_delta) else 1.0
-    image = axes[0].imshow(delta, aspect="auto", cmap="RdYlGn", vmin=-limit, vmax=limit)
-    sample = axes[1].imshow(count, aspect="auto", cmap="Blues")
+    extent = [float(delta.columns.min()), float(delta.columns.max()),
+              float(delta.index.min()), float(delta.index.max())]
+    image = axes[0].imshow(delta.to_numpy(), origin="lower", aspect="auto",
+                           cmap="RdYlGn", vmin=-10, vmax=10, extent=extent)
+    sample = axes[1].imshow(count.to_numpy(), origin="lower", aspect="auto",
+                            cmap="Blues", extent=extent)
     fig.colorbar(image, ax=axes[0], label="Selective-policy SR change (pp)")
     fig.colorbar(sample, ax=axes[1], label="Episodes refined")
     for ax in axes:
-        ax.set(xlabel="Upper uncertainty threshold grid index",
-               ylabel="Lower uncertainty threshold grid index")
-    axes[0].set_title("Exploratory uncertainty-window sweep")
+        ax.set(xlabel="Upper uncertainty threshold",
+               ylabel="Lower uncertainty threshold")
+    axes[0].set_title("Exploratory selective-policy SR change")
     axes[1].set_title("Window sample size")
     _save_figure(fig, "expanded_uncertainty_window_sweep", output)
 
