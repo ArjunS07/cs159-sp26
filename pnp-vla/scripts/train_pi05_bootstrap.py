@@ -2,8 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
+
+
+LIBERO_TO_PI05_BASE_RENAME_MAP = {
+    "observation.images.image": "observation.images.base_0_rgb",
+    "observation.images.image2": "observation.images.left_wrist_0_rgb",
+}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -39,6 +47,8 @@ def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = 
     return [
         f"--dataset.repo_id={manifest['dataset_repo_id']}",
         f"--dataset.revision={manifest['dataset_revision']}",
+        "--rename_map=" + json.dumps(
+            LIBERO_TO_PI05_BASE_RENAME_MAP, separators=(",", ":")),
         f"--policy.path={source_model}",
         f"--policy.repo_id={args.policy_repo_id}",
         "--policy.push_to_hub=true",
@@ -64,6 +74,10 @@ def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = 
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    # LeRobot otherwise uses a second Hub cache and redownloads the ~35 GB LIBERO dataset.
+    from huggingface_hub.constants import HF_HOME
+
+    os.environ.setdefault("HF_LEROBOT_HOME", str(HF_HOME))
     from pnp.diversity import (DIVERSITY_SOURCE_MODEL, bootstrap_manifest_summary,
                                install_bootstrap_sampler, load_bootstrap_manifest,
                                require_full_finetune_gpu)

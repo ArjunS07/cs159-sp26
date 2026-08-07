@@ -63,8 +63,10 @@ print("raw model revision:", manifest["source_model_revision"])
 print("tasks:", manifest["n_tasks"], "source episodes:", manifest["n_source_episodes"])'''),
     md("## 4. Launch training"),
     code(r'''import subprocess, sys
+from pathlib import Path
 
-args = [sys.executable, str(package_dir / "scripts" / "train_pi05_bootstrap.py"),
+args = [sys.executable, "-u",
+        str(Path(package_dir) / "scripts" / "train_pi05_bootstrap.py"),
         "--manifest", str(MANIFEST_PATH), "--member", str(MODEL_INDEX),
         "--output-dir", str(OUTPUT_DIR),
         "--policy-repo-id", MODEL_REPOS[MODEL_INDEX],
@@ -75,7 +77,14 @@ if COMPILE_MODEL: args.append("--compile-model")
 if WANDB: args.append("--wandb")
 if RESUME: args.append("--resume")
 print("starting member", MODEL_INDEX)
-subprocess.run(args, check=True)'''),
+process = subprocess.Popen(
+    args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    text=True, bufsize=1)
+for line in process.stdout:
+    print(line, end="", flush=True)
+return_code = process.wait()
+if return_code:
+    raise RuntimeError(f"Training exited with code {return_code}")'''),
     md("## 5. Record the immutable identifiers"),
     code(r'''print({"member": MODEL_INDEX, "model_repo": MODEL_REPOS[MODEL_INDEX],
        "manifest_hash": manifest["manifest_hash"], "source_model": manifest["source_model"],

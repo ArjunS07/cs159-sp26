@@ -1,4 +1,7 @@
 import copy
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -6,6 +9,14 @@ import pandas as pd
 from pnp.diversity import (analyze_diversity_signal, bootstrap_manifest_summary,
                            bootstrap_sampler_class, build_bootstrap_manifest,
                            validate_bootstrap_manifest)
+
+
+def _training_module():
+    path = Path(__file__).parents[1] / "scripts" / "train_pi05_bootstrap.py"
+    spec = importlib.util.spec_from_file_location("train_pi05_bootstrap", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _episode_rows():
@@ -53,6 +64,24 @@ def test_bootstrap_sampler_repeats_whole_episode_frame_ranges():
                    for index, count in counts.items())
     assert len(sampler) == expected
     assert list(iter(sampler)) == sampler.indices
+
+
+def test_training_maps_two_libero_cameras_to_raw_pi05_base_names():
+    module = _training_module()
+    args = SimpleNamespace(
+        resume=False, output_dir=Path("unused-output"), policy_repo_id="user/model",
+        member=0, compile_model=False, expert_only=False, steps=10, batch_size=2,
+        num_workers=1, save_freq=5, log_freq=1, wandb=False)
+    manifest = {
+        "dataset_repo_id": "HuggingFaceVLA/libero", "dataset_revision": "dataset-sha",
+        "source_model": "lerobot/pi05_base", "members": [{"seed": 159}, {"seed": 160}],
+    }
+    cli = module.build_lerobot_args(
+        args, manifest, source_model_path="/cache/pi05_base")
+    rename_arg = next(value for value in cli if value.startswith("--rename_map="))
+    assert '"observation.images.image":"observation.images.base_0_rgb"' in rename_arg
+    assert '"observation.images.image2":"observation.images.left_wrist_0_rgb"' in rename_arg
+    assert "right_wrist_0_rgb" not in rename_arg
 
 
 def test_diversity_signal_reports_oracle_and_first_chunk_selector():
