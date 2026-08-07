@@ -272,38 +272,67 @@ def validate_pro_expanded(rollouts: pd.DataFrame, runs: pd.DataFrame | None = No
         raise ValidationError("expanded PRO snapshot has no rollouts")
     if set(rollouts["benchmark"].dropna()) != {"libero_pro"}:
         raise ValidationError("expanded PRO analysis requires benchmark=libero_pro")
-    bad = rollouts[rollouts["status"] != "completed"]
+    snapshot_df = rollouts.copy()
+    suites = expanded_pro_suites()
+    unknown_suites = sorted(set(snapshot_df["suite"].unique()) - set(EXPANDED_PRO_SUITES))
+    if unknown_suites:
+        raise ValidationError(f"expanded PRO snapshot contains unknown suites: {unknown_suites}")
+
+    # This experiment label predates the decision to drop three 0%-SR suites and defer the
+    # matched-compute control. Resume correctly retained those pilot rows. Select the intended
+    # final cohort here, while preserving an explicit audit of everything ignored.
+    target = snapshot_df[snapshot_df["suite"].isin(suites)].copy()
+    observed = _single(target, method=Method.UNCERTAINTY, steps=PRO_EXPANDED_STEPS)
+    observed = observed[observed["pnp_k"] == PRO_EXPANDED_K]
+    refined = _single(target, method=Method.REFINEMENT, steps=PRO_EXPANDED_STEPS)
+    refined = refined[(refined["pnp_k"] == PRO_EXPANDED_K) &
+                      (~refined["refine_average"].fillna(False).astype(bool))]
+    control = _single(target, method=Method.EXTRA_STEPS, inference_steps=20)
+    selected_ids = set(observed.index) | set(refined.index)
+    recognized_ids = selected_ids | set(control.index)
+    unexpected = target.loc[~target.index.isin(recognized_ids)]
+    if len(unexpected):
+        catalog = unexpected.groupby(["method", "config_hash"], dropna=False).size().to_dict()
+        raise ValidationError(f"unexpected expanded PRO target configurations: {catalog}")
+
+    expected_per_suite = {
+        suite: (100 if suite.endswith("_with_milk") else 200) for suite in suites
+    }
+    expected_identities = sum(expected_per_suite.values())
+    control_complete = len(control) == expected_identities
+    if len(control) not in (0, expected_identities):
+        # A partial pilot control is not a valid analysis arm, but it must not invalidate the
+        # complete observed/refine experiment collected afterward.
+        selected_control = control.iloc[0:0]
+    else:
+        selected_control = control
+        selected_ids |= set(control.index)
+    df = pd.concat([observed, refined, selected_control], ignore_index=False).copy()
+    ignored = snapshot_df.loc[~snapshot_df.index.isin(selected_ids)].copy()
+    df["condition_label"] = [condition_label(row) for row in df.to_dict("records")]
+
+    bad = df[df["status"] != "completed"]
     if len(bad):
-        raise ValidationError(f"expanded PRO analysis contains {len(bad)} non-completed rows")
-    duplicate = rollouts.duplicated(["experiment", *PAIR_KEYS, "config_hash"], keep=False)
+        raise ValidationError(f"expanded PRO selected cohort contains {len(bad)} non-completed rows")
+    duplicate = df.duplicated(["experiment", *PAIR_KEYS, "config_hash"], keep=False)
     if duplicate.any():
         raise ValidationError(f"duplicate expanded PRO identity/config rows: {int(duplicate.sum())}")
-
-    df = rollouts.copy()
-    df["condition_label"] = [condition_label(row) for row in df.to_dict("records")]
-    suites = expanded_pro_suites()
     if set(df["suite"].unique()) != set(suites):
         missing_suites = sorted(set(suites) - set(df["suite"].unique()))
-        extra_suites = sorted(set(df["suite"].unique()) - set(suites))
         raise ValidationError(
-            f"expanded PRO suite mismatch; missing={missing_suites}, extra={extra_suites}")
+            f"expanded PRO selected-cohort suite mismatch; missing={missing_suites}")
     if not df["expanded_member"].fillna(False).all():
         raise ValidationError("expanded PRO collection contains non-expanded membership")
     expected_canonical = df["suite"].isin(CANONICAL_PRO_SUITES)
     if not (df["canonical_member"].fillna(False).astype(bool) == expected_canonical).all():
         raise ValidationError("canonical membership flags disagree with the suite manifest")
 
-    expected_per_suite = {
-        suite: (100 if suite.endswith("_with_milk") else 200) for suite in suites
-    }
     identities = identity_key_frame(df)
     actual_per_suite = identities.groupby("suite").size().to_dict()
     if actual_per_suite != expected_per_suite:
         raise ValidationError(
             f"expanded PRO identity coverage mismatch: expected={expected_per_suite}, "
             f"actual={actual_per_suite}")
-    expected_identities = sum(expected_per_suite.values())
-
     selected_hashes = set()
     for method in (Method.UNCERTAINTY, Method.REFINEMENT):
         group = _single(df, method=method, steps=PRO_EXPANDED_STEPS)
@@ -313,19 +342,34 @@ def validate_pro_expanded(rollouts: pd.DataFrame, runs: pd.DataFrame | None = No
                 f"{len(group)} rows/{group['config_hash'].nunique()} configs")
         if not (group["pnp_k"] == PRO_EXPANDED_K).all():
             raise ValidationError(f"expanded PRO {method} arm is not K={PRO_EXPANDED_K}")
+        per_suite = identity_key_frame(group).groupby("suite").size().to_dict()
+        if per_suite != expected_per_suite:
+            raise ValidationError(
+                f"expanded PRO {method} per-suite coverage mismatch: {per_suite}")
         selected_hashes.add(group["config_hash"].iloc[0])
 
-    control = _single(df, method=Method.EXTRA_STEPS, inference_steps=20)
-    if len(control) not in (0, expected_identities):
-        raise ValidationError(f"partial expanded PRO control arm: {len(control)} rows")
-    if len(control):
-        if control["config_hash"].nunique() != 1:
+    selected_control = _single(df, method=Method.EXTRA_STEPS, inference_steps=20)
+    if len(selected_control):
+        if selected_control["config_hash"].nunique() != 1:
             raise ValidationError("expanded PRO control has multiple configurations")
-        selected_hashes.add(control["config_hash"].iloc[0])
+        per_suite = identity_key_frame(selected_control).groupby("suite").size().to_dict()
+        if per_suite != expected_per_suite:
+            raise ValidationError(f"expanded PRO control per-suite coverage mismatch: {per_suite}")
+        selected_hashes.add(selected_control["config_hash"].iloc[0])
     if df["config_hash"].nunique() != len(selected_hashes):
         raise ValidationError("unexpected expanded PRO configurations are present")
 
     warnings = []
+    if len(ignored):
+        ignored_counts = {
+            f"{suite}|{method}": int(n)
+            for (suite, method), n in ignored.groupby(["suite", "method"], dropna=False).size().items()
+        }
+        warnings.append(
+            f"ignored {len(ignored)} pre-final pilot rows outside the complete 13-suite "
+            f"observed/refine cohort")
+    else:
+        ignored_counts = {}
     runs = runs if runs is not None else pd.DataFrame()
     completed_shards, failed_runs = set(), 0
     if runs.empty:
@@ -357,7 +401,9 @@ def validate_pro_expanded(rollouts: pd.DataFrame, runs: pd.DataFrame | None = No
         "n_rollouts": len(df), "n_identities": expected_identities,
         "n_configurations": len(selected_hashes), "n_suites": len(suites),
         "canonical_complete": False, "expanded_complete": True,
-        "control_complete": len(control) == expected_identities,
+        "control_complete": control_complete,
+        "n_snapshot_rollouts": len(snapshot_df), "n_ignored_rollouts": len(ignored),
+        "ignored_by_suite_method": ignored_counts,
         "run_summary": {"completed_shards": sorted(completed_shards),
                         "failed_runs": failed_runs},
         "warnings": warnings, "artifact_validation": artifact_validation or {},

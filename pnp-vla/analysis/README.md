@@ -69,6 +69,10 @@ arm only, then paired with the refine-last outcome. The primary correctability p
 observed failures, and the target is a paired failure-to-success transition. Full `a_hat` blobs
 are not required.
 
+The experiment label was retained when the three zero-SR suites and control arm were dropped.
+The validator therefore audits but excludes any partial pre-final rows from those suites/control,
+then requires complete one-to-one coverage for both final observed and refine arms.
+
 PRO reports also use the complete nine-step denoising telemetry. They report per-step detector
 metrics, uncertainty/action-dispersion/action-motion profiles, and regularized logistic models
 using either the legacy scalar, the nine-step uncertainty profile, or the full denoising dynamics.

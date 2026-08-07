@@ -58,6 +58,29 @@ def test_validate_complete_expanded_pro_fixture():
     assert validated.config_hash.nunique() == 2
 
 
+def test_validate_expanded_pro_ignores_pre_final_suites_and_partial_control():
+    rollouts, runs = _expanded_fixture()
+    template = rollouts.iloc[0].to_dict()
+    stale = []
+    for i, method in enumerate((Method.UNCERTAINTY, Method.REFINEMENT,
+                                Method.EXTRA_STEPS)):
+        stale.append({**template, "suite": "libero_10_swap",
+                      "rollout_id": f"stale-suite-{i}", "init_state_hash": f"stale-{i}",
+                      "method": method, "config_hash": f"stale-{method}",
+                      "num_inference_steps": 20 if method == Method.EXTRA_STEPS else 10})
+    stale.append({**template, "rollout_id": "partial-control",
+                  "method": Method.EXTRA_STEPS, "config_hash": "control-20",
+                  "num_inference_steps": 20, "pnp_step_indices": None, "pnp_k": None})
+    mixed = pd.concat([rollouts, pd.DataFrame(stale)], ignore_index=True)
+    validated, result = validate_pro_expanded(mixed, runs)
+    assert len(validated) == 4800
+    assert result["n_snapshot_rollouts"] == 4804
+    assert result["n_ignored_rollouts"] == 4
+    assert not result["control_complete"]
+    assert set(validated.suite) == set(expanded_pro_suites())
+    assert any("pre-final pilot rows" in warning for warning in result["warnings"])
+
+
 def test_episode_contraction_uses_observed_telemetry_and_paired_refine_outcome():
     rows, vectors = [], []
     profiles = ([.4, .3, .2, .1], [.1, .2, .3, .4])
