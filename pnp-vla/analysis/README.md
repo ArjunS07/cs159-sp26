@@ -30,7 +30,7 @@ is reserved for the versioned raw Supabase snapshot cache (`rollouts`, step/vect
 run metadata), where preserving nested data and types matters. Availability is recorded in
 `manifest.json`, alongside `validation.json` and publication figures.
 
-Commands are `snapshot`, `validate`, `standard`, `pro`, `pcp`, and `all`. Missing optional data is
+Commands are `snapshot`, `validate`, `standard`, `pro`, `pro-expanded`, `pcp`, and `all`. Missing optional data is
 represented by explicit `not_available` records. Validation failures exit nonzero. In particular,
 the current K=3 collection cannot support Sarle's bimodality coefficient, and refinement telemetry
 is never admitted to the prospective observed-arm detector analysis.
@@ -47,13 +47,27 @@ validated standard-LIBERO snapshot:
 ```
 
 The canonical PRO result requires exactly 600 identities across the six declared suites and one
-row per identity for observed/no-op, 16-step control, and refine-last `(4,5)`. The expanded
-16-suite collection remains explicitly `not_available` until complete. Legacy threshold heatmaps
+row per identity for observed/no-op, 16-step control, and refine-last `(4,5)`. Legacy threshold heatmaps
 are labeled exploratory and in-sample; the selective-refinement estimate is reported separately
 from five held-out, suite/outcome-stratified folds. Detector thresholds transferred from standard
 LIBERO are selected using standard labels only. Storage references are verified during snapshot
 creation; `ahats` and observation-frame analyses remain unavailable because those artifacts are
 not present.
+
+For the expanded workers 0--5 experiment, use the dedicated command or run
+`notebooks/16_analyze_expanded_pro.ipynb`:
+
+```bash
+.venv-analysis/bin/python -m analysis.run_analysis pro-expanded \
+  --experiment pro-16suite-k5-steps34-v1 --refresh
+```
+
+This validates the 13 retained suites, 2,400 paired identities, K=5 and steps `(3,4)`, with the
+matched-compute control optional because it was deferred during collection. It also analyzes
+`pnp_action_vectors.u_iter`: episode-level contraction features are computed from the observed
+arm only, then paired with the refine-last outcome. The primary correctability population is
+observed failures, and the target is a paired failure-to-success transition. Full `a_hat` blobs
+are not required.
 
 PRO reports also use the complete nine-step denoising telemetry. They report per-step detector
 metrics, uncertainty/action-dispersion/action-motion profiles, and regularized logistic models

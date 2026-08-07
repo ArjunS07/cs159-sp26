@@ -481,3 +481,129 @@ def write_pro_report(snapshot: Path, tables: dict[str, pd.DataFrame], availabili
     _write_availability(snapshot, availability)
     pro_figures(tables, snapshot)
     return snapshot
+
+
+def expanded_pro_figures(tables: dict[str, pd.DataFrame], output: Path) -> None:
+    """Figures for the 13-suite K=5 expanded collection and contraction study."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    suite = tables["pro_success_by_suite"]
+    suites = sorted(suite.suite.unique())
+    labels = suite.condition_label.drop_duplicates().tolist()
+    x, width = np.arange(len(suites)), .82 / len(labels)
+    fig, ax = plt.subplots(figsize=(15, 5.5))
+    for i, label in enumerate(labels):
+        group = suite[suite.condition_label == label].set_index("suite").reindex(suites)
+        ax.bar(x + (i - (len(labels) - 1) / 2) * width, 100 * group.sr, width, label=label)
+    ax.set_xticks(x, [name.replace("libero_", "") for name in suites], rotation=35, ha="right")
+    ax.set(ylabel="Success rate (%)", ylim=(0, 100),
+           title="Expanded LIBERO-PRO success by paired condition")
+    ax.legend(fontsize=8)
+    _save_figure(fig, "expanded_pro_success_by_suite", output)
+
+    transitions = tables["pro_paired_by_suite"]
+    transitions = transitions[transitions.condition_label.str.startswith("refine-last")]
+    transitions = transitions.set_index("suite").reindex(suites)
+    fig, ax = plt.subplots(figsize=(15, 5.5)); bottom = np.zeros(len(suites))
+    for column, label, color in [("F_to_F", "F to F", "#E45756"),
+                                  ("F_to_S", "F to S", "#54A24B"),
+                                  ("S_to_F", "S to F", "#F58518"),
+                                  ("S_to_S", "S to S", "#4C78A8")]:
+        ax.bar(x, transitions[column], bottom=bottom, label=label, color=color)
+        bottom += transitions[column].to_numpy()
+    ax.set_xticks(x, [name.replace("libero_", "") for name in suites], rotation=35, ha="right")
+    ax.set(ylabel="Paired identities", title="Observed/no-op to refine-last transitions")
+    ax.legend()
+    _save_figure(fig, "expanded_pro_paired_transitions", output)
+
+    episodes = tables["expanded_contraction_episode"]
+    failures = episodes[(episodes.window == "full_episode") & episodes.observed_failure]
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for corrected, label, color in [(False, "remained failure", "#E45756"),
+                                     (True, "corrected F to S", "#54A24B")]:
+        group = failures[failures.corrected == corrected]
+        values = group[[f"u_iter_{i}" for i in range(4)]].to_numpy(float)
+        mean = values.mean(axis=0)
+        sem = values.std(axis=0, ddof=1) / np.sqrt(len(values)) if len(values) > 1 else np.zeros(4)
+        ax.errorbar(np.arange(1, 5), mean, yerr=sem, marker="o", capsize=3,
+                    label=f"{label} (n={len(group)})", color=color)
+    ax.set(xticks=np.arange(1, 5), xlabel="Consecutive perturbation pair",
+           ylabel="Mean |a-hat(i+1) - a-hat(i)|",
+           title="Per-episode uncertainty trajectory among observed failures")
+    ax.legend()
+    _save_figure(fig, "expanded_contraction_profiles", output)
+
+    quartiles = tables["expanded_contraction_quartiles"]
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for window, group in quartiles.groupby("window"):
+        group = group.sort_values("contraction_quartile")
+        ax.errorbar(group.contraction_quartile, 100 * group.correction_rate,
+                    yerr=np.vstack((100 * (group.correction_rate - group.ci_low),
+                                    100 * (group.ci_high - group.correction_rate))),
+                    marker="o", capsize=3, label=window.replace("_", " "))
+    ax.set(xticks=[1, 2, 3, 4], xlabel="Within-suite contraction quartile",
+           ylabel="Paired correction rate among observed failures (%)",
+           title="Does stronger contraction predict successful refinement?")
+    ax.legend()
+    _save_figure(fig, "expanded_contraction_quartiles", output)
+
+    detector_suite = tables["pro_detector_by_suite"].copy()
+    pooled = tables["pro_detector_summary"].query("estimate_scope == 'pooled'").iloc[0]
+    detector = pd.concat([
+        pd.DataFrame([{"suite": "pooled", "roc_auc": pooled.roc_auc,
+                       "roc_ci_low": pooled.roc_ci_low, "roc_ci_high": pooled.roc_ci_high}]),
+        detector_suite[["suite", "roc_auc", "roc_ci_low", "roc_ci_high"]],
+    ], ignore_index=True)
+    detector = detector[np.isfinite(detector.roc_auc)].sort_values("roc_auc")
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.errorbar(detector.roc_auc, detector.suite.str.replace("libero_", "", regex=False),
+                xerr=np.vstack((detector.roc_auc - detector.roc_ci_low,
+                                detector.roc_ci_high - detector.roc_auc)),
+                fmt="o", capsize=3)
+    ax.axvline(.5, color="black", ls="--", lw=1)
+    ax.set(xlim=(0, 1), xlabel="Failure ROC-AUC (95% bootstrap CI)",
+           title="Observed P&P uncertainty as a failure detector")
+    _save_figure(fig, "expanded_uncertainty_failure_auc", output)
+
+    effect = tables["expanded_refinement_effect_by_uncertainty_bin"]
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.errorbar(effect.uncertainty_bin, effect.delta_pp,
+                yerr=np.vstack((effect.delta_pp - effect.delta_ci_low_pp,
+                                effect.delta_ci_high_pp - effect.delta_pp)),
+                marker="o", capsize=3)
+    ax.axhline(0, color="black", lw=1)
+    ax.set(xticks=effect.uncertainty_bin,
+           xlabel="Observed uncertainty decile (low to high)",
+           ylabel="Paired refinement success-rate change (pp)",
+           title="Refinement effect by observed uncertainty")
+    _save_figure(fig, "expanded_refinement_effect_by_uncertainty", output)
+
+    sweep = tables["expanded_uncertainty_window_sweep"]
+    delta = sweep.pivot(index="lower_grid_index", columns="upper_grid_index",
+                        values="delta_pp").sort_index(ascending=False)
+    count = sweep.pivot(index="lower_grid_index", columns="upper_grid_index",
+                        values="n_refined").reindex_like(delta)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    finite_delta = np.abs(delta.to_numpy(float)[np.isfinite(delta.to_numpy(float))])
+    limit = max(1.0, float(finite_delta.max())) if len(finite_delta) else 1.0
+    image = axes[0].imshow(delta, aspect="auto", cmap="RdYlGn", vmin=-limit, vmax=limit)
+    sample = axes[1].imshow(count, aspect="auto", cmap="Blues")
+    fig.colorbar(image, ax=axes[0], label="Selective-policy SR change (pp)")
+    fig.colorbar(sample, ax=axes[1], label="Episodes refined")
+    for ax in axes:
+        ax.set(xlabel="Upper uncertainty threshold grid index",
+               ylabel="Lower uncertainty threshold grid index")
+    axes[0].set_title("Exploratory uncertainty-window sweep")
+    axes[1].set_title("Window sample size")
+    _save_figure(fig, "expanded_uncertainty_window_sweep", output)
+
+
+def write_expanded_pro_report(snapshot: Path, tables: dict[str, pd.DataFrame],
+                              availability: dict) -> Path:
+    _clean_rendered_outputs(snapshot)
+    for name, frame in tables.items():
+        write_table(frame, name, snapshot)
+    _write_availability(snapshot, availability)
+    expanded_pro_figures(tables, snapshot)
+    return snapshot

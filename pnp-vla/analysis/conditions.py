@@ -24,6 +24,11 @@ def condition_label(row: Mapping[str, Any]) -> str:
     """Human label for one behavior-defining config; never a grouping key itself."""
     method = row.get("method")
     if method == Method.UNCERTAINTY:
+        steps = _steps(row.get("pnp_step_indices"))
+        k = row.get("pnp_k")
+        if steps and k is not None and not pd.isna(k):
+            schedule = ",".join(map(str, steps))
+            return f"observed/no-op (steps {schedule}, K={int(k)})"
         return OBSERVED_LABEL
     if method == Method.EXTRA_STEPS:
         return f"compute control ({int(row['num_inference_steps'])} steps)"

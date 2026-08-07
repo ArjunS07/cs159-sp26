@@ -6,10 +6,11 @@ import json
 import os
 from pathlib import Path
 
-from . import geometry, pcp, pro, report, snapshot, standard_libero
-from pnp.experiments import EXPERIMENT as STANDARD_EXPERIMENT
+from . import geometry, pcp, pro, pro_expanded, report, snapshot, standard_libero
+from pnp.experiments import (EXPERIMENT as STANDARD_EXPERIMENT,
+                             PRO_EXPANDED_EXPERIMENT)
 from .validate import (coverage_matrix, pro_coverage_matrix, validate_pro,
-                       validate_standard)
+                       validate_pro_expanded, validate_standard)
 
 
 def _client():
@@ -19,7 +20,7 @@ def _client():
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", nargs="?", choices=("snapshot", "validate", "standard", "pro", "pcp", "all"), default="all")
+    parser.add_argument("command", nargs="?", choices=("snapshot", "validate", "standard", "pro", "pro-expanded", "pcp", "all"), default="all")
     parser.add_argument("--experiment", required=True)
     parser.add_argument("--output-root", type=Path, default=Path("analysis_outputs"))
     parser.add_argument("--snapshot", type=Path)
@@ -43,12 +44,17 @@ def main(argv=None) -> int:
     benchmarks = set(frames["rollouts"]["benchmark"].dropna()) if "benchmark" in frames["rollouts"] else set()
     benchmark = next(iter(benchmarks)) if len(benchmarks) == 1 else None
     is_pro = benchmark == "libero_pro"
+    is_expanded_pro = args.experiment == PRO_EXPANDED_EXPERIMENT
     if args.command == "standard" and is_pro:
         raise ValueError("standard command cannot analyze a LIBERO-PRO snapshot")
     if args.command == "pro" and not is_pro:
         raise ValueError("pro command requires a LIBERO-PRO snapshot")
+    if args.command == "pro-expanded" and not is_expanded_pro:
+        raise ValueError(
+            f"pro-expanded requires experiment={PRO_EXPANDED_EXPERIMENT}")
     if is_pro:
-        validated, validation = validate_pro(
+        validator = validate_pro_expanded if is_expanded_pro else validate_pro
+        validated, validation = validator(
             frames["rollouts"], frames["experiment_runs"], artifact_validation)
     else:
         validated, validation = validate_standard(frames["rollouts"], frames["experiment_runs"])
@@ -62,6 +68,18 @@ def main(argv=None) -> int:
         return 0
     if args.command == "pcp":
         print(json.dumps(pcp.analyze(validated), indent=2)); return 0
+    if is_expanded_pro:
+        tables, expanded_state = pro_expanded.analyze(
+            validated, frames["pnp_euler_steps"], frames["pnp_action_vectors"])
+        availability = {
+            "pro_expanded": expanded_state,
+            "pcp": pcp.analyze(validated),
+            "cross_model": {"status": "not_available",
+                            "reason": "matching model conditions absent"},
+        }
+        report.write_expanded_pro_report(path, tables, availability)
+        print(f"expanded PRO analysis complete: {path}")
+        return 0
     if is_pro:
         reference_path = args.reference_snapshot or snapshot.latest_snapshot(
             args.output_root, args.reference_experiment)

@@ -22,6 +22,9 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 
+- `16_analyze_expanded_pro.ipynb` — zero-GPU Supabase analysis for expanded PRO workers 0–5,
+  including paired rollout results and consecutive-uncertainty contraction.
+
 Superseded verifier notebooks and workers are retained under `archive/verifier_v1/` for
 provenance. They should not be used for new collection or model selection.
 
