@@ -84,6 +84,32 @@ def test_training_maps_two_libero_cameras_to_raw_pi05_base_names():
     assert "right_wrist_0_rgb" not in rename_arg
 
 
+def test_training_rebuilds_stale_raw_base_processors_and_applies_rename_map():
+    module = _training_module()
+
+    class RenameObservationsProcessorStep:
+        def __init__(self):
+            self.rename_map = {}
+
+    preprocessor = SimpleNamespace(steps=[RenameObservationsProcessorStep()])
+    postprocessor = object()
+    calls = []
+
+    def make_processors(policy_cfg, pretrained_path=None, **kwargs):
+        calls.append((pretrained_path, kwargs))
+        assert pretrained_path is None
+        return preprocessor, postprocessor
+
+    trainer = SimpleNamespace(make_pre_post_processors=make_processors)
+    mapping = {"observation.images.image": "observation.images.base_0_rgb"}
+    module.install_fresh_pi05_processors(trainer, mapping)
+    actual = trainer.make_pre_post_processors(
+        object(), pretrained_path="/cache/pi05_base", dataset_stats={"action": {}})
+    assert actual == (preprocessor, postprocessor)
+    assert calls == [(None, {"dataset_stats": {"action": {}}})]
+    assert preprocessor.steps[0].rename_map == mapping
+
+
 def test_diversity_signal_reports_oracle_and_first_chunk_selector():
     identities = [
         {"suite": "libero_goal_swap", "task_idx": 0, "episode_idx": index,

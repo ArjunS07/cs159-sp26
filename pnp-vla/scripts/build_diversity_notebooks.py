@@ -14,7 +14,14 @@ independently sampled with replacement within task. This is a full-model fine-tu
 The start point is the agreed raw `lerobot/pi05_base`. Neither member inherits the common
 LIBERO-finetuned solution; their LIBERO specialization comes only from their independently
 bootstrapped demonstration multisets. Final weights are pushed to your Hugging Face account.
-The shared split manifest is stored in Drive so both runs use exactly the same experiment."""),
+The shared split manifest is stored in Drive so both runs use exactly the same experiment.
+
+This is a **diversity-signal pilot**, not a reproduction of published LIBERO performance. The
+official OpenPI recipe trains raw pi0.5 for 30k steps with batch size 256 and a 10-action horizon;
+this pilot uses 3k steps, batch size 16, and keeps the 50-action chunk / execute-10 interface used
+by the PnP experiments. The training shim rebuilds the raw checkpoint's stale processor metadata
+with the exact pinned LeRobot implementation; it does not alter the model weights or turn on an
+extra relative-action transform."""),
     md("## 1. Install the exact pinned training stack"),
     code(bootstrap(extras="train", setup_env=False)),
     md("## 2. Configuration"),
@@ -61,7 +68,11 @@ print("manifest hash:", manifest["manifest_hash"])
 print("dataset revision:", manifest["dataset_revision"])
 print("raw model revision:", manifest["source_model_revision"])
 print("tasks:", manifest["n_tasks"], "source episodes:", manifest["n_source_episodes"])'''),
-    md("## 4. Launch training"),
+    md("""## 4. Launch training
+
+Expected after the weights load: `Built fresh pinned-LeRobot processors with LIBERO camera
+mapping.` This confirms that the obsolete processor metadata in `pi05_base` was replaced by the
+pinned implementation before optimizer creation."""),
     code(r'''import subprocess, sys
 from pathlib import Path
 

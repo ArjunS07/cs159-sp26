@@ -14,6 +14,39 @@ LIBERO_TO_PI05_BASE_RENAME_MAP = {
 }
 
 
+def install_fresh_pi05_processors(trainer, rename_map: dict[str, str]):
+    """Build processors with pinned LeRobot instead of loading incompatible Hub metadata.
+
+    The raw checkpoint's processor JSON names ``relative_actions_processor``, while the pinned
+    LeRobot registry uses the current delta/absolute action processor names. The model weights are
+    compatible; only the serialized pipeline is stale. Rebuilding also installs current LIBERO
+    statistics, then we apply the source-to-policy camera rename explicitly.
+    """
+    original = trainer.make_pre_post_processors
+
+    def make_compatible(policy_cfg, pretrained_path=None, **kwargs):
+        if pretrained_path is None:
+            return original(policy_cfg, pretrained_path=None, **kwargs)
+        fresh_kwargs = {}
+        if "dataset_stats" in kwargs:
+            fresh_kwargs["dataset_stats"] = kwargs["dataset_stats"]
+        preprocessor, postprocessor = original(
+            policy_cfg, pretrained_path=None, **fresh_kwargs)
+        rename_steps = [
+            step for step in getattr(preprocessor, "steps", [])
+            if step.__class__.__name__ == "RenameObservationsProcessorStep"
+        ]
+        if len(rename_steps) != 1:
+            raise RuntimeError(
+                f"expected one rename-observations processor, found {len(rename_steps)}")
+        rename_steps[0].rename_map = dict(rename_map)
+        print("Built fresh pinned-LeRobot processors with LIBERO camera mapping.")
+        return preprocessor, postprocessor
+
+    trainer.make_pre_post_processors = make_compatible
+    return trainer
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -104,6 +137,9 @@ def main(argv=None) -> int:
     source_model_path = snapshot_download(
         repo_id=manifest["source_model"], revision=manifest["source_model_revision"])
     trainer = install_bootstrap_sampler(manifest, args.member)
+    if not args.resume:
+        trainer = install_fresh_pi05_processors(
+            trainer, LIBERO_TO_PI05_BASE_RENAME_MAP)
     lerobot_args = build_lerobot_args(
         args, manifest, source_model_path=source_model_path)
     print("LeRobot training arguments:")
