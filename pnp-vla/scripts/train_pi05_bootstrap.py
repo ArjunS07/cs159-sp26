@@ -38,6 +38,17 @@ def mirror_latest_checkpoint(checkpoint_dir: Path, mirror_dir: Path,
         raise RuntimeError(f"checkpoint is incomplete: {checkpoint_dir}")
 
     mirror_dir.mkdir(parents=True, exist_ok=True)
+    newer = sorted(
+        (path for path in mirror_dir.iterdir()
+         if path.is_dir() and path.name.isdigit()
+         and int(path.name) > int(checkpoint_dir.name)
+         and _is_complete_checkpoint(path)),
+        key=lambda path: int(path.name),
+    )
+    if newer:
+        raise RuntimeError(
+            f"refusing to replace newer Drive checkpoint {newer[-1].name} "
+            f"with older checkpoint {checkpoint_dir.name}")
     destination = mirror_dir / checkpoint_dir.name
     staging = mirror_dir / f".{checkpoint_dir.name}.staging"
     if staging.exists():
@@ -190,6 +201,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--no-checkpoints", action="store_true")
     parser.add_argument("--checkpoint-mirror-dir", type=Path)
     return parser
 
@@ -199,7 +211,12 @@ def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = 
         config = args.output_dir / "checkpoints" / "last" / "pretrained_model" / "train_config.json"
         if not config.exists():
             raise FileNotFoundError(f"cannot resume; missing {config}")
-        return [f"--config_path={config}", "--resume=true"]
+        return [
+            f"--config_path={config}",
+            "--resume=true",
+            f"--save_freq={args.save_freq}",
+            f"--save_checkpoint={str(not args.no_checkpoints).lower()}",
+        ]
     if args.output_dir.exists():
         raise FileExistsError(
             f"{args.output_dir} already exists. Set --resume if it contains a valid checkpoint, "
@@ -229,7 +246,7 @@ def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = 
         "--eval_freq=0",
         f"--save_freq={args.save_freq}",
         f"--log_freq={args.log_freq}",
-        "--save_checkpoint=true",
+        f"--save_checkpoint={str(not args.no_checkpoints).lower()}",
         f"--wandb.enable={str(args.wandb).lower()}",
     ]
 
@@ -260,7 +277,9 @@ def main(argv=None) -> int:
            "source_model": manifest["source_model"],
            "source_model_revision": manifest["source_model_revision"],
            "dataset_revision": manifest["dataset_revision"],
-           "policy_repo_id": args.policy_repo_id})
+           "policy_repo_id": args.policy_repo_id,
+           "save_freq_requested": args.save_freq,
+           "checkpoints_enabled": not args.no_checkpoints})
 
     from huggingface_hub import snapshot_download
     source_model_path = snapshot_download(

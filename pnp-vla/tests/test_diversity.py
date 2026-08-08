@@ -71,7 +71,7 @@ def test_training_maps_two_libero_cameras_to_raw_pi05_base_names():
     args = SimpleNamespace(
         resume=False, output_dir=Path("unused-output"), policy_repo_id="user/model",
         member=0, compile_model=False, expert_only=False, steps=10, batch_size=2,
-        num_workers=1, save_freq=5, log_freq=1, wandb=False)
+        num_workers=1, save_freq=5, log_freq=1, wandb=False, no_checkpoints=False)
     manifest = {
         "dataset_repo_id": "HuggingFaceVLA/libero", "dataset_revision": "dataset-sha",
         "source_model": "lerobot/pi05_base", "members": [{"seed": 159}, {"seed": 160}],
@@ -82,6 +82,26 @@ def test_training_maps_two_libero_cameras_to_raw_pi05_base_names():
     assert '"observation.images.image":"observation.images.base_0_rgb"' in rename_arg
     assert '"observation.images.image2":"observation.images.left_wrist_0_rgb"' in rename_arg
     assert "right_wrist_0_rgb" not in rename_arg
+    assert "--save_checkpoint=true" in cli
+
+
+def test_resume_overrides_saved_checkpoint_frequency_and_can_disable_saves(tmp_path):
+    module = _training_module()
+    output = tmp_path / "output"
+    config = output / "checkpoints" / "last" / "pretrained_model" / "train_config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text("{}")
+    args = SimpleNamespace(
+        resume=True, output_dir=output, save_freq=10000, no_checkpoints=True)
+
+    cli = module.build_lerobot_args(args, {})
+
+    assert cli == [
+        f"--config_path={config}",
+        "--resume=true",
+        "--save_freq=10000",
+        "--save_checkpoint=false",
+    ]
 
 
 def test_training_rebuilds_stale_raw_base_processors_and_applies_rename_map():

@@ -34,7 +34,8 @@ drive.mount("/content/drive")
 MODEL_INDEX = 0                 # rerun a separate copy with 1
 STEPS = 3000                    # signal pilot; increase only after both models train cleanly
 BATCH_SIZE = 16                 # safe starting point on an 80GB A100/H100
-SAVE_FREQ = 500                 # resumable checkpoints within the current Colab runtime
+SAVE_FREQ = 10000               # greater than STEPS: save only the final checkpoint
+SAVE_CHECKPOINTS = False        # False: no local/Drive checkpoints; final model still uploads to HF
 FULL_FINETUNE = True            # planned experiment; False is explicit expert-only fallback
 COMPILE_MODEL = False           # avoids a long first-step compile during the pilot
 WANDB = False
@@ -49,7 +50,7 @@ OUTPUT_DIR = Path(f"/content/pi05_diversity/train_m{MODEL_INDEX}")
 CHECKPOINT_MIRROR_DIR = PERSISTENT_ROOT / f"checkpoint_m{MODEL_INDEX}"
 print({"member": MODEL_INDEX, "model_repo": MODEL_REPOS[MODEL_INDEX],
        "output": str(OUTPUT_DIR), "checkpoint_mirror": str(CHECKPOINT_MIRROR_DIR),
-       "full_finetune": FULL_FINETUNE})'''),
+       "full_finetune": FULL_FINETUNE, "save_checkpoints": SAVE_CHECKPOINTS})'''),
     md("""## 3. Build or load the shared episode-bootstrap manifest
 
 The file in Drive contains both independently sampled members. Member 1 must load this exact file;
@@ -81,7 +82,11 @@ mirrored to Drive, then all local checkpoint copies and older Drive mirrors are 
 fresh Colab runtime starts with `RESUME=True`, the newest complete Drive checkpoint is preferred;
 `/content` is used only if Drive has no complete checkpoint. Partial saves are ignored. The
 temporary checkpoint copy is removed after model, optimizer, and scheduler state are loaded.
-Do not manually delete checkpoint folders while a save is in progress."""),
+Do not manually delete checkpoint folders while a save is in progress.
+
+With the default `SAVE_CHECKPOINTS=False`, LeRobot writes no training checkpoints at all; the final
+model and processors are still pushed to `MODEL_REPOS[MODEL_INDEX]` after step 3000. The tradeoff is
+that a disconnect during this run cannot be resumed from a newer step."""),
     code(r'''import subprocess, sys
 from pathlib import Path
 
@@ -97,6 +102,7 @@ if not FULL_FINETUNE: args.append("--expert-only")
 if COMPILE_MODEL: args.append("--compile-model")
 if WANDB: args.append("--wandb")
 if RESUME: args.append("--resume")
+if not SAVE_CHECKPOINTS: args.append("--no-checkpoints")
 print("starting member", MODEL_INDEX)
 process = subprocess.Popen(
     args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
