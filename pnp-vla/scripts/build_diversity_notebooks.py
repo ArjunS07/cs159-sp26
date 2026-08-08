@@ -78,9 +78,9 @@ pinned implementation before optimizer creation.
 
 Training stays on fast local disk. After each complete save, the checkpoint is verified and
 mirrored to Drive, then all local checkpoint copies and older Drive mirrors are removed. If a
-fresh Colab runtime starts with `RESUME=True`, the Drive mirror replaces any partial local save;
-resume uses the newest complete local checkpoint first and Drive only as a fallback. The temporary
-checkpoint copy is removed after model, optimizer, and scheduler state are loaded.
+fresh Colab runtime starts with `RESUME=True`, the newest complete Drive checkpoint is preferred;
+`/content` is used only if Drive has no complete checkpoint. Partial saves are ignored. The
+temporary checkpoint copy is removed after model, optimizer, and scheduler state are loaded.
 Do not manually delete checkpoint folders while a save is in progress."""),
     code(r'''import subprocess, sys
 from pathlib import Path

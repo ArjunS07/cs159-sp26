@@ -175,7 +175,7 @@ def test_checkpoint_mirror_restores_resume_layout_in_fresh_runtime(tmp_path):
     assert not partial.exists()
 
 
-def test_resume_prefers_newest_complete_local_checkpoint_over_drive(tmp_path):
+def test_resume_prefers_complete_drive_checkpoint_over_newer_local(tmp_path):
     module = _training_module()
     mirror = tmp_path / "drive"
     _fake_checkpoint(mirror / "002000", 2000)
@@ -187,11 +187,27 @@ def test_resume_prefers_newest_complete_local_checkpoint_over_drive(tmp_path):
 
     last = module.restore_latest_mirrored_checkpoint(output, mirror)
 
+    assert last.resolve().name == "002000"
+    assert module._is_complete_checkpoint(last)
+    assert module._is_complete_checkpoint(mirror / "002000")
+    assert not local.exists()
+    assert not partial.exists()
+
+
+def test_resume_uses_local_only_when_drive_has_no_complete_checkpoint(tmp_path):
+    module = _training_module()
+    mirror = tmp_path / "drive"
+    (mirror / "002000" / "pretrained_model").mkdir(parents=True)
+    output = tmp_path / "local"
+    local = output / "checkpoints" / "002500"
+    _fake_checkpoint(local, 2500)
+
+    last = module.restore_latest_mirrored_checkpoint(output, mirror)
+
     assert last.resolve() == local.resolve()
     assert module._is_complete_checkpoint(last)
     assert module._is_complete_checkpoint(mirror / "002500")
     assert not (mirror / "002000").exists()
-    assert not partial.exists()
 
 
 def test_resume_releases_restored_local_checkpoint_after_state_load(tmp_path):

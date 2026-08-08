@@ -65,54 +65,54 @@ def mirror_latest_checkpoint(checkpoint_dir: Path, mirror_dir: Path,
 
 
 def restore_latest_mirrored_checkpoint(output_dir: Path, mirror_dir: Path) -> Path | None:
-    """Use the newest complete local checkpoint, falling back to the Drive mirror."""
+    """Use the newest complete Drive checkpoint, falling back to local content."""
     output_dir, mirror_dir = Path(output_dir), Path(mirror_dir)
     local_checkpoints = output_dir / "checkpoints"
     local_last = output_dir / "checkpoints" / "last"
+    drive_candidates = sorted(
+        (path for path in mirror_dir.glob("*")
+         if path.is_dir() and path.name.isdigit() and _is_complete_checkpoint(path)),
+        key=lambda path: int(path.name),
+    ) if mirror_dir.exists() else []
+    if drive_candidates:
+        source = drive_candidates[-1]
+        local_checkpoints.mkdir(parents=True, exist_ok=True)
+        # Drive is authoritative. Remove partial or stale local saves before restoring it.
+        for candidate in local_checkpoints.iterdir():
+            if candidate.is_dir() and candidate.name.isdigit():
+                shutil.rmtree(candidate)
+        if local_last.is_symlink():
+            local_last.unlink()
+        elif local_last.exists():
+            shutil.rmtree(local_last)
+        destination = local_checkpoints / source.name
+        staging = local_checkpoints / f".{source.name}.restore"
+        if staging.exists():
+            shutil.rmtree(staging)
+        shutil.copytree(source, staging)
+        if not _is_complete_checkpoint(staging):
+            raise RuntimeError(f"restored checkpoint is incomplete: {staging}")
+        staging.rename(destination)
+        local_last.symlink_to(destination.name)
+        print(f"Restored preferred Drive checkpoint {source.name} to local disk.")
+        return local_last
+
     local_candidates = sorted(
         (path for path in local_checkpoints.glob("*")
          if path.is_dir() and path.name.isdigit() and _is_complete_checkpoint(path)),
         key=lambda path: int(path.name),
     ) if local_checkpoints.exists() else []
-    if local_candidates:
-        source = local_candidates[-1]
-        # Preserve the complete local checkpoint in Drive before releasing its disk after load.
-        mirror_latest_checkpoint(source, mirror_dir, keep_local=True)
-        if local_last.is_symlink():
-            local_last.unlink()
-        elif local_last.exists():
-            shutil.rmtree(local_last)
-        local_last.symlink_to(source.name)
-        print(f"Using complete local checkpoint {source.name}; Drive fallback synchronized.")
-        return local_last
-
-    candidates = sorted(
-        (path for path in mirror_dir.glob("*")
-         if path.is_dir() and path.name.isdigit() and _is_complete_checkpoint(path)),
-        key=lambda path: int(path.name),
-    ) if mirror_dir.exists() else []
-    if not candidates:
+    if not local_candidates:
         return None
-    source = candidates[-1]
-    local_checkpoints.mkdir(parents=True, exist_ok=True)
-    # No complete local checkpoint exists. Remove partial saves, then restore the Drive fallback.
-    for candidate in local_checkpoints.iterdir():
-        if candidate.is_dir() and candidate.name.isdigit():
-            shutil.rmtree(candidate)
+    source = local_candidates[-1]
+    # Drive has no complete checkpoint, so preserve the local fallback before loading it.
+    mirror_latest_checkpoint(source, mirror_dir, keep_local=True)
     if local_last.is_symlink():
         local_last.unlink()
     elif local_last.exists():
         shutil.rmtree(local_last)
-    destination = local_checkpoints / source.name
-    staging = local_checkpoints / f".{source.name}.restore"
-    if staging.exists():
-        shutil.rmtree(staging)
-    shutil.copytree(source, staging)
-    if not _is_complete_checkpoint(staging):
-        raise RuntimeError(f"restored checkpoint is incomplete: {staging}")
-    staging.rename(destination)
-    local_last.symlink_to(destination.name)
-    print(f"Restored checkpoint {source.name} from {source} to local disk.")
+    local_last.symlink_to(source.name)
+    print(f"Using local fallback checkpoint {source.name}; Drive mirror initialized.")
     return local_last
 
 
