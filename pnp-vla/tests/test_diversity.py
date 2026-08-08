@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -128,6 +129,60 @@ def test_training_rebuilds_stale_raw_base_processors_and_applies_rename_map():
     assert actual == (preprocessor, postprocessor)
     assert calls == [(None, {"dataset_stats": {"action": {}}})]
     assert preprocessor.steps[0].rename_map == mapping
+
+
+def test_final_drive_export_survives_hub_upload_failure(tmp_path):
+    module = _training_module()
+    final_dir = tmp_path / "drive" / "final_model_m0"
+    calls = []
+
+    class Savable:
+        def __init__(self, filename, content="{}"):
+            self.filename = filename
+            self.content = content
+
+        def save_pretrained(self, path):
+            path = Path(path)
+            path.mkdir(parents=True, exist_ok=True)
+            (path / self.filename).write_text(self.content)
+
+    class Policy(Savable):
+        def __init__(self):
+            super().__init__("model.safetensors", "weights")
+
+        def save_pretrained(self, path):
+            super().save_pretrained(path)
+            (Path(path) / "config.json").write_text("{}")
+
+        def push_model_to_hub(self, cfg):
+            calls.append(("hub", cfg))
+            raise PermissionError("simulated 403")
+
+    policy = Policy()
+    cfg = Savable("train_config.json")
+    preprocessor = Savable("policy_preprocessor.json")
+    postprocessor = Savable("policy_postprocessor.json")
+    trainer = SimpleNamespace(
+        make_policy=lambda: policy,
+        make_pre_post_processors=lambda: (preprocessor, postprocessor),
+    )
+    metadata = {"training_completed_steps": 3000, "member_index": 0}
+    module.install_final_drive_export(trainer, final_dir, metadata)
+
+    actual_policy = trainer.make_policy()
+    assert trainer.make_pre_post_processors() == (preprocessor, postprocessor)
+    with np.testing.assert_raises_regex(PermissionError, "simulated 403"):
+        actual_policy.push_model_to_hub(cfg)
+
+    assert calls == [("hub", cfg)]
+    assert (final_dir / "model.safetensors").read_text() == "weights"
+    assert (final_dir / "config.json").is_file()
+    assert (final_dir / "train_config.json").is_file()
+    assert (final_dir / "policy_preprocessor.json").is_file()
+    assert (final_dir / "policy_postprocessor.json").is_file()
+    assert json.loads((final_dir / "final_export.json").read_text()) == metadata
+    assert not final_dir.with_name(".final_model_m0.staging").exists()
+    assert not final_dir.with_name(".final_model_m0.previous").exists()
 
 
 def _fake_checkpoint(path: Path, step: int):

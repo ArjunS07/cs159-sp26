@@ -34,8 +34,8 @@ drive.mount("/content/drive")
 MODEL_INDEX = 0                 # rerun a separate copy with 1
 STEPS = 3000                    # signal pilot; increase only after both models train cleanly
 BATCH_SIZE = 16                 # safe starting point on an 80GB A100/H100
-SAVE_FREQ = 10000               # greater than STEPS: save only the final checkpoint
-SAVE_CHECKPOINTS = False        # False: no local/Drive checkpoints; final model still uploads to HF
+SAVE_FREQ = 10000               # ignored while SAVE_CHECKPOINTS=False
+SAVE_CHECKPOINTS = False        # no optimizer checkpoints; final inference model goes to Drive
 FULL_FINETUNE = True            # planned experiment; False is explicit expert-only fallback
 COMPILE_MODEL = False           # avoids a long first-step compile during the pilot
 WANDB = False
@@ -48,9 +48,11 @@ PERSISTENT_ROOT = Path("/content/drive/MyDrive/pnp_diversity")
 MANIFEST_PATH = PERSISTENT_ROOT / "bootstrap_manifest.json"
 OUTPUT_DIR = Path(f"/content/pi05_diversity/train_m{MODEL_INDEX}")
 CHECKPOINT_MIRROR_DIR = PERSISTENT_ROOT / f"checkpoint_m{MODEL_INDEX}"
+FINAL_DRIVE_DIR = PERSISTENT_ROOT / f"final_model_m{MODEL_INDEX}"
 print({"member": MODEL_INDEX, "model_repo": MODEL_REPOS[MODEL_INDEX],
        "output": str(OUTPUT_DIR), "checkpoint_mirror": str(CHECKPOINT_MIRROR_DIR),
-       "full_finetune": FULL_FINETUNE, "save_checkpoints": SAVE_CHECKPOINTS})'''),
+       "final_drive_dir": str(FINAL_DRIVE_DIR), "full_finetune": FULL_FINETUNE,
+       "save_checkpoints": SAVE_CHECKPOINTS})'''),
     md("""## 3. Build or load the shared episode-bootstrap manifest
 
 The file in Drive contains both independently sampled members. Member 1 must load this exact file;
@@ -85,8 +87,9 @@ temporary checkpoint copy is removed after model, optimizer, and scheduler state
 Do not manually delete checkpoint folders while a save is in progress.
 
 With the default `SAVE_CHECKPOINTS=False`, LeRobot writes no training checkpoints at all; the final
-model and processors are still pushed to `MODEL_REPOS[MODEL_INDEX]` after step 3000. The tradeoff is
-that a disconnect during this run cannot be resumed from a newer step."""),
+model and processors are exported directly to `FINAL_DRIVE_DIR` before the Hub upload is attempted.
+This model-only export omits the large optimizer state, so it is suitable for evaluation but not
+training resume. A disconnect before step 3000 still cannot be resumed from a newer step."""),
     code(r'''import subprocess, sys
 from pathlib import Path
 
@@ -95,6 +98,7 @@ args = [sys.executable, "-u",
         "--manifest", str(MANIFEST_PATH), "--member", str(MODEL_INDEX),
         "--output-dir", str(OUTPUT_DIR),
         "--checkpoint-mirror-dir", str(CHECKPOINT_MIRROR_DIR),
+        "--final-drive-dir", str(FINAL_DRIVE_DIR),
         "--policy-repo-id", MODEL_REPOS[MODEL_INDEX],
         "--steps", str(STEPS), "--batch-size", str(BATCH_SIZE),
         "--save-freq", str(SAVE_FREQ)]

@@ -153,6 +153,72 @@ def install_checkpoint_mirroring(trainer, mirror_dir: Path, *, keep_local: bool 
     return trainer
 
 
+def install_final_drive_export(trainer, final_dir: Path, metadata: dict):
+    """Export inference-ready weights and processors to Drive before the Hub upload."""
+    final_dir = Path(final_dir)
+    captured = {}
+    original_make_policy = trainer.make_policy
+    original_make_processors = trainer.make_pre_post_processors
+
+    def make_policy_and_wrap_push(*args, **kwargs):
+        policy = original_make_policy(*args, **kwargs)
+        original_push = policy.push_model_to_hub
+
+        def export_then_push(cfg, *push_args, **push_kwargs):
+            preprocessor = captured.get("preprocessor")
+            postprocessor = captured.get("postprocessor")
+            if preprocessor is None or postprocessor is None:
+                raise RuntimeError("cannot export final model before processors are created")
+            final_dir.parent.mkdir(parents=True, exist_ok=True)
+            staging = final_dir.with_name(f".{final_dir.name}.staging")
+            previous = final_dir.with_name(f".{final_dir.name}.previous")
+            for path in (staging, previous):
+                if path.exists():
+                    shutil.rmtree(path)
+            staging.mkdir(parents=True)
+            policy.save_pretrained(staging)
+            cfg.save_pretrained(staging)
+            preprocessor.save_pretrained(staging)
+            postprocessor.save_pretrained(staging)
+            (staging / "final_export.json").write_text(
+                json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+            if not (staging / "config.json").is_file():
+                raise RuntimeError("final Drive export is missing config.json")
+            if not list(staging.glob("*.safetensors")):
+                raise RuntimeError("final Drive export is missing model weights")
+            processor_names = {path.name for path in staging.iterdir()}
+            if not any("preprocessor" in name for name in processor_names):
+                raise RuntimeError("final Drive export is missing the preprocessor")
+            if not any("postprocessor" in name for name in processor_names):
+                raise RuntimeError("final Drive export is missing the postprocessor")
+
+            if final_dir.exists():
+                final_dir.rename(previous)
+            try:
+                staging.rename(final_dir)
+            except Exception:
+                if previous.exists() and not final_dir.exists():
+                    previous.rename(final_dir)
+                raise
+            if previous.exists():
+                shutil.rmtree(previous)
+            print(f"Final trained model exported to Drive: {final_dir}")
+            return original_push(cfg, *push_args, **push_kwargs)
+
+        policy.push_model_to_hub = export_then_push
+        return policy
+
+    def make_processors_and_capture(*args, **kwargs):
+        preprocessor, postprocessor = original_make_processors(*args, **kwargs)
+        captured["preprocessor"] = preprocessor
+        captured["postprocessor"] = postprocessor
+        return preprocessor, postprocessor
+
+    trainer.make_policy = make_policy_and_wrap_push
+    trainer.make_pre_post_processors = make_processors_and_capture
+    return trainer
+
+
 def install_fresh_pi05_processors(trainer, rename_map: dict[str, str]):
     """Build processors with pinned LeRobot instead of loading incompatible Hub metadata.
 
@@ -203,6 +269,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-checkpoints", action="store_true")
     parser.add_argument("--checkpoint-mirror-dir", type=Path)
+    parser.add_argument("--final-drive-dir", type=Path)
     return parser
 
 
@@ -300,6 +367,20 @@ def main(argv=None) -> int:
     if not args.resume:
         trainer = install_fresh_pi05_processors(
             trainer, LIBERO_TO_PI05_BASE_RENAME_MAP)
+    if args.final_drive_dir is not None:
+        trainer = install_final_drive_export(
+            trainer,
+            args.final_drive_dir,
+            metadata={
+                "member_index": args.member,
+                "training_completed_steps": args.steps,
+                "manifest_hash": manifest["manifest_hash"],
+                "source_model": manifest["source_model"],
+                "source_model_revision": manifest["source_model_revision"],
+                "dataset_revision": manifest["dataset_revision"],
+                "policy_repo_id": args.policy_repo_id,
+            },
+        )
     lerobot_args = build_lerobot_args(
         args, manifest, source_model_path=source_model_path)
     print("LeRobot training arguments:")
