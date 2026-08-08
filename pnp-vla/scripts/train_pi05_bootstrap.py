@@ -65,20 +65,37 @@ def mirror_latest_checkpoint(checkpoint_dir: Path, mirror_dir: Path,
 
 
 def restore_latest_mirrored_checkpoint(output_dir: Path, mirror_dir: Path) -> Path | None:
-    """Replace local checkpoint state with the newest complete Drive mirror."""
+    """Use the newest complete local checkpoint, falling back to the Drive mirror."""
     output_dir, mirror_dir = Path(output_dir), Path(mirror_dir)
+    local_checkpoints = output_dir / "checkpoints"
     local_last = output_dir / "checkpoints" / "last"
+    local_candidates = sorted(
+        (path for path in local_checkpoints.glob("*")
+         if path.is_dir() and path.name.isdigit() and _is_complete_checkpoint(path)),
+        key=lambda path: int(path.name),
+    ) if local_checkpoints.exists() else []
+    if local_candidates:
+        source = local_candidates[-1]
+        # Preserve the complete local checkpoint in Drive before releasing its disk after load.
+        mirror_latest_checkpoint(source, mirror_dir, keep_local=True)
+        if local_last.is_symlink():
+            local_last.unlink()
+        elif local_last.exists():
+            shutil.rmtree(local_last)
+        local_last.symlink_to(source.name)
+        print(f"Using complete local checkpoint {source.name}; Drive fallback synchronized.")
+        return local_last
+
     candidates = sorted(
         (path for path in mirror_dir.glob("*")
          if path.is_dir() and path.name.isdigit() and _is_complete_checkpoint(path)),
         key=lambda path: int(path.name),
     ) if mirror_dir.exists() else []
     if not candidates:
-        return local_last if _is_complete_checkpoint(local_last) else None
+        return None
     source = candidates[-1]
-    local_checkpoints = output_dir / "checkpoints"
     local_checkpoints.mkdir(parents=True, exist_ok=True)
-    # The Drive mirror is authoritative for resume. Remove partial and stale local saves first.
+    # No complete local checkpoint exists. Remove partial saves, then restore the Drive fallback.
     for candidate in local_checkpoints.iterdir():
         if candidate.is_dir() and candidate.name.isdigit():
             shutil.rmtree(candidate)
