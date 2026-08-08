@@ -136,7 +136,7 @@ def test_checkpoint_mirror_keeps_only_newest_complete_copy(tmp_path):
     assert destination == mirror / "001000"
     assert module._is_complete_checkpoint(destination)
     assert not old.exists()
-    assert new.exists()
+    assert not new.exists()
     assert not (mirror / "000500").exists()
 
 
@@ -163,6 +163,8 @@ def test_checkpoint_mirror_restores_resume_layout_in_fresh_runtime(tmp_path):
     _fake_checkpoint(mirror / "001500", 1500)
     _fake_checkpoint(mirror / "002000", 2000)
     output = tmp_path / "fresh-local"
+    partial = output / "checkpoints" / "002500"
+    (partial / "pretrained_model").mkdir(parents=True)
 
     last = module.restore_latest_mirrored_checkpoint(output, mirror)
 
@@ -170,6 +172,32 @@ def test_checkpoint_mirror_restores_resume_layout_in_fresh_runtime(tmp_path):
     assert last.is_symlink()
     assert last.resolve().name == "002000"
     assert module._is_complete_checkpoint(last)
+    assert not partial.exists()
+
+
+def test_resume_releases_restored_local_checkpoint_after_state_load(tmp_path):
+    module = _training_module()
+    mirror = tmp_path / "drive"
+    mirrored = mirror / "002000"
+    _fake_checkpoint(mirrored, 2000)
+    local = tmp_path / "local" / "checkpoints" / "002000"
+    _fake_checkpoint(local, 2000)
+    calls = []
+
+    def load_training_state(checkpoint_dir, optimizer, scheduler):
+        calls.append(Path(checkpoint_dir))
+        return 2000, optimizer, scheduler
+
+    trainer = SimpleNamespace(
+        update_last_checkpoint=lambda checkpoint_dir: checkpoint_dir,
+        load_training_state=load_training_state,
+    )
+    module.install_checkpoint_mirroring(trainer, mirror)
+    result = trainer.load_training_state(local, object(), object())
+
+    assert result[0] == 2000
+    assert calls == [local]
+    assert not local.exists()
 
 
 def test_diversity_signal_reports_oracle_and_first_chunk_selector():

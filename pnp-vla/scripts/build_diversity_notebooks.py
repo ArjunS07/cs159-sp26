@@ -76,10 +76,11 @@ Expected after the weights load: `Built fresh pinned-LeRobot processors with LIB
 mapping.` This confirms that the obsolete processor metadata in `pi05_base` was replaced by the
 pinned implementation before optimizer creation.
 
-Training stays on fast local disk. After each complete save, only the newest full checkpoint is
-mirrored to Drive and older numbered checkpoints are removed locally and from the mirror. If a
-fresh Colab runtime starts with `RESUME=True`, the launcher restores that Drive checkpoint locally
-before resuming. A temporary second checkpoint is needed only while a new save is being completed."""),
+Training stays on fast local disk. After each complete save, the checkpoint is verified and
+mirrored to Drive, then all local checkpoint copies and older Drive mirrors are removed. If a
+fresh Colab runtime starts with `RESUME=True`, the Drive mirror replaces any partial local save;
+the temporary restored copy is removed after model, optimizer, and scheduler state are loaded.
+Do not manually delete checkpoint folders while a save is in progress."""),
     code(r'''import subprocess, sys
 from pathlib import Path
 

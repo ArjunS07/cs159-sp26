@@ -27,8 +27,9 @@ def _is_complete_checkpoint(path: Path) -> bool:
     return all((path / relative).is_file() for relative in required)
 
 
-def mirror_latest_checkpoint(checkpoint_dir: Path, mirror_dir: Path) -> Path:
-    """Durably mirror one complete checkpoint, then prune older local and mirrored copies."""
+def mirror_latest_checkpoint(checkpoint_dir: Path, mirror_dir: Path,
+                             *, keep_local: bool = False) -> Path:
+    """Durably mirror one complete checkpoint, then prune superseded copies."""
     checkpoint_dir = Path(checkpoint_dir)
     mirror_dir = Path(mirror_dir)
     if not checkpoint_dir.name.isdigit() or checkpoint_dir.parent.name != "checkpoints":
@@ -54,51 +55,73 @@ def mirror_latest_checkpoint(checkpoint_dir: Path, mirror_dir: Path) -> Path:
         if candidate != destination and candidate.is_dir() and candidate.name.isdigit():
             shutil.rmtree(candidate)
     for candidate in checkpoint_dir.parent.iterdir():
-        if candidate != checkpoint_dir and candidate.is_dir() and candidate.name.isdigit():
+        if (keep_local and candidate == checkpoint_dir) or not candidate.name.isdigit():
+            continue
+        if candidate.is_dir():
             shutil.rmtree(candidate)
-    print(f"Mirrored checkpoint {checkpoint_dir.name} to {destination}; pruned older checkpoints.")
+    local_note = "kept latest local copy" if keep_local else "removed local checkpoint copies"
+    print(f"Mirrored checkpoint {checkpoint_dir.name} to {destination}; {local_note}.")
     return destination
 
 
 def restore_latest_mirrored_checkpoint(output_dir: Path, mirror_dir: Path) -> Path | None:
-    """Restore the newest complete Drive mirror into a fresh local Colab runtime."""
+    """Replace local checkpoint state with the newest complete Drive mirror."""
     output_dir, mirror_dir = Path(output_dir), Path(mirror_dir)
     local_last = output_dir / "checkpoints" / "last"
-    if (local_last / "pretrained_model" / "train_config.json").is_file():
-        return local_last
     candidates = sorted(
         (path for path in mirror_dir.glob("*")
          if path.is_dir() and path.name.isdigit() and _is_complete_checkpoint(path)),
         key=lambda path: int(path.name),
     ) if mirror_dir.exists() else []
     if not candidates:
-        return None
+        return local_last if _is_complete_checkpoint(local_last) else None
     source = candidates[-1]
     local_checkpoints = output_dir / "checkpoints"
     local_checkpoints.mkdir(parents=True, exist_ok=True)
-    destination = local_checkpoints / source.name
-    if destination.exists():
-        shutil.rmtree(destination)
-    shutil.copytree(source, destination)
+    # The Drive mirror is authoritative for resume. Remove partial and stale local saves first.
+    for candidate in local_checkpoints.iterdir():
+        if candidate.is_dir() and candidate.name.isdigit():
+            shutil.rmtree(candidate)
     if local_last.is_symlink():
         local_last.unlink()
     elif local_last.exists():
-        raise RuntimeError(f"expected a symlink or absent path at {local_last}")
+        shutil.rmtree(local_last)
+    destination = local_checkpoints / source.name
+    staging = local_checkpoints / f".{source.name}.restore"
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(source, staging)
+    if not _is_complete_checkpoint(staging):
+        raise RuntimeError(f"restored checkpoint is incomplete: {staging}")
+    staging.rename(destination)
     local_last.symlink_to(destination.name)
     print(f"Restored checkpoint {source.name} from {source} to local disk.")
     return local_last
 
 
-def install_checkpoint_mirroring(trainer, mirror_dir: Path):
-    """Mirror only completed checkpoints and retain only the latest numbered directory."""
+def install_checkpoint_mirroring(trainer, mirror_dir: Path, *, keep_local: bool = False):
+    """Make Drive authoritative and release local checkpoint disk after loading or saving."""
     original = trainer.update_last_checkpoint
+    original_load = trainer.load_training_state
 
     def update_mirror_and_prune(checkpoint_dir):
         result = original(checkpoint_dir)
-        mirror_latest_checkpoint(Path(checkpoint_dir), Path(mirror_dir))
+        mirror_latest_checkpoint(
+            Path(checkpoint_dir), Path(mirror_dir), keep_local=keep_local)
+        return result
+
+    def load_and_release_local(checkpoint_dir, optimizer, scheduler):
+        result = original_load(checkpoint_dir, optimizer, scheduler)
+        local_checkpoint = Path(checkpoint_dir).resolve()
+        mirror_checkpoint = Path(mirror_dir) / local_checkpoint.name
+        if (not keep_local and local_checkpoint.parent.name == "checkpoints"
+                and _is_complete_checkpoint(mirror_checkpoint)):
+            shutil.rmtree(local_checkpoint)
+            print(f"Loaded checkpoint {local_checkpoint.name}; released its local disk copy.")
         return result
 
     trainer.update_last_checkpoint = update_mirror_and_prune
+    trainer.load_training_state = load_and_release_local
     return trainer
 
 
@@ -236,7 +259,8 @@ def main(argv=None) -> int:
                 raise FileNotFoundError(
                     f"no resumable checkpoint in {args.output_dir} or "
                     f"{args.checkpoint_mirror_dir}")
-        trainer = install_checkpoint_mirroring(trainer, args.checkpoint_mirror_dir)
+        trainer = install_checkpoint_mirroring(
+            trainer, args.checkpoint_mirror_dir, keep_local=args.wandb)
     if not args.resume:
         trainer = install_fresh_pi05_processors(
             trainer, LIBERO_TO_PI05_BASE_RENAME_MAP)
