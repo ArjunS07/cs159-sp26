@@ -114,8 +114,11 @@ def _fake_checkpoint(path: Path, step: int):
     (path / "pretrained_model").mkdir(parents=True)
     (path / "training_state").mkdir()
     (path / "pretrained_model" / "train_config.json").write_text("{}")
+    (path / "pretrained_model" / "config.json").write_text("{}")
     (path / "training_state" / "training_step.json").write_text(str(step))
     (path / "pretrained_model" / "model.safetensors").write_bytes(b"weights")
+    (path / "training_state" / "optimizer_state.safetensors").write_bytes(b"optimizer")
+    (path / "training_state" / "scheduler_state.json").write_text("{}")
 
 
 def test_checkpoint_mirror_keeps_only_newest_complete_copy(tmp_path):

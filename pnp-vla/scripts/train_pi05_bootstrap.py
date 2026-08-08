@@ -16,10 +16,15 @@ LIBERO_TO_PI05_BASE_RENAME_MAP = {
 
 
 def _is_complete_checkpoint(path: Path) -> bool:
-    return (
-        (path / "pretrained_model" / "train_config.json").is_file()
-        and (path / "training_state" / "training_step.json").is_file()
+    required = (
+        "pretrained_model/train_config.json",
+        "pretrained_model/config.json",
+        "pretrained_model/model.safetensors",
+        "training_state/training_step.json",
+        "training_state/optimizer_state.safetensors",
+        "training_state/scheduler_state.json",
     )
+    return all((path / relative).is_file() for relative in required)
 
 
 def mirror_latest_checkpoint(checkpoint_dir: Path, mirror_dir: Path) -> Path:
