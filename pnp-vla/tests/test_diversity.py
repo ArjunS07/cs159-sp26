@@ -110,6 +110,65 @@ def test_training_rebuilds_stale_raw_base_processors_and_applies_rename_map():
     assert preprocessor.steps[0].rename_map == mapping
 
 
+def _fake_checkpoint(path: Path, step: int):
+    (path / "pretrained_model").mkdir(parents=True)
+    (path / "training_state").mkdir()
+    (path / "pretrained_model" / "train_config.json").write_text("{}")
+    (path / "training_state" / "training_step.json").write_text(str(step))
+    (path / "pretrained_model" / "model.safetensors").write_bytes(b"weights")
+
+
+def test_checkpoint_mirror_keeps_only_newest_complete_copy(tmp_path):
+    module = _training_module()
+    checkpoints = tmp_path / "local" / "checkpoints"
+    old = checkpoints / "000500"
+    new = checkpoints / "001000"
+    _fake_checkpoint(old, 500)
+    _fake_checkpoint(new, 1000)
+    mirror = tmp_path / "drive"
+    _fake_checkpoint(mirror / "000500", 500)
+
+    destination = module.mirror_latest_checkpoint(new, mirror)
+
+    assert destination == mirror / "001000"
+    assert module._is_complete_checkpoint(destination)
+    assert not old.exists()
+    assert new.exists()
+    assert not (mirror / "000500").exists()
+
+
+def test_incomplete_checkpoint_never_prunes_recoverable_copy(tmp_path):
+    module = _training_module()
+    checkpoints = tmp_path / "local" / "checkpoints"
+    old = checkpoints / "000500"
+    incomplete = checkpoints / "001000"
+    _fake_checkpoint(old, 500)
+    (incomplete / "pretrained_model").mkdir(parents=True)
+    mirror = tmp_path / "drive"
+    _fake_checkpoint(mirror / "000500", 500)
+
+    with np.testing.assert_raises_regex(RuntimeError, "incomplete"):
+        module.mirror_latest_checkpoint(incomplete, mirror)
+
+    assert old.exists()
+    assert (mirror / "000500").exists()
+
+
+def test_checkpoint_mirror_restores_resume_layout_in_fresh_runtime(tmp_path):
+    module = _training_module()
+    mirror = tmp_path / "drive"
+    _fake_checkpoint(mirror / "001500", 1500)
+    _fake_checkpoint(mirror / "002000", 2000)
+    output = tmp_path / "fresh-local"
+
+    last = module.restore_latest_mirrored_checkpoint(output, mirror)
+
+    assert last == output / "checkpoints" / "last"
+    assert last.is_symlink()
+    assert last.resolve().name == "002000"
+    assert module._is_complete_checkpoint(last)
+
+
 def test_diversity_signal_reports_oracle_and_first_chunk_selector():
     identities = [
         {"suite": "libero_goal_swap", "task_idx": 0, "episode_idx": index,

@@ -46,8 +46,10 @@ MODEL_REPOS = [f"{HF_USER}/pi05-base-to-libero-bootstrap-m0-v1",
 PERSISTENT_ROOT = Path("/content/drive/MyDrive/pnp_diversity")
 MANIFEST_PATH = PERSISTENT_ROOT / "bootstrap_manifest.json"
 OUTPUT_DIR = Path(f"/content/pi05_diversity/train_m{MODEL_INDEX}")
+CHECKPOINT_MIRROR_DIR = PERSISTENT_ROOT / f"checkpoint_m{MODEL_INDEX}"
 print({"member": MODEL_INDEX, "model_repo": MODEL_REPOS[MODEL_INDEX],
-       "output": str(OUTPUT_DIR), "full_finetune": FULL_FINETUNE})'''),
+       "output": str(OUTPUT_DIR), "checkpoint_mirror": str(CHECKPOINT_MIRROR_DIR),
+       "full_finetune": FULL_FINETUNE})'''),
     md("""## 3. Build or load the shared episode-bootstrap manifest
 
 The file in Drive contains both independently sampled members. Member 1 must load this exact file;
@@ -72,7 +74,12 @@ print("tasks:", manifest["n_tasks"], "source episodes:", manifest["n_source_epis
 
 Expected after the weights load: `Built fresh pinned-LeRobot processors with LIBERO camera
 mapping.` This confirms that the obsolete processor metadata in `pi05_base` was replaced by the
-pinned implementation before optimizer creation."""),
+pinned implementation before optimizer creation.
+
+Training stays on fast local disk. After each complete save, only the newest full checkpoint is
+mirrored to Drive and older numbered checkpoints are removed locally and from the mirror. If a
+fresh Colab runtime starts with `RESUME=True`, the launcher restores that Drive checkpoint locally
+before resuming. A temporary second checkpoint is needed only while a new save is being completed."""),
     code(r'''import subprocess, sys
 from pathlib import Path
 
@@ -80,6 +87,7 @@ args = [sys.executable, "-u",
         str(Path(package_dir) / "scripts" / "train_pi05_bootstrap.py"),
         "--manifest", str(MANIFEST_PATH), "--member", str(MODEL_INDEX),
         "--output-dir", str(OUTPUT_DIR),
+        "--checkpoint-mirror-dir", str(CHECKPOINT_MIRROR_DIR),
         "--policy-repo-id", MODEL_REPOS[MODEL_INDEX],
         "--steps", str(STEPS), "--batch-size", str(BATCH_SIZE),
         "--save-freq", str(SAVE_FREQ)]

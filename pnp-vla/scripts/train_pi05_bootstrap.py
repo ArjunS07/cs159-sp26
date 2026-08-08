@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -12,6 +13,88 @@ LIBERO_TO_PI05_BASE_RENAME_MAP = {
     "observation.images.image": "observation.images.base_0_rgb",
     "observation.images.image2": "observation.images.left_wrist_0_rgb",
 }
+
+
+def _is_complete_checkpoint(path: Path) -> bool:
+    return (
+        (path / "pretrained_model" / "train_config.json").is_file()
+        and (path / "training_state" / "training_step.json").is_file()
+    )
+
+
+def mirror_latest_checkpoint(checkpoint_dir: Path, mirror_dir: Path) -> Path:
+    """Durably mirror one complete checkpoint, then prune older local and mirrored copies."""
+    checkpoint_dir = Path(checkpoint_dir)
+    mirror_dir = Path(mirror_dir)
+    if not checkpoint_dir.name.isdigit() or checkpoint_dir.parent.name != "checkpoints":
+        raise ValueError(f"refusing to prune unexpected checkpoint path: {checkpoint_dir}")
+    if not _is_complete_checkpoint(checkpoint_dir):
+        raise RuntimeError(f"checkpoint is incomplete: {checkpoint_dir}")
+
+    mirror_dir.mkdir(parents=True, exist_ok=True)
+    destination = mirror_dir / checkpoint_dir.name
+    staging = mirror_dir / f".{checkpoint_dir.name}.staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    if not destination.exists():
+        shutil.copytree(checkpoint_dir, staging)
+        if not _is_complete_checkpoint(staging):
+            raise RuntimeError(f"mirrored checkpoint is incomplete: {staging}")
+        staging.rename(destination)
+    elif not _is_complete_checkpoint(destination):
+        raise RuntimeError(f"existing mirrored checkpoint is incomplete: {destination}")
+
+    # The old checkpoint remains recoverable until the new Drive copy is complete.
+    for candidate in mirror_dir.iterdir():
+        if candidate != destination and candidate.is_dir() and candidate.name.isdigit():
+            shutil.rmtree(candidate)
+    for candidate in checkpoint_dir.parent.iterdir():
+        if candidate != checkpoint_dir and candidate.is_dir() and candidate.name.isdigit():
+            shutil.rmtree(candidate)
+    print(f"Mirrored checkpoint {checkpoint_dir.name} to {destination}; pruned older checkpoints.")
+    return destination
+
+
+def restore_latest_mirrored_checkpoint(output_dir: Path, mirror_dir: Path) -> Path | None:
+    """Restore the newest complete Drive mirror into a fresh local Colab runtime."""
+    output_dir, mirror_dir = Path(output_dir), Path(mirror_dir)
+    local_last = output_dir / "checkpoints" / "last"
+    if (local_last / "pretrained_model" / "train_config.json").is_file():
+        return local_last
+    candidates = sorted(
+        (path for path in mirror_dir.glob("*")
+         if path.is_dir() and path.name.isdigit() and _is_complete_checkpoint(path)),
+        key=lambda path: int(path.name),
+    ) if mirror_dir.exists() else []
+    if not candidates:
+        return None
+    source = candidates[-1]
+    local_checkpoints = output_dir / "checkpoints"
+    local_checkpoints.mkdir(parents=True, exist_ok=True)
+    destination = local_checkpoints / source.name
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination)
+    if local_last.is_symlink():
+        local_last.unlink()
+    elif local_last.exists():
+        raise RuntimeError(f"expected a symlink or absent path at {local_last}")
+    local_last.symlink_to(destination.name)
+    print(f"Restored checkpoint {source.name} from {source} to local disk.")
+    return local_last
+
+
+def install_checkpoint_mirroring(trainer, mirror_dir: Path):
+    """Mirror only completed checkpoints and retain only the latest numbered directory."""
+    original = trainer.update_last_checkpoint
+
+    def update_mirror_and_prune(checkpoint_dir):
+        result = original(checkpoint_dir)
+        mirror_latest_checkpoint(Path(checkpoint_dir), Path(mirror_dir))
+        return result
+
+    trainer.update_last_checkpoint = update_mirror_and_prune
+    return trainer
 
 
 def install_fresh_pi05_processors(trainer, rename_map: dict[str, str]):
@@ -62,6 +145,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--checkpoint-mirror-dir", type=Path)
     return parser
 
 
@@ -137,6 +221,17 @@ def main(argv=None) -> int:
     source_model_path = snapshot_download(
         repo_id=manifest["source_model"], revision=manifest["source_model_revision"])
     trainer = install_bootstrap_sampler(manifest, args.member)
+    if args.checkpoint_mirror_dir is not None:
+        if args.resume:
+            restored = restore_latest_mirrored_checkpoint(
+                args.output_dir, args.checkpoint_mirror_dir)
+            if restored is None and not (
+                    args.output_dir / "checkpoints" / "last" / "pretrained_model" /
+                    "train_config.json").is_file():
+                raise FileNotFoundError(
+                    f"no resumable checkpoint in {args.output_dir} or "
+                    f"{args.checkpoint_mirror_dir}")
+        trainer = install_checkpoint_mirroring(trainer, args.checkpoint_mirror_dir)
     if not args.resume:
         trainer = install_fresh_pi05_processors(
             trainer, LIBERO_TO_PI05_BASE_RENAME_MAP)
