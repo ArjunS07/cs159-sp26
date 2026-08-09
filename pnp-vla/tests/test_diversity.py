@@ -86,6 +86,34 @@ def test_training_maps_two_libero_cameras_to_raw_pi05_base_names():
     assert "--save_checkpoint=true" in cli
 
 
+def test_finetuned_v2_keeps_native_libero_features_and_overrides_schedule():
+    module = _training_module()
+    args = SimpleNamespace(
+        resume=False, output_dir=Path("unused-v2-output"), policy_repo_id="user/model-v2",
+        member=1, compile_model=False, expert_only=False, steps=6000, batch_size=32,
+        num_workers=4, save_freq=10000, log_freq=20, wandb=False, no_checkpoints=True,
+        learning_rate=5e-6, scheduler_warmup_steps=500,
+        scheduler_decay_steps=6000, scheduler_decay_lr=5e-7)
+    manifest = {
+        "dataset_repo_id": "HuggingFaceVLA/libero", "dataset_revision": "dataset-sha",
+        "source_model": "lerobot/pi05_libero_finetuned",
+        "members": [{"seed": 159}, {"seed": 160}],
+    }
+
+    cli = module.build_lerobot_args(
+        args, manifest, source_model_path="/cache/pi05_libero_finetuned")
+
+    assert not any(value.startswith("--rename_map=") for value in cli)
+    assert "--policy.path=/cache/pi05_libero_finetuned" in cli
+    assert "--policy.optimizer_lr=5e-06" in cli
+    assert "--policy.scheduler_warmup_steps=500" in cli
+    assert "--policy.scheduler_decay_steps=6000" in cli
+    assert "--policy.scheduler_decay_lr=5e-07" in cli
+    assert "--steps=6000" in cli
+    assert "--batch_size=32" in cli
+    assert "--save_checkpoint=false" in cli
+
+
 def test_resume_overrides_saved_checkpoint_frequency_and_can_disable_saves(tmp_path):
     module = _training_module()
     output = tmp_path / "output"
@@ -134,6 +162,9 @@ def test_training_rebuilds_stale_raw_base_processors_and_applies_rename_map():
 def test_final_drive_export_survives_hub_upload_failure(tmp_path):
     module = _training_module()
     final_dir = tmp_path / "drive" / "final_model_m0"
+    recovery_dir = tmp_path / "drive" / "recovery_m0"
+    recovery_dir.mkdir(parents=True)
+    (recovery_dir / "old-model.safetensors").write_text("old")
     calls = []
 
     class Savable:
@@ -167,7 +198,8 @@ def test_final_drive_export_survives_hub_upload_failure(tmp_path):
         make_pre_post_processors=lambda: (preprocessor, postprocessor),
     )
     metadata = {"training_completed_steps": 3000, "member_index": 0}
-    module.install_final_drive_export(trainer, final_dir, metadata)
+    module.install_final_drive_export(
+        trainer, final_dir, metadata, cleanup_recovery_dir=recovery_dir)
 
     actual_policy = trainer.make_policy()
     assert trainer.make_pre_post_processors() == (preprocessor, postprocessor)
@@ -181,8 +213,72 @@ def test_final_drive_export_survives_hub_upload_failure(tmp_path):
     assert (final_dir / "policy_preprocessor.json").is_file()
     assert (final_dir / "policy_postprocessor.json").is_file()
     assert json.loads((final_dir / "final_export.json").read_text()) == metadata
+    assert not recovery_dir.exists()
     assert not final_dir.with_name(".final_model_m0.staging").exists()
     assert not final_dir.with_name(".final_model_m0.previous").exists()
+
+
+def test_model_only_recovery_keeps_one_valid_bundle_and_reloads_it(tmp_path):
+    module = _training_module()
+
+    class Savable:
+        def __init__(self, filename, content="{}"):
+            self.filename = filename
+            self.content = content
+
+        def save_pretrained(self, path):
+            path = Path(path)
+            path.mkdir(parents=True, exist_ok=True)
+            (path / self.filename).write_text(self.content)
+
+    class Policy(Savable):
+        def __init__(self):
+            super().__init__("model.safetensors", "weights")
+
+        def save_pretrained(self, path):
+            super().save_pretrained(path)
+            (Path(path) / "config.json").write_text("{}")
+
+    class Accelerator:
+        is_main_process = True
+
+        @staticmethod
+        def unwrap_model(policy):
+            return policy
+
+    policy = Policy()
+    preprocessor = Savable("policy_preprocessor.json")
+    postprocessor = Savable("policy_postprocessor.json")
+    trainer = SimpleNamespace(
+        make_pre_post_processors=lambda: (preprocessor, postprocessor),
+        update_policy=lambda *args, **kwargs: "updated",
+    )
+    recovery = tmp_path / "recovery"
+    metadata = {"manifest_hash": "manifest", "member_index": 1}
+    module.install_model_only_recovery(
+        trainer, recovery, every_steps=2, start_step=0, target_steps=6,
+        metadata=metadata)
+    trainer.make_pre_post_processors()
+
+    for _ in range(4):
+        assert trainer.update_policy(
+            None, policy, None, None, None, Accelerator()) == "updated"
+
+    latest = recovery / "latest"
+    saved = json.loads((latest / "recovery_export.json").read_text())
+    assert saved["completed_steps"] == 4
+    assert saved["target_steps"] == 6
+    assert not list(latest.glob("*optimizer*"))
+    assert not latest.with_name(".latest.previous").exists()
+    assert not latest.with_name(".latest.staging").exists()
+    assert module.load_model_only_recovery(
+        recovery, manifest_hash="manifest", member_index=1,
+        target_steps=6) == (latest, 4)
+
+    with np.testing.assert_raises_regex(RuntimeError, "manifest_hash mismatch"):
+        module.load_model_only_recovery(
+            recovery, manifest_hash="different", member_index=1,
+            target_steps=6)
 
 
 def _fake_checkpoint(path: Path, step: int):

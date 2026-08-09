@@ -13,6 +13,10 @@ LIBERO_TO_PI05_BASE_RENAME_MAP = {
     "observation.images.image": "observation.images.base_0_rgb",
     "observation.images.image2": "observation.images.left_wrist_0_rgb",
 }
+SUPPORTED_SOURCE_MODELS = {
+    "lerobot/pi05_base",
+    "lerobot/pi05_libero_finetuned",
+}
 
 
 def _is_complete_checkpoint(path: Path) -> bool:
@@ -153,7 +157,134 @@ def install_checkpoint_mirroring(trainer, mirror_dir: Path, *, keep_local: bool 
     return trainer
 
 
-def install_final_drive_export(trainer, final_dir: Path, metadata: dict):
+def export_inference_bundle(policy, preprocessor, postprocessor, destination: Path,
+                            metadata: dict, *, train_cfg=None,
+                            metadata_filename: str = "export_metadata.json") -> Path:
+    """Atomically replace one model-only bundle without ever writing optimizer state."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(f".{destination.name}.staging")
+    previous = destination.with_name(f".{destination.name}.previous")
+    for path in (staging, previous):
+        if path.exists():
+            shutil.rmtree(path)
+    staging.mkdir(parents=True)
+    try:
+        policy.save_pretrained(staging)
+        if train_cfg is not None:
+            train_cfg.save_pretrained(staging)
+        preprocessor.save_pretrained(staging)
+        postprocessor.save_pretrained(staging)
+        (staging / metadata_filename).write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        if not (staging / "config.json").is_file():
+            raise RuntimeError("model-only Drive export is missing config.json")
+        if not list(staging.glob("*.safetensors")):
+            raise RuntimeError("model-only Drive export is missing model weights")
+        names = {path.name for path in staging.iterdir()}
+        if not any("preprocessor" in name for name in names):
+            raise RuntimeError("model-only Drive export is missing the preprocessor")
+        if not any("postprocessor" in name for name in names):
+            raise RuntimeError("model-only Drive export is missing the postprocessor")
+
+        if destination.exists():
+            destination.rename(previous)
+        try:
+            staging.rename(destination)
+        except Exception:
+            if previous.exists() and not destination.exists():
+                previous.rename(destination)
+            raise
+        if previous.exists():
+            shutil.rmtree(previous)
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    return destination
+
+
+def load_model_only_recovery(recovery_dir: Path, *, manifest_hash: str,
+                             member_index: int, target_steps: int) -> tuple[Path, int] | None:
+    """Return a validated model-only recovery bundle, if one exists."""
+    latest = Path(recovery_dir) / "latest"
+    metadata_path = latest / "recovery_export.json"
+    if not metadata_path.is_file():
+        return None
+    metadata = json.loads(metadata_path.read_text())
+    expected = {
+        "manifest_hash": manifest_hash,
+        "member_index": int(member_index),
+        "target_steps": int(target_steps),
+    }
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise RuntimeError(
+                f"recovery snapshot {key} mismatch: {metadata.get(key)!r} != {value!r}")
+    completed = int(metadata.get("completed_steps", -1))
+    if not 0 < completed < int(target_steps):
+        raise RuntimeError(
+            f"recovery completed_steps must be between 1 and {target_steps - 1}, got {completed}")
+    if not (latest / "config.json").is_file() or not list(latest.glob("*.safetensors")):
+        raise RuntimeError(f"incomplete model-only recovery snapshot: {latest}")
+    print(f"Using model-only recovery snapshot at global step {completed}: {latest}")
+    return latest, completed
+
+
+def install_model_only_recovery(trainer, recovery_dir: Path, *, every_steps: int,
+                                start_step: int, target_steps: int, metadata: dict):
+    """Save one rolling inference bundle after optimizer updates; never save optimizer state."""
+    if every_steps <= 0:
+        raise ValueError("model-only recovery frequency must be positive")
+    recovery_dir = Path(recovery_dir)
+    captured = {}
+    local_updates = 0
+    original_make_processors = trainer.make_pre_post_processors
+    original_update_policy = trainer.update_policy
+
+    def make_processors_and_capture(*args, **kwargs):
+        preprocessor, postprocessor = original_make_processors(*args, **kwargs)
+        captured["preprocessor"] = preprocessor
+        captured["postprocessor"] = postprocessor
+        return preprocessor, postprocessor
+
+    def update_policy_and_maybe_export(*args, **kwargs):
+        nonlocal local_updates
+        result = original_update_policy(*args, **kwargs)
+        local_updates += 1
+        completed = int(start_step) + local_updates
+        if completed >= int(target_steps) or completed % int(every_steps):
+            return result
+        accelerator = kwargs.get("accelerator")
+        if accelerator is None and len(args) > 5:
+            accelerator = args[5]
+        if accelerator is not None and not accelerator.is_main_process:
+            return result
+        preprocessor = captured.get("preprocessor")
+        postprocessor = captured.get("postprocessor")
+        if preprocessor is None or postprocessor is None:
+            raise RuntimeError("cannot save model-only recovery before processors are created")
+        policy = kwargs.get("policy") if "policy" in kwargs else args[1]
+        unwrapped = accelerator.unwrap_model(policy) if accelerator is not None else policy
+        snapshot_metadata = {
+            **metadata,
+            "completed_steps": completed,
+            "target_steps": int(target_steps),
+            "recovery_kind": "model_only_fresh_optimizer_on_restart",
+        }
+        destination = export_inference_bundle(
+            unwrapped, preprocessor, postprocessor, recovery_dir / "latest",
+            snapshot_metadata, metadata_filename="recovery_export.json")
+        print(f"Model-only recovery snapshot saved at global step {completed}: {destination}")
+        return result
+
+    trainer.make_pre_post_processors = make_processors_and_capture
+    trainer.update_policy = update_policy_and_maybe_export
+    return trainer
+
+
+def install_final_drive_export(trainer, final_dir: Path, metadata: dict,
+                               *, cleanup_recovery_dir: Path | None = None):
     """Export inference-ready weights and processors to Drive before the Hub upload."""
     final_dir = Path(final_dir)
     captured = {}
@@ -169,40 +300,13 @@ def install_final_drive_export(trainer, final_dir: Path, metadata: dict):
             postprocessor = captured.get("postprocessor")
             if preprocessor is None or postprocessor is None:
                 raise RuntimeError("cannot export final model before processors are created")
-            final_dir.parent.mkdir(parents=True, exist_ok=True)
-            staging = final_dir.with_name(f".{final_dir.name}.staging")
-            previous = final_dir.with_name(f".{final_dir.name}.previous")
-            for path in (staging, previous):
-                if path.exists():
-                    shutil.rmtree(path)
-            staging.mkdir(parents=True)
-            policy.save_pretrained(staging)
-            cfg.save_pretrained(staging)
-            preprocessor.save_pretrained(staging)
-            postprocessor.save_pretrained(staging)
-            (staging / "final_export.json").write_text(
-                json.dumps(metadata, indent=2, sort_keys=True) + "\n")
-            if not (staging / "config.json").is_file():
-                raise RuntimeError("final Drive export is missing config.json")
-            if not list(staging.glob("*.safetensors")):
-                raise RuntimeError("final Drive export is missing model weights")
-            processor_names = {path.name for path in staging.iterdir()}
-            if not any("preprocessor" in name for name in processor_names):
-                raise RuntimeError("final Drive export is missing the preprocessor")
-            if not any("postprocessor" in name for name in processor_names):
-                raise RuntimeError("final Drive export is missing the postprocessor")
-
-            if final_dir.exists():
-                final_dir.rename(previous)
-            try:
-                staging.rename(final_dir)
-            except Exception:
-                if previous.exists() and not final_dir.exists():
-                    previous.rename(final_dir)
-                raise
-            if previous.exists():
-                shutil.rmtree(previous)
+            export_inference_bundle(
+                policy, preprocessor, postprocessor, final_dir, metadata,
+                train_cfg=cfg, metadata_filename="final_export.json")
             print(f"Final trained model exported to Drive: {final_dir}")
+            if cleanup_recovery_dir is not None and Path(cleanup_recovery_dir).exists():
+                shutil.rmtree(cleanup_recovery_dir)
+                print(f"Removed superseded model-only recovery: {cleanup_recovery_dir}")
             return original_push(cfg, *push_args, **push_kwargs)
 
         policy.push_model_to_hub = export_then_push
@@ -270,10 +374,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-checkpoints", action="store_true")
     parser.add_argument("--checkpoint-mirror-dir", type=Path)
     parser.add_argument("--final-drive-dir", type=Path)
+    parser.add_argument("--model-only-recovery-dir", type=Path)
+    parser.add_argument("--model-only-recovery-freq", type=int, default=1000)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--scheduler-warmup-steps", type=int)
+    parser.add_argument("--scheduler-decay-steps", type=int)
+    parser.add_argument("--scheduler-decay-lr", type=float)
     return parser
 
 
-def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = None) -> list[str]:
+def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = None,
+                       session_steps: int | None = None) -> list[str]:
     if args.resume:
         config = args.output_dir / "checkpoints" / "last" / "pretrained_model" / "train_config.json"
         if not config.exists():
@@ -288,13 +399,11 @@ def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = 
         raise FileExistsError(
             f"{args.output_dir} already exists. Set --resume if it contains a valid checkpoint, "
             "or choose a new output directory.")
-    source_model = source_model_path or manifest["source_model"]
     member_seed = manifest["members"][args.member]["seed"]
-    return [
+    source_model = source_model_path or manifest["source_model"]
+    values = [
         f"--dataset.repo_id={manifest['dataset_repo_id']}",
         f"--dataset.revision={manifest['dataset_revision']}",
-        "--rename_map=" + json.dumps(
-            LIBERO_TO_PI05_BASE_RENAME_MAP, separators=(",", ":")),
         f"--policy.path={source_model}",
         f"--policy.repo_id={args.policy_repo_id}",
         "--policy.push_to_hub=true",
@@ -307,7 +416,7 @@ def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = 
         f"--output_dir={args.output_dir}",
         f"--job_name=pi05_diverse_m{args.member}",
         f"--seed={member_seed}",
-        f"--steps={args.steps}",
+        f"--steps={session_steps if session_steps is not None else args.steps}",
         f"--batch_size={args.batch_size}",
         f"--num_workers={args.num_workers}",
         "--eval_freq=0",
@@ -316,6 +425,18 @@ def build_lerobot_args(args, manifest: dict, *, source_model_path: str | None = 
         f"--save_checkpoint={str(not args.no_checkpoints).lower()}",
         f"--wandb.enable={str(args.wandb).lower()}",
     ]
+    if manifest["source_model"] == "lerobot/pi05_base":
+        values.insert(2, "--rename_map=" + json.dumps(
+            LIBERO_TO_PI05_BASE_RENAME_MAP, separators=(",", ":")))
+    if getattr(args, "learning_rate", None) is not None:
+        values.append(f"--policy.optimizer_lr={args.learning_rate}")
+    if getattr(args, "scheduler_warmup_steps", None) is not None:
+        values.append(f"--policy.scheduler_warmup_steps={args.scheduler_warmup_steps}")
+    if getattr(args, "scheduler_decay_steps", None) is not None:
+        values.append(f"--policy.scheduler_decay_steps={args.scheduler_decay_steps}")
+    if getattr(args, "scheduler_decay_lr", None) is not None:
+        values.append(f"--policy.scheduler_decay_lr={args.scheduler_decay_lr}")
+    return values
 
 
 def main(argv=None) -> int:
@@ -324,17 +445,18 @@ def main(argv=None) -> int:
     from huggingface_hub.constants import HF_HOME
 
     os.environ.setdefault("HF_LEROBOT_HOME", str(HF_HOME))
-    from pnp.diversity import (DIVERSITY_SOURCE_MODEL, bootstrap_manifest_summary,
-                               install_bootstrap_sampler, load_bootstrap_manifest,
-                               require_full_finetune_gpu)
+    from pnp.diversity import (bootstrap_manifest_summary, install_bootstrap_sampler,
+                               load_bootstrap_manifest, require_full_finetune_gpu)
 
     manifest = load_bootstrap_manifest(args.manifest)
-    if manifest["source_model"] != DIVERSITY_SOURCE_MODEL:
+    if manifest["source_model"] not in SUPPORTED_SOURCE_MODELS:
         raise ValueError(
-            f"This experiment must start from raw {DIVERSITY_SOURCE_MODEL}; manifest requests "
-            f"{manifest['source_model']}. Build a fresh shared manifest.")
+            f"unsupported diversity source model {manifest['source_model']!r}; expected one of "
+            f"{sorted(SUPPORTED_SOURCE_MODELS)}")
     if not manifest.get("dataset_revision") or not manifest.get("source_model_revision"):
         raise ValueError("real training requires pinned dataset and source-model revisions")
+    if args.resume and args.model_only_recovery_dir is not None:
+        raise ValueError("full optimizer resume and model-only recovery are mutually exclusive")
     if not args.expert_only:
         print("Full-model fine-tune preflight:", require_full_finetune_gpu())
     else:
@@ -348,9 +470,26 @@ def main(argv=None) -> int:
            "save_freq_requested": args.save_freq,
            "checkpoints_enabled": not args.no_checkpoints})
 
-    from huggingface_hub import snapshot_download
-    source_model_path = snapshot_download(
-        repo_id=manifest["source_model"], revision=manifest["source_model_revision"])
+    start_step = 0
+    recovered = None
+    if args.model_only_recovery_dir is not None:
+        recovered = load_model_only_recovery(
+            args.model_only_recovery_dir,
+            manifest_hash=manifest["manifest_hash"], member_index=args.member,
+            target_steps=args.steps)
+    if recovered is None:
+        from huggingface_hub import snapshot_download
+        source_model_path = snapshot_download(
+            repo_id=manifest["source_model"], revision=manifest["source_model_revision"])
+    else:
+        source_model_path, start_step = recovered
+    session_steps = int(args.steps) - int(start_step)
+    if session_steps <= 0:
+        raise RuntimeError(
+            f"nothing to train: recovery already records {start_step}/{args.steps} steps")
+    print({"global_start_step": start_step, "session_steps": session_steps,
+           "global_target_steps": args.steps, "training_source_path": str(source_model_path)})
+
     trainer = install_bootstrap_sampler(manifest, args.member)
     if args.checkpoint_mirror_dir is not None:
         if args.resume:
@@ -364,25 +503,39 @@ def main(argv=None) -> int:
                     f"{args.checkpoint_mirror_dir}")
         trainer = install_checkpoint_mirroring(
             trainer, args.checkpoint_mirror_dir, keep_local=args.wandb)
-    if not args.resume:
+    if (not args.resume and start_step == 0
+            and manifest["source_model"] == "lerobot/pi05_base"):
         trainer = install_fresh_pi05_processors(
             trainer, LIBERO_TO_PI05_BASE_RENAME_MAP)
+    shared_metadata = {
+        "member_index": args.member,
+        "manifest_hash": manifest["manifest_hash"],
+        "source_model": manifest["source_model"],
+        "source_model_revision": manifest["source_model_revision"],
+        "dataset_revision": manifest["dataset_revision"],
+        "policy_repo_id": args.policy_repo_id,
+    }
+    if args.model_only_recovery_dir is not None:
+        trainer = install_model_only_recovery(
+            trainer, args.model_only_recovery_dir,
+            every_steps=args.model_only_recovery_freq,
+            start_step=start_step, target_steps=args.steps,
+            metadata=shared_metadata)
     if args.final_drive_dir is not None:
         trainer = install_final_drive_export(
             trainer,
             args.final_drive_dir,
             metadata={
-                "member_index": args.member,
+                **shared_metadata,
                 "training_completed_steps": args.steps,
-                "manifest_hash": manifest["manifest_hash"],
-                "source_model": manifest["source_model"],
-                "source_model_revision": manifest["source_model_revision"],
-                "dataset_revision": manifest["dataset_revision"],
-                "policy_repo_id": args.policy_repo_id,
+                "session_start_step": start_step,
+                "session_training_steps": session_steps,
             },
+            cleanup_recovery_dir=args.model_only_recovery_dir,
         )
     lerobot_args = build_lerobot_args(
-        args, manifest, source_model_path=source_model_path)
+        args, manifest, source_model_path=str(source_model_path),
+        session_steps=session_steps)
     print("LeRobot training arguments:")
     print("\n".join(f"  {value}" for value in lerobot_args))
     sys.argv = ["lerobot-train", *lerobot_args]
