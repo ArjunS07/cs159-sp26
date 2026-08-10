@@ -1,6 +1,8 @@
 """Generate the two-model bootstrap training, PRO collection, and analysis notebooks."""
 from __future__ import annotations
 
+import copy
+
 from nb_common import ROOT, bootstrap, code, md, notebook, write_notebook
 
 
@@ -325,6 +327,50 @@ run_diversity_signal_worker(
     ], f"18_diversity_signal_model_{member_index}.ipynb")
 
 
+def collection_v2_notebook(member_index: int):
+    return notebook([
+        md(f"""# 18 v2 — Diversity-signal LIBERO-PRO worker: model {member_index}
+
+This evaluates one LIBERO-finetuned/bootstrap v2 member on the same deterministic 65-identity
+shard used for the raw-base v1 pilot: 13 suites and five identities per suite. Run both v2 model
+workers before analysis. Supabase labels are isolated under `pi05-diversity-signal-v2-*`."""),
+        md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
+        md("## 2. Configuration and collection"),
+        code(f'''from pathlib import Path
+from google.colab import drive
+from huggingface_hub import HfApi
+from pnp.config import PI05_REPO_ID
+from pnp.diversity import (DIVERSITY_V2_EXPERIMENT_PREFIX,
+    load_bootstrap_manifest, run_diversity_signal_worker)
+
+drive.mount("/content/drive")
+
+MEMBER_INDEX = {member_index}
+HF_USER = HfApi().whoami()["name"]
+MODEL_REPO = f"{{HF_USER}}/pi05-libero-ft-bootstrap-m{{MEMBER_INDEX}}-v2"
+EPISODES_PER_TASK = 2
+SHARD_COUNT = 4
+SHARD_INDEX = 0
+EXPERIMENT_PREFIX = DIVERSITY_V2_EXPERIMENT_PREFIX
+MANIFEST_PATH = Path(
+    "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
+manifest = load_bootstrap_manifest(MANIFEST_PATH)
+assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+
+print({{"member": MEMBER_INDEX, "model_repo": MODEL_REPO,
+       "experiment_prefix": EXPERIMENT_PREFIX,
+       "episodes_per_task": EPISODES_PER_TASK,
+       "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+       "manifest_hash": manifest["manifest_hash"]}})
+run_diversity_signal_worker(
+    member_index=MEMBER_INDEX, model_repo_id=MODEL_REPO,
+    episodes_per_task=EPISODES_PER_TASK,
+    shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+    manifest_hash=manifest["manifest_hash"],
+    experiment_prefix=EXPERIMENT_PREFIX)'''),
+    ], f"18_diversity_signal_v2_model_{member_index}.ipynb")
+
+
 ANALYZE = notebook([
     md("""# 19 — Analyze the two-model diversity signal
 
@@ -391,6 +437,30 @@ print("Whole-episode selector is POST-HOC only: %.1f%%" %
 ], "19_analyze_diversity_signal.ipynb")
 
 
+ANALYZE_V2 = copy.deepcopy(ANALYZE)
+ANALYZE_V2["metadata"]["colab"]["name"] = "19_analyze_diversity_signal_v2.ipynb"
+for cell in ANALYZE_V2["cells"]:
+    source = cell.get("source", "")
+    source = source.replace(
+        "# 19 — Analyze the two-model diversity signal",
+        "# 19 v2 — Analyze the fine-tuned two-model diversity signal")
+    source = source.replace(
+        "measures complementarity rather than an achievable policy.",
+        "measures complementarity rather than an achievable policy.\n\n"
+        "This notebook fetches only `pi05-diversity-signal-v2-m0/m1`; v1 rows are excluded.")
+    source = source.replace(
+        'OUTPUT = Path("diversity_signal_outputs")',
+        'EXPERIMENT_PREFIX = "pi05-diversity-signal-v2"\n'
+        'OUTPUT = Path("diversity_signal_v2_outputs")')
+    source = source.replace(
+        "rollouts, steps = fetch_diversity_signal(store)",
+        "rollouts, steps = fetch_diversity_signal(\n"
+        "    store, experiment_prefix=EXPERIMENT_PREFIX)\n"
+        "expected = [f\"{EXPERIMENT_PREFIX}-m0\", f\"{EXPERIMENT_PREFIX}-m1\"]\n"
+        "assert sorted(rollouts.experiment.unique()) == expected")
+    cell["source"] = source
+
+
 def main():
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05.ipynb", TRAIN)
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05_v2.ipynb", TRAIN_V2)
@@ -398,7 +468,11 @@ def main():
         write_notebook(ROOT / "notebooks" / "workers" /
                        f"18_diversity_signal_model_{member_index}.ipynb",
                        collection_notebook(member_index))
+        write_notebook(ROOT / "notebooks" / "workers" /
+                       f"18_diversity_signal_v2_model_{member_index}.ipynb",
+                       collection_v2_notebook(member_index))
     write_notebook(ROOT / "notebooks" / "19_analyze_diversity_signal.ipynb", ANALYZE)
+    write_notebook(ROOT / "notebooks" / "19_analyze_diversity_signal_v2.ipynb", ANALYZE_V2)
 
 
 if __name__ == "__main__":

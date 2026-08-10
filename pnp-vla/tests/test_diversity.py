@@ -7,9 +7,10 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-from pnp.diversity import (analyze_diversity_signal, bootstrap_manifest_summary,
+from pnp.diversity import (DIVERSITY_EXPERIMENT_PREFIX, DIVERSITY_V2_EXPERIMENT_PREFIX,
+                           analyze_diversity_signal, bootstrap_manifest_summary,
                            bootstrap_sampler_class, build_bootstrap_manifest,
-                           validate_bootstrap_manifest)
+                           diversity_experiment, validate_bootstrap_manifest)
 
 
 def _training_module():
@@ -28,6 +29,16 @@ def _episode_rows():
         {"episode_index": 3, "tasks": ["task b"]},
         {"episode_index": 4, "tasks": ["task b"]},
     ]
+
+
+def test_diversity_experiment_prefixes_keep_v1_and_v2_isolated():
+    assert diversity_experiment(0) == f"{DIVERSITY_EXPERIMENT_PREFIX}-m0"
+    assert diversity_experiment(
+        1, DIVERSITY_V2_EXPERIMENT_PREFIX) == f"{DIVERSITY_V2_EXPERIMENT_PREFIX}-m1"
+    with np.testing.assert_raises_regex(ValueError, "member_index"):
+        diversity_experiment(2, DIVERSITY_V2_EXPERIMENT_PREFIX)
+    with np.testing.assert_raises_regex(ValueError, "cannot be empty"):
+        diversity_experiment(0, "")
 
 
 def test_task_stratified_bootstrap_is_deterministic_and_preserves_every_task():

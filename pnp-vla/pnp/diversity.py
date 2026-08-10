@@ -25,6 +25,7 @@ DIVERSITY_SOURCE_MODEL = "lerobot/pi05_base"
 DIVERSITY_EXPECTED_TASKS = 40
 DIVERSITY_EXPECTED_EPISODES = 1693
 DIVERSITY_EXPERIMENT_PREFIX = "pi05-diversity-signal-v1"
+DIVERSITY_V2_EXPERIMENT_PREFIX = "pi05-diversity-signal-v2"
 DIVERSITY_PAIR_KEYS = ["suite", "task_idx", "episode_idx", "init_state_hash"]
 
 
@@ -276,14 +277,22 @@ def require_full_finetune_gpu(*, minimum_gib: float = 70.0) -> dict:
     return {"gpu": props.name, "memory_gib": total_gib}
 
 
-def diversity_experiment(member_index: int) -> str:
-    return f"{DIVERSITY_EXPERIMENT_PREFIX}-m{int(member_index)}"
+def diversity_experiment(member_index: int,
+                         experiment_prefix: str = DIVERSITY_EXPERIMENT_PREFIX) -> str:
+    member_index = int(member_index)
+    if member_index not in (0, 1):
+        raise ValueError("diversity member_index must be 0 or 1")
+    experiment_prefix = str(experiment_prefix).strip()
+    if not experiment_prefix:
+        raise ValueError("diversity experiment_prefix cannot be empty")
+    return f"{experiment_prefix}-m{member_index}"
 
 
 def run_diversity_signal_worker(*, member_index: int, model_repo_id: str,
                                 shard_count: int = 1, shard_index: int = 0,
                                 episodes_per_task: int = 2,
-                                manifest_hash: str = ""):
+                                manifest_hash: str = "",
+                                experiment_prefix: str = DIVERSITY_EXPERIMENT_PREFIX):
     """Collect one model's matched 13-suite PRO rollouts with K=5 uncertainty telemetry."""
     from . import models
     from .config import Method, RolloutConfig
@@ -303,14 +312,16 @@ def run_diversity_signal_worker(*, member_index: int, model_repo_id: str,
     policy, preprocess, postprocess = models.load_pi05(
         repo_id=model_repo_id, revision=model_revision)
     device, store = models.default_device(), SupabaseStore()
-    experiment = diversity_experiment(member_index)
+    experiment = diversity_experiment(member_index, experiment_prefix)
     _run_collection(
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
         device=device, experiment=experiment, episodes=episodes,
-        methods=[(Method.UNCERTAINTY, config)], cohort=f"diversity_m{member_index}",
+        methods=[(Method.UNCERTAINTY, config)],
+        cohort=f"{experiment_prefix}_m{member_index}",
         shard_count=shard_count, shard_index=shard_index,
         benchmark="libero_pro", driver="pi05_diversity_signal",
         run_metadata={"member_index": int(member_index), "model_repo_id": model_repo_id,
+                      "experiment_prefix": experiment_prefix,
                       "bootstrap_manifest_hash": manifest_hash,
                       "model_revision": model_revision, "pnp_k": 5,
                       "pnp_steps": [3, 4], "episodes_per_task": episodes_per_task},
@@ -329,10 +340,11 @@ def _fetch_for_rollouts(store, table: str, rollout_ids: list[str], columns: str 
     return rows
 
 
-def fetch_diversity_signal(store) -> tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_diversity_signal(store, *, experiment_prefix: str = DIVERSITY_EXPERIMENT_PREFIX
+                           ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rollout_frames, step_frames = [], []
     for member_index in (0, 1):
-        experiment = diversity_experiment(member_index)
+        experiment = diversity_experiment(member_index, experiment_prefix)
         rows = store.fetch_all(
             "rollouts", "*", configure=lambda query, exp=experiment: query.eq("experiment", exp),
             order_by=("rollout_id",))
