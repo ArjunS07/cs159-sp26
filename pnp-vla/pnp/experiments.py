@@ -287,7 +287,7 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
 def _run_collection(*, store, policy, preprocess, postprocess, device, experiment, episodes,
                     methods, cohort, shard_count, shard_index,
                     benchmark="libero", driver="hybrid_schedules", run_metadata=None,
-                    report_every=50, provenance=None):
+                    report_every=50, provenance=None, initial_tally=None):
     from tqdm.auto import tqdm
     from .rollout import iter_task_envs, run_episode
 
@@ -313,6 +313,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     completed = 0
     method_names = [name for name, _ in methods]
     tally = collections.defaultdict(lambda: [0, 0])   # (suite, method) -> [n, successes]
+    for key, counts in (initial_tally or {}).items():
+        tally[key] = [int(counts[0]), int(counts[1])]
     try:
         with tqdm(total=pending, desc=f"{cohort}[{shard_index}]", unit="rollout",
                   dynamic_ncols=True) as progress:

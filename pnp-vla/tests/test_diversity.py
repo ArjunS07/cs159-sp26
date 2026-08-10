@@ -7,10 +7,15 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
+from pnp.config import RolloutConfig
 from pnp.diversity import (DIVERSITY_EXPERIMENT_PREFIX, DIVERSITY_V2_EXPERIMENT_PREFIX,
-                           analyze_diversity_signal, bootstrap_manifest_summary,
+                           analyze_diversity_selective_refinement, analyze_diversity_signal,
+                           bootstrap_manifest_summary,
                            bootstrap_sampler_class, build_bootstrap_manifest,
-                           diversity_experiment, validate_bootstrap_manifest)
+                           diversity_baseline_cohort, diversity_experiment,
+                           diversity_model_source,
+                           diversity_selective_refinement_figures,
+                           validate_bootstrap_manifest)
 
 
 def _training_module():
@@ -447,3 +452,121 @@ def test_diversity_signal_reports_oracle_and_first_chunk_selector():
     assert np.isclose(summary.lower_first_chunk_u_sr, .75)
     assert np.isclose(summary.lower_first_chunk_u_accuracy_discordant, 1.)
     assert np.isclose(summary.lower_first_chunk_u_win_auc, 1.)
+
+
+def test_diversity_model_source_requires_one_immutable_baseline_revision():
+    class Store:
+        @staticmethod
+        def fetch_all(*args, **kwargs):
+            return [
+                {"model_repo_id": "user/member-0", "model_revision": "abc"},
+                {"model_repo_id": "user/member-0", "model_revision": "abc"},
+            ]
+
+    assert diversity_model_source(Store(), member_index=0) == ("user/member-0", "abc")
+
+    class MixedStore:
+        @staticmethod
+        def fetch_all(*args, **kwargs):
+            return [
+                {"model_repo_id": "user/member-0", "model_revision": "abc"},
+                {"model_repo_id": "user/member-0", "model_revision": "changed"},
+            ]
+
+    with np.testing.assert_raises_regex(ValueError, "exactly one recorded model source"):
+        diversity_model_source(MixedStore(), member_index=0)
+
+
+def test_refinement_backfill_reuses_the_existing_baseline_logical_config():
+    original = RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, save_trajectory=True,
+        save_generated_chunks=True, skip_unused_renders=True, render_lead=2)
+    backfill_baseline = RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, save_trajectory=True,
+        save_generated_chunks=True, skip_unused_renders=True, render_lead=2)
+    refinement = RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, save_trajectory=True,
+        skip_unused_renders=True, render_lead=2, refine=True)
+
+    assert original.logical_dict() == backfill_baseline.logical_dict()
+    assert original.logical_dict() != refinement.logical_dict()
+
+
+def test_refinement_cohort_is_exactly_ten_per_suite_and_matched_between_members():
+    suites = [f"libero_suite_{index}" for index in range(13)]
+    rows = [{
+        "rollout_id": f"{suite}-{episode_idx}", "suite": suite,
+        "task_idx": episode_idx, "episode_idx": 0,
+        "init_state_hash": f"{suite}-{episode_idx}", "status": "completed",
+        "success": episode_idx % 2 == 0, "method": "pnp_uncertainty_only",
+        "pnp_k": 5, "pnp_step_indices": [3, 4],
+    } for suite in suites for episode_idx in range(10)]
+
+    class Store:
+        calls = 0
+
+        def fetch_all(self, *args, **kwargs):
+            self.calls += 1
+            return copy.deepcopy(rows)
+
+    cohort = diversity_baseline_cohort(Store(), expected_per_suite=10)
+    assert len(cohort) == 260
+    assert set(cohort.groupby(["member_index", "suite"]).size()) == {10}
+
+    class ShortStore(Store):
+        def fetch_all(self, *args, **kwargs):
+            result = super().fetch_all(*args, **kwargs)
+            return result[:-1] if self.calls == 2 else result
+
+    with np.testing.assert_raises_regex(ValueError, "must contain 10 baselines"):
+        diversity_baseline_cohort(ShortStore(), expected_per_suite=10)
+
+
+def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
+    identities = [
+        {"suite": "libero_goal_swap" if index % 2 == 0 else "libero_object_swap",
+         "task_idx": 0, "episode_idx": index, "init_state_hash": str(index)}
+        for index in range(4)
+    ]
+    baseline = {0: [True, False, True, False], 1: [True, True, False, False]}
+    refined = {0: [True, True, True, False], 1: [True, False, False, True]}
+    uncertainty = {0: [.02, .04, .025, .05], 1: [.03, .02, .04, .04]}
+    rows, steps = [], []
+    for member in (0, 1):
+        for method, outcomes in (("pnp_uncertainty_only", baseline[member]),
+                                 ("pnp_refinement", refined[member])):
+            for index, identity in enumerate(identities):
+                rollout_id = f"m{member}-{method}-{index}"
+                rows.append({
+                    **identity, "member_index": member, "rollout_id": rollout_id,
+                    "method": method, "success": outcomes[index], "status": "completed",
+                    "u_mean_episode": uncertainty[member][index] + .0035,
+                })
+                for chunk_idx in range(8):
+                    for euler_step in (3, 4):
+                        steps.append({
+                            "member_index": member, "rollout_id": rollout_id,
+                            "chunk_idx": chunk_idx, "euler_step": euler_step,
+                            "u_mean": uncertainty[member][index] + .001 * chunk_idx,
+                        })
+    tables = analyze_diversity_selective_refinement(
+        pd.DataFrame(rows), pd.DataFrame(steps), grid_size=5, min_window=1)
+    overall = tables["selective_refinement_overall"].set_index("score_name")
+    first = overall.loc["first_chunk"]
+    assert first.n_pairs == 4
+    assert np.isclose(first.lower_u_baseline_sr, .75)
+    assert np.isclose(first.fixed_threshold_sr, 1.)
+    assert first.n_refined_fixed == 1
+    assert first.fixed_F_to_S == 1
+    assert first.fixed_S_to_F == 0
+    assert set(["first_chunk", "prefix_2_chunks", "prefix_4_chunks",
+                "prefix_8_chunks", "full_episode"]) <= set(overall.index)
+    assert len(tables["selective_refinement_loso_folds"].held_out_suite.unique()) == 2
+    figures = diversity_selective_refinement_figures(tables, tmp_path)
+    assert {path.name for path in figures} == {
+        "selective_refinement_by_horizon.png",
+        "selective_refinement_by_chunk.png",
+        "selective_refinement_first_chunk_by_suite.png",
+        "selective_refinement_window_first_chunk.png",
+        "selective_refinement_window_full_episode.png",
+    }

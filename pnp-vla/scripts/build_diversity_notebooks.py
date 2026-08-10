@@ -371,6 +371,53 @@ run_diversity_signal_worker(
     ], f"18_diversity_signal_v2_model_{member_index}.ipynb")
 
 
+def selective_refinement_v2_notebook(member_index: int):
+    return notebook([
+        md(f"""# 20 v2 - Selective-refinement LIBERO-PRO worker: model {member_index}
+
+This backfills the established K=5, Euler-steps `(3,4)`, refine-last arm for the exact 130
+identities already collected by the v2 diversity-signal workers. It requests both baseline and
+refinement under the existing `pi05-diversity-signal-v2-m{member_index}` experiment. Supabase
+rollout IDs are behavior-derived, so completed uncertainty-only rows are skipped and only missing
+rows execute.
+
+The model repository and immutable revision are read from the existing baseline run metadata.
+This fails rather than silently evaluating a newer Hub upload. Run `SHARD_INDEX=0,1,2,3`; each
+completed shard is resumable. Every ten new rollouts, the worker prints the stored baseline SR,
+current refinement SR, and historical reference SR by suite."""),
+        md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
+        md("## 2. Configuration and resumable collection"),
+        code(f'''from pathlib import Path
+from google.colab import drive
+from pnp.config import PI05_REPO_ID
+from pnp.diversity import (DIVERSITY_V2_EXPERIMENT_PREFIX,
+    load_bootstrap_manifest, run_diversity_refinement_worker)
+
+drive.mount("/content/drive")
+
+MEMBER_INDEX = {member_index}
+EXPECTED_EPISODES_PER_SUITE = 10  # exact 130 stored baseline identities/member
+SHARD_COUNT = 4
+SHARD_INDEX = 0                # run 0, 1, 2, 3 for this member
+EXPERIMENT_PREFIX = DIVERSITY_V2_EXPERIMENT_PREFIX
+MANIFEST_PATH = Path(
+    "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
+manifest = load_bootstrap_manifest(MANIFEST_PATH)
+assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+
+print({{"member": MEMBER_INDEX, "experiment_prefix": EXPERIMENT_PREFIX,
+       "expected_episodes_per_suite": EXPECTED_EPISODES_PER_SUITE,
+       "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+       "manifest_hash": manifest["manifest_hash"]}})
+run_diversity_refinement_worker(
+    member_index=MEMBER_INDEX,
+    expected_episodes_per_suite=EXPECTED_EPISODES_PER_SUITE,
+    shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+    manifest_hash=manifest["manifest_hash"],
+    experiment_prefix=EXPERIMENT_PREFIX)'''),
+    ], f"20_diversity_selective_refinement_v2_model_{member_index}.ipynb")
+
+
 ANALYZE = notebook([
     md("""# 19 — Analyze the two-model diversity signal
 
@@ -461,6 +508,109 @@ for cell in ANALYZE_V2["cells"]:
     cell["source"] = source
 
 
+ANALYZE_SELECTIVE_REFINEMENT_V2 = notebook([
+    md("""# 21 - Analyze two-model selective refinement (v2)
+
+This notebook combines the existing uncertainty-only arms with the matched K=5 `(3,4)`
+refine-last arms for both competent v2 models. The primary predeclared policy uses first-chunk
+uncertainty: select the lower-U model, refine it for the episode only when U is at least `0.03`.
+
+Prefix, individual-chunk, and full-episode summaries are also analyzed. Only the first-chunk rule
+is directly deployable from these independently simulated trajectories. Later scores are useful
+post-hoc evidence about predictiveness and headroom, but they are not presented as an online
+policy. The best in-sample window is exploratory; leave-one-suite-out (LOSO) window selection is
+reported separately to reduce threshold-selection optimism."""),
+    md("## 1. Setup"), code(bootstrap(extras="analysis", setup_env=False)),
+    md("## 2. Fetch and validate the exact four-arm cohort"),
+    code(r'''from pathlib import Path
+import pandas as pd
+from IPython.display import display, Image
+from pnp.config import Method
+from pnp.store import SupabaseStore
+from pnp.diversity import (DIVERSITY_FIXED_REFINEMENT_THRESHOLD,
+    DIVERSITY_V2_EXPERIMENT_PREFIX, analyze_diversity_selective_refinement,
+    diversity_selective_refinement_figures, fetch_diversity_selective_refinement)
+
+EXPERIMENT_PREFIX = DIVERSITY_V2_EXPERIMENT_PREFIX
+FIXED_THRESHOLD = DIVERSITY_FIXED_REFINEMENT_THRESHOLD  # predeclared 0.03
+OUTPUT = Path("diversity_selective_refinement_v2_outputs")
+OUTPUT.mkdir(exist_ok=True)
+
+store = SupabaseStore()
+rollouts, steps = fetch_diversity_selective_refinement(
+    store, experiment_prefix=EXPERIMENT_PREFIX)
+counts = (rollouts.groupby(["member_index", "method"]).size()
+          .rename("n").reset_index())
+display(counts)
+expected_methods = {Method.UNCERTAINTY, Method.REFINEMENT}
+assert set(rollouts.method) == expected_methods
+assert set(counts.n) == {130}, "Expected 130 matched identities in every member/method arm"
+assert len(rollouts) == 520
+print({"rollouts": len(rollouts), "step_rows": len(steps),
+       "experiments": sorted(rollouts.experiment.unique()),
+       "fixed_threshold": FIXED_THRESHOLD})'''),
+    md("## 3. Build matched policies and uncertainty-horizon analyses"),
+    code(r'''tables = analyze_diversity_selective_refinement(
+    rollouts, steps, fixed_threshold=FIXED_THRESHOLD)
+
+overall = tables["selective_refinement_overall"]
+horizons = ["first_chunk", "prefix_2_chunks", "prefix_4_chunks",
+            "prefix_8_chunks", "full_episode"]
+columns = ["score_name", "interpretation", "n_pairs", "best_fixed_member_sr",
+           "lower_u_baseline_sr", "lower_u_refine_all_sr",
+           "n_refined_fixed", "fixed_threshold_sr",
+           "fixed_delta_vs_lower_u_pp", "fixed_delta_ci_low_pp",
+           "fixed_delta_ci_high_pp", "fixed_F_to_S", "fixed_S_to_F"]
+print("Primary 0.03 gate and uncertainty-horizon results")
+display(overall[overall.score_name.isin(horizons)][columns])
+
+print("Individual chunks (chunk 0 is deployable; later chunks are post-hoc here)")
+display(overall[overall.signal_kind == "individual_chunk"][columns])'''),
+    md("""## 4. Exploratory windows and cross-validated estimate
+
+The top-window table is selected and evaluated on the same data, so it is an optimistic discovery
+tool. LOSO chooses a window on 12 suites and applies it once to the held-out suite; its pooled
+delta is the more defensible estimate of whether a learned window transfers."""),
+    code(r'''top = tables["selective_refinement_top_windows"]
+print("Top in-sample windows")
+display(top[(top.score_name.isin(horizons)) & (top["rank"] <= 5)][
+    ["score_name", "rank", "lower", "upper", "n_refined", "selective_sr",
+     "delta_pp", "selected_F_to_S", "selected_S_to_F"]])
+
+print("Leave-one-suite-out window selection")
+display(tables["selective_refinement_loso_summary"])
+
+print("Primary first-chunk fixed-threshold result by suite")
+by_suite = tables["selective_refinement_fixed_by_suite"]
+display(by_suite[by_suite.score_name == "first_chunk"][[
+    "suite", "n_pairs", "lower_u_baseline_sr", "n_refined_fixed",
+    "fixed_threshold_sr", "fixed_delta_vs_lower_u_pp", "fixed_F_to_S", "fixed_S_to_F"]])'''),
+    md("## 5. Save tables and figures"),
+    code(r'''for name, frame in tables.items():
+    frame.to_csv(OUTPUT / f"{name}.csv", index=False)
+paths = diversity_selective_refinement_figures(tables, OUTPUT / "figures")
+for path in paths:
+    print(path.name)
+    display(Image(filename=str(path)))'''),
+    md("## 6. Concise readout"),
+    code(r'''overall = tables["selective_refinement_overall"].set_index("score_name")
+loso = tables["selective_refinement_loso_summary"].set_index("score_name")
+for score_name in ("first_chunk", "full_episode"):
+    row, cv = overall.loc[score_name], loso.loc[score_name]
+    print(score_name.replace("_", " "))
+    print("  lower-U baseline: %.1f%%" % (100 * row.lower_u_baseline_sr))
+    print("  fixed U >= %.2f: %.1f%% (%+.1f pp; F->S=%d, S->F=%d)" %
+          (row.fixed_threshold, 100 * row.fixed_threshold_sr,
+           row.fixed_delta_vs_lower_u_pp, row.fixed_F_to_S, row.fixed_S_to_F))
+    print("  refine selected model always: %.1f%% (%+.1f pp)" %
+          (100 * row.lower_u_refine_all_sr, row.refine_all_delta_vs_lower_u_pp))
+    print("  LOSO window: %.1f%% (%+.1f pp, CI [%+.1f, %+.1f])" %
+          (100 * cv.loso_selective_sr, cv.delta_pp,
+           cv.delta_ci_low_pp, cv.delta_ci_high_pp))
+print("\nInterpretation: first chunk is deployable; full episode and later chunks are post-hoc.")'''),
+], "21_analyze_diversity_selective_refinement_v2.ipynb")
+
+
 def main():
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05.ipynb", TRAIN)
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05_v2.ipynb", TRAIN_V2)
@@ -471,8 +621,14 @@ def main():
         write_notebook(ROOT / "notebooks" / "workers" /
                        f"18_diversity_signal_v2_model_{member_index}.ipynb",
                        collection_v2_notebook(member_index))
+        write_notebook(ROOT / "notebooks" / "workers" /
+                       f"20_diversity_selective_refinement_v2_model_{member_index}.ipynb",
+                       selective_refinement_v2_notebook(member_index))
     write_notebook(ROOT / "notebooks" / "19_analyze_diversity_signal.ipynb", ANALYZE)
     write_notebook(ROOT / "notebooks" / "19_analyze_diversity_signal_v2.ipynb", ANALYZE_V2)
+    write_notebook(ROOT / "notebooks" /
+                   "21_analyze_diversity_selective_refinement_v2.ipynb",
+                   ANALYZE_SELECTIVE_REFINEMENT_V2)
 
 
 if __name__ == "__main__":
