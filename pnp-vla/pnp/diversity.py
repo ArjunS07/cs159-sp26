@@ -397,15 +397,15 @@ def diversity_baseline_cohort(store, *, expected_per_suite: int = 10,
 
 def run_diversity_refinement_worker(*, member_index: int,
                                     shard_count: int = 4, shard_index: int = 0,
-                                    expected_episodes_per_suite: int = 10,
+                                    episodes_per_task: int = 10,
                                     manifest_hash: str = "",
                                     experiment_prefix: str = DIVERSITY_V2_EXPERIMENT_PREFIX):
-    """Backfill matched K=5 (3,4) refinement beside an existing diversity baseline.
+    """Collect a 10-episode/task K=5 (3,4) baseline/refinement cohort.
 
     Both arms are requested deliberately. Their IDs are behavior-derived, so completed
-    uncertainty-only rows are skipped and only missing baseline/refinement rows execute. The model
-    repo and immutable revision come from the existing baseline experiment, preventing a later Hub
-    upload from silently changing the paired policy.
+    uncertainty-only/refinement rows are skipped and only missing rows execute. The model repo and
+    immutable revision come from the existing baseline experiment, preventing a later Hub upload
+    from silently changing the paired policy.
     """
     from . import models
     from .config import Method, RolloutConfig
@@ -416,34 +416,39 @@ def run_diversity_refinement_worker(*, member_index: int,
     if not manifest_hash:
         raise ValueError("manifest_hash is required; load the shared Drive manifest")
     store = SupabaseStore()
-    baseline = diversity_baseline_cohort(
-        store, expected_per_suite=expected_episodes_per_suite,
-        experiment_prefix=experiment_prefix)
     model_repo_id, model_revision = diversity_model_source(
         store, member_index=member_index, experiment_prefix=experiment_prefix)
-    baseline_member = baseline[baseline.member_index == int(member_index)].copy()
-    identity_set = set(map(tuple, baseline_member[DIVERSITY_PAIR_KEYS].to_numpy()))
-    episode_limit = int(baseline_member.episode_idx.max()) + 1
-    manifest = _prepare_libero_pro_expanded_episodes(episode_limit)
-    selected = [ep for ep in manifest if (
-        ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"]) in identity_set]
-    selected_identities = {
-        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
-        for ep in selected}
-    if selected_identities != identity_set:
+    manifest = _prepare_libero_pro_expanded_episodes(episodes_per_task)
+    expected_identities = 13 * 10 * int(episodes_per_task)
+    if len(manifest) != expected_identities:
         raise ValueError(
-            f"installed LIBERO-PRO manifest did not reproduce "
-            f"{len(identity_set - selected_identities)} stored baseline identities")
-    episodes = identity_shard(selected, shard_count, shard_index)
+            f"expected {expected_identities} identities for 13 suites x 10 tasks x "
+            f"{episodes_per_task} episodes, found {len(manifest)}")
+    episodes = identity_shard(manifest, shard_count, shard_index)
     shard_identities = {
         (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
         for ep in episodes}
-    shard_baseline = baseline_member[
-        baseline_member[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(shard_identities)]
-    initial_tally = {
+    experiment = diversity_experiment(member_index, experiment_prefix)
+    baseline_rows = store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,pnp_k,"
+        "pnp_step_indices",
+        configure=lambda query: query.eq(
+            "experiment", experiment).eq("method", Method.UNCERTAINTY),
+        order_by=("rollout_id",))
+    baseline_member = pd.DataFrame(baseline_rows)
+    if not baseline_member.empty:
+        if baseline_member.status.ne("completed").any():
+            raise ValueError(f"{experiment} contains non-completed baseline rows")
+        if set(baseline_member.pnp_k.astype(int)) != {5} or {
+                tuple(value or []) for value in baseline_member.pnp_step_indices} != {(3, 4)}:
+            raise ValueError(f"{experiment} contains a baseline other than K=5 steps (3,4)")
+        shard_baseline = baseline_member[
+            baseline_member[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(shard_identities)]
+    else:
+        shard_baseline = baseline_member
+    initial_tally = {} if shard_baseline.empty else {
         (suite, Method.UNCERTAINTY): [len(group), int(group.success.astype(bool).sum())]
-        for suite, group in shard_baseline.groupby("suite", sort=True)
-    }
+        for suite, group in shard_baseline.groupby("suite", sort=True)}
     common = dict(pnp_steps=(3, 4), pnp_k=5, save_trajectory=True,
                   skip_unused_renders=True, render_lead=2)
     methods = [
@@ -452,14 +457,14 @@ def run_diversity_refinement_worker(*, member_index: int,
     ]
     print({"member": int(member_index), "model_repo_id": model_repo_id,
            "model_revision": model_revision, "experiment_prefix": experiment_prefix,
-           "stored_cohort_size": len(identity_set), "episodes_in_shard": len(episodes),
+           "target_cohort_size": len(manifest), "episodes_in_shard": len(episodes),
            "requested_arms": [name for name, _ in methods]})
     policy, preprocess, postprocess = models.load_pi05(
         repo_id=model_repo_id, revision=model_revision)
     _run_collection(
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
         device=models.default_device(),
-        experiment=diversity_experiment(member_index, experiment_prefix),
+        experiment=experiment,
         episodes=episodes, methods=methods,
         cohort=f"{experiment_prefix}_selective_refinement_m{member_index}",
         shard_count=shard_count, shard_index=shard_index,
@@ -468,12 +473,11 @@ def run_diversity_refinement_worker(*, member_index: int,
                       "experiment_prefix": experiment_prefix,
                       "bootstrap_manifest_hash": manifest_hash,
                       "model_revision": model_revision, "pnp_k": 5,
-                      "pnp_steps": [3, 4],
-                      "expected_episodes_per_suite": expected_episodes_per_suite,
+                      "pnp_steps": [3, 4], "episodes_per_task": episodes_per_task,
                       "requested_methods": [name for name, _ in methods]},
         provenance=gather_provenance(
             model_repo_id=model_repo_id, model_revision=model_revision),
-        report_every=10, initial_tally=initial_tally,
+        report_every=50, initial_tally=initial_tally,
     )
 
 

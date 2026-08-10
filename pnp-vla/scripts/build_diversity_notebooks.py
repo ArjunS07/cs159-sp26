@@ -375,15 +375,15 @@ def selective_refinement_v2_notebook(member_index: int):
     return notebook([
         md(f"""# 20 v2 - Selective-refinement LIBERO-PRO worker: model {member_index}
 
-This backfills the established K=5, Euler-steps `(3,4)`, refine-last arm for the exact 130
-identities already collected by the v2 diversity-signal workers. It requests both baseline and
+This collects the 10-episodes-per-task subset of the 13-suite cohort: 1,300 identities per arm.
+It uses the established K=5, Euler-steps `(3,4)`, refine-last configuration and requests baseline and
 refinement under the existing `pi05-diversity-signal-v2-m{member_index}` experiment. Supabase
-rollout IDs are behavior-derived, so completed uncertainty-only rows are skipped and only missing
-rows execute.
+rollout IDs are behavior-derived, so the existing 130 baselines and any completed refinements are
+reused; only missing rows execute.
 
 The model repository and immutable revision are read from the existing baseline run metadata.
 This fails rather than silently evaluating a newer Hub upload. Run `SHARD_INDEX=0,1,2,3`; each
-completed shard is resumable. Every ten new rollouts, the worker prints the stored baseline SR,
+completed shard is resumable. Every fifty new rollouts, the worker prints the current baseline SR,
 current refinement SR, and historical reference SR by suite."""),
         md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
         md("## 2. Configuration and resumable collection"),
@@ -396,7 +396,7 @@ from pnp.diversity import (DIVERSITY_V2_EXPERIMENT_PREFIX,
 drive.mount("/content/drive")
 
 MEMBER_INDEX = {member_index}
-EXPECTED_EPISODES_PER_SUITE = 10  # exact 130 stored baseline identities/member
+EPISODES_PER_TASK = 10         # 13 suites x 10 tasks x 10 episodes = 1,300 identities/arm
 SHARD_COUNT = 4
 SHARD_INDEX = 0                # run 0, 1, 2, 3 for this member
 EXPERIMENT_PREFIX = DIVERSITY_V2_EXPERIMENT_PREFIX
@@ -406,12 +406,12 @@ manifest = load_bootstrap_manifest(MANIFEST_PATH)
 assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
 
 print({{"member": MEMBER_INDEX, "experiment_prefix": EXPERIMENT_PREFIX,
-       "expected_episodes_per_suite": EXPECTED_EPISODES_PER_SUITE,
+       "episodes_per_task": EPISODES_PER_TASK,
        "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
        "manifest_hash": manifest["manifest_hash"]}})
 run_diversity_refinement_worker(
     member_index=MEMBER_INDEX,
-    expected_episodes_per_suite=EXPECTED_EPISODES_PER_SUITE,
+    episodes_per_task=EPISODES_PER_TASK,
     shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
     manifest_hash=manifest["manifest_hash"],
     experiment_prefix=EXPERIMENT_PREFIX)'''),
@@ -544,8 +544,8 @@ counts = (rollouts.groupby(["member_index", "method"]).size()
 display(counts)
 expected_methods = {Method.UNCERTAINTY, Method.REFINEMENT}
 assert set(rollouts.method) == expected_methods
-assert set(counts.n) == {130}, "Expected 130 matched identities in every member/method arm"
-assert len(rollouts) == 520
+assert set(counts.n) == {1300}, "Expected 1,300 matched identities in every member/method arm"
+assert len(rollouts) == 5200
 print({"rollouts": len(rollouts), "step_rows": len(steps),
        "experiments": sorted(rollouts.experiment.unique()),
        "fixed_threshold": FIXED_THRESHOLD})'''),
