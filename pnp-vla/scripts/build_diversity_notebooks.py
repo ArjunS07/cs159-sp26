@@ -802,8 +802,9 @@ oracle also includes source baseline/refinement.
 The source-plus-member experiments are implementable selection rules on the recorded trajectories:
 choose the lower-uncertainty policy from `{source, model 0}` or `{source, model 1}`, then refine that
 chosen policy only when its uncertainty falls inside the swept window. Positive
-`delta_advantage_vs_source_pp` means the pair's window gain exceeds the source checkpoint's own
-best window gain at that horizon."""),
+`pair_minus_optimal_source_pp` means the resulting pair policy beats the source checkpoint after
+the source receives its own optimal uncertainty window at that same horizon. Every displayed SR
+uses the full matched episode cohort, including episodes outside the refinement window."""),
     code(r'''from pnp.diversity import analyze_source_member_ensembles
 
 # Exact episode-level oracle ceilings. These are diagnostics, not deployable policies.
@@ -846,7 +847,13 @@ oracle_summary = pd.DataFrame([{
 tables["oracle_opportunity_episodes"] = oracle_episodes
 tables["oracle_opportunity_summary"] = oracle_summary
 print("Oracle opportunity (upper bounds; outcome knowledge is not deployable)")
-display(oracle_summary)
+oracle_display = oracle_summary[[
+    "policy", "n_success", "n", "success_rate",
+    "delta_vs_best_source_window_pp"]].copy()
+oracle_display["success_rate"] *= 100
+display(oracle_display.rename(columns={
+    "success_rate": "oracle_sr_all_episodes_pct",
+    "delta_vs_best_source_window_pp": "oracle_minus_optimal_source_pp"}))
 
 # Source+m0 and source+m1: lower-U policy selection followed by a windowed refinement gate.
 source_member = analyze_source_member_ensembles(
@@ -877,15 +884,20 @@ source_member_comparison["score_name"] = pd.Categorical(
 source_member_comparison = source_member_comparison.sort_values(
     ["member_index", "score_name"])
 tables["source_member_best_window_comparison"] = source_member_comparison
-display(source_member_comparison[[
-    "ensemble", "score_name", "lower_u_baseline_sr", "best_fixed_member_sr",
-    "lower", "upper", "n_refined", "selective_sr", "delta_pp",
-    "source_window_delta_pp", "delta_advantage_vs_source_pp",
-    "source_window_sr", "window_sr_vs_source_window_pp"]].rename(columns={
-        "score_name": "uncertainty_horizon",
-        "best_fixed_member_sr": "best_fixed_pair_sr",
-        "selective_sr": "source_member_window_sr",
-        "delta_pp": "source_member_window_delta_pp"}))'''),
+source_member_display = source_member_comparison[[
+    "ensemble", "score_name", "lower", "upper", "n_refined",
+    "selective_sr", "source_window_sr", "window_sr_vs_source_window_pp"]].copy()
+source_member_display["selective_sr"] *= 100
+source_member_display["source_window_sr"] *= 100
+display(source_member_display.rename(columns={
+    "ensemble": "pair",
+    "score_name": "uncertainty_horizon",
+    "lower": "window_lower",
+    "upper": "window_upper",
+    "n_refined": "episodes_refined",
+    "selective_sr": "pair_sr_all_episodes_pct",
+    "source_window_sr": "optimal_source_sr_all_episodes_pct",
+    "window_sr_vs_source_window_pp": "pair_minus_optimal_source_pp"}))'''),
     md("""## 8. Supporting aggregation details
 
 The table below retains the five best windows per horizon so nearby alternatives can be inspected.
