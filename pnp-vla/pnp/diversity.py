@@ -1043,6 +1043,40 @@ def selective_refinement_window_sweep(policy_pairs: pd.DataFrame, *, grid_size: 
     return pd.DataFrame(rows)
 
 
+def aggregation_gate_signal_window_sweep(
+        policy_pairs: pd.DataFrame, *, grid_size: int = 25,
+        min_window: int = 10) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compare two-model uncertainty signals while keeping lower-U model selection fixed."""
+    rows = []
+    for score_name, group in policy_pairs.groupby("score_name", sort=False):
+        metadata = group.iloc[0]
+        u0, u1 = group.u_m0.to_numpy(float), group.u_m1.to_numpy(float)
+        signals = {
+            "minimum_u": np.minimum(u0, u1),
+            "mean_u": (u0 + u1) / 2,
+            "maximum_u": np.maximum(u0, u1),
+            "absolute_u_gap": np.abs(u0 - u1),
+        }
+        for signal_name, values in signals.items():
+            signal_group = group.copy()
+            signal_group["selected_u"] = values
+            rows.extend({
+                "score_name": score_name,
+                "score_order": int(metadata.score_order),
+                "interpretation": metadata.interpretation,
+                "gate_signal": signal_name,
+                "analysis_type": "exploratory_in_sample",
+                **row,
+            } for row in _window_rows(
+                signal_group, grid_size=grid_size, min_window=min_window))
+    sweep = pd.DataFrame(rows)
+    eligible = sweep[sweep.eligible & sweep.delta_pp.notna()].sort_values(
+        ["score_order", "gate_signal", "delta_pp", "n_refined", "lower", "upper"],
+        ascending=[True, True, False, False, True, True])
+    best = eligible.groupby(["score_name", "gate_signal"], sort=False).head(1).copy()
+    return sweep, best
+
+
 def selective_refinement_loso(policy_pairs: pd.DataFrame, *, grid_size: int = 25,
                               min_window: int = 10) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Choose a window on 12 suites and apply it once to the held-out suite."""
@@ -1567,4 +1601,39 @@ def diversity_selective_refinement_figures(
             fig.subplots_adjust(top=.84, bottom=.14, wspace=.28)
             path = output / f"source_vs_aggregate_window_sweep_{score_name}.png"
             fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+    if "alternative_aggregate_gate_signal_best_windows" in tables:
+        alternatives = tables["alternative_aggregate_gate_signal_best_windows"].copy()
+        alternatives["score_name"] = pd.Categorical(
+            alternatives.score_name, categories=horizon_names, ordered=True)
+        alternatives = alternatives.sort_values(["score_name", "gate_signal"])
+        x = np.arange(len(horizon_names))
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        source = alternatives[alternatives.score_name.isin(horizon_names)].copy()
+        source["score_name"] = source.score_name.astype(str)
+        source = source.drop_duplicates("score_name").set_index(
+            "score_name").reindex(horizon_names)
+        axes[0].plot(x, source.source_window_delta_pp, marker="o", lw=2.5,
+                     label="source checkpoint", color="#222222")
+        for signal_name, group in alternatives.groupby("gate_signal", observed=True):
+            group = group[group.score_name.isin(horizon_names)].copy()
+            group["score_name"] = group.score_name.astype(str)
+            group = group.drop_duplicates("score_name").set_index(
+                "score_name").reindex(horizon_names)
+            label = str(signal_name).replace("_", " ")
+            axes[0].plot(x, group.delta_pp, marker="o", label=label)
+            axes[1].plot(x, group.delta_advantage_vs_source_pp, marker="o", label=label)
+        axes[0].axhline(0, color="black", lw=1)
+        axes[0].set(ylabel="Best-window whole-cohort delta SR (pp)",
+                    title="Best correction gain")
+        axes[1].axhline(0, color="black", lw=1)
+        axes[1].set(ylabel="Aggregation delta minus source delta (pp)",
+                    title="Does a two-model signal beat source uncertainty?")
+        tick_labels = [name.replace("_", " ") for name in horizon_names]
+        for axis in axes:
+            axis.set_xticks(x, tick_labels, rotation=25, ha="right")
+            axis.legend(fontsize=8)
+        fig.suptitle("Alternative uncertainty signals for two-model refinement gating")
+        fig.tight_layout()
+        path = output / "alternative_aggregate_gate_signals.png"
+        fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
     return written

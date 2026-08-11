@@ -9,6 +9,7 @@ import pandas as pd
 
 from pnp.config import RolloutConfig
 from pnp.diversity import (DIVERSITY_EXPERIMENT_PREFIX, DIVERSITY_V2_EXPERIMENT_PREFIX,
+                           aggregation_gate_signal_window_sweep,
                            analyze_checkpoint_refinement,
                            analyze_diversity_selective_refinement, analyze_diversity_signal,
                            bootstrap_manifest_summary,
@@ -598,6 +599,21 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
          "source_window_sr": source_best.loc[score_name].selective_sr,
          "aggregate_window_sr": aggregate_best.loc[score_name].selective_sr}
         for score_name in horizons])
+    gate_sweep, gate_best = aggregation_gate_signal_window_sweep(
+        tables["selective_refinement_policy_pairs"], grid_size=5, min_window=1)
+    assert set(gate_best.gate_signal) == {
+        "minimum_u", "mean_u", "maximum_u", "absolute_u_gap"}
+    assert len(gate_best) == 4 * len(set(tables[
+        "selective_refinement_policy_pairs"].score_name))
+    source_delta = source_best.delta_pp.rename("source_window_delta_pp")
+    source_sr = source_best.selective_sr.rename("source_window_sr")
+    alternative_best = gate_best.merge(
+        pd.concat([source_delta, source_sr], axis=1),
+        left_on="score_name", right_index=True, validate="many_to_one")
+    alternative_best["delta_advantage_vs_source_pp"] = (
+        alternative_best.delta_pp - alternative_best.source_window_delta_pp)
+    tables["alternative_aggregate_gate_signal_sweep"] = gate_sweep
+    tables["alternative_aggregate_gate_signal_best_windows"] = alternative_best
     figures = diversity_selective_refinement_figures(tables, tmp_path)
     expected = {
         "member_0_refinement_delta_by_suite.png",
@@ -612,6 +628,7 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         "member_1_window_full_episode.png",
         "aggregate_selector_delta_and_auc.png",
         "aggregate_window_delta_vs_best_by_horizon.png",
+        "alternative_aggregate_gate_signals.png",
         "members_vs_source_checkpoint_by_suite.png",
         "source_vs_aggregate_best_windows.png",
         "selective_refinement_by_horizon.png",

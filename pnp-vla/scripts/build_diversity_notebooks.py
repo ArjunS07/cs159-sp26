@@ -751,7 +751,49 @@ source checkpoint gains from its own window."""),
 display(window_comparison[main_columns].rename(columns={
     "score_name": "uncertainty_horizon",
     "lower_u_baseline_sr": "aggregate_no_refinement_sr"}))'''),
-    md("""## 6. Supporting aggregation details
+    md("""## 6. Test alternative two-model uncertainty signals
+
+The executed model is still whichever member has lower uncertainty. Only the score deciding
+whether to refine changes: `minimum_u`, `(U0+U1)/2`, `maximum_u`, or `abs(U0-U1)`. Each signal gets
+its own window sweep. Positive `delta_advantage_vs_source_pp` means that signal's best aggregation
+window improves SR more than the source checkpoint's own best window."""),
+    code(r'''from pnp.diversity import aggregation_gate_signal_window_sweep
+
+gate_sweep, gate_best = aggregation_gate_signal_window_sweep(
+    tables["selective_refinement_policy_pairs"])
+source_reference = window_comparison[[
+    "score_name", "source_window_delta_pp", "source_window_sr"]]
+gate_comparison = gate_best[gate_best.score_name.isin(horizons)][[
+    "score_name", "gate_signal", "lower", "upper", "n_refined", "selective_sr",
+    "delta_pp", "delta_vs_best_fixed_pp"]].merge(
+        source_reference, on="score_name", validate="many_to_one")
+gate_comparison["delta_advantage_vs_source_pp"] = (
+    gate_comparison.delta_pp - gate_comparison.source_window_delta_pp)
+gate_comparison["window_sr_vs_source_window_pp"] = 100 * (
+    gate_comparison.selective_sr - gate_comparison.source_window_sr)
+signal_order = ["minimum_u", "mean_u", "maximum_u", "absolute_u_gap"]
+gate_comparison["score_name"] = pd.Categorical(
+    gate_comparison.score_name, categories=horizons, ordered=True)
+gate_comparison["gate_signal"] = pd.Categorical(
+    gate_comparison.gate_signal, categories=signal_order, ordered=True)
+gate_comparison = gate_comparison.sort_values(["score_name", "gate_signal"])
+signal_winners = gate_comparison.sort_values(
+    ["score_name", "delta_pp"], ascending=[True, False]).groupby(
+        "score_name", observed=True).head(1)
+tables["alternative_aggregate_gate_signal_sweep"] = gate_sweep
+tables["alternative_aggregate_gate_signal_best_windows"] = gate_comparison
+tables["alternative_aggregate_gate_signal_winners"] = signal_winners
+
+display(gate_comparison.rename(columns={
+    "score_name": "uncertainty_horizon",
+    "selective_sr": "aggregate_window_sr",
+    "delta_pp": "aggregate_window_delta_pp",
+    "delta_vs_best_fixed_pp": "aggregate_window_vs_best_member_pp"}))
+print("Best two-model gating signal at each horizon")
+display(signal_winners[[
+    "score_name", "gate_signal", "lower", "upper", "n_refined", "selective_sr",
+    "delta_pp", "source_window_delta_pp", "delta_advantage_vs_source_pp"]])'''),
+    md("""## 7. Supporting aggregation details
 
 The table below retains the five best windows per horizon so nearby alternatives can be inspected.
 The fixed `0.03` gate is shown only as a secondary predeclared comparison; it is not the main
@@ -768,11 +810,12 @@ display(overall[overall.score_name.isin(horizons)][[
     "fixed_threshold_sr", "fixed_delta_vs_lower_u_pp",
     "fixed_delta_vs_best_fixed_pp", "fixed_vs_best_ci_low_pp",
     "fixed_vs_best_ci_high_pp", "n_refined_fixed", "fixed_F_to_S", "fixed_S_to_F"]])'''),
-    md("## 7. Save tables and figures"),
+    md("## 8. Save tables and figures"),
     code(r'''for name, frame in tables.items():
     frame.to_csv(OUTPUT / f"{name}.csv", index=False)
 paths = diversity_selective_refinement_figures(tables, OUTPUT / "figures")
-primary_names = {"source_vs_aggregate_best_windows.png"} | {
+primary_names = {"source_vs_aggregate_best_windows.png",
+                 "alternative_aggregate_gate_signals.png"} | {
     f"source_vs_aggregate_window_sweep_{name}.png" for name in horizons}
 print("Primary source-versus-aggregation figures")
 for path in paths:
@@ -780,7 +823,7 @@ for path in paths:
         print(path.name)
         display(Image(filename=str(path)))
 print(f"Saved {len(paths) - len(primary_names)} additional diagnostic figures without displaying them.")'''),
-    md("## 8. Concise readout"),
+    md("## 9. Concise readout"),
     code(r'''for _, row in window_comparison.iterrows():
     print(str(row.score_name).replace("_", " "))
     print("  source window:    %5.1f%% SR (%+.2f pp over source baseline)" %
