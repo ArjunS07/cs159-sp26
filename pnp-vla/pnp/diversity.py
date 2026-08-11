@@ -1088,14 +1088,19 @@ def analyze_source_member_ensembles(
             "refined_success": "source_refined_success"})
     if source.duplicated(DIVERSITY_PAIR_KEYS + ["score_name"]).any():
         raise ValueError("source checkpoint contains duplicate score identities")
+    member_indices = sorted({int(value) for value in member_pairs.member_index.unique()})
+    if not member_indices:
+        raise ValueError("member checkpoint contains no refinement pairs")
     frames = []
-    for member_index in (0, 1):
+    members_by_index = {}
+    for member_index in member_indices:
         member = member_pairs[member_pairs.member_index == member_index][
             DIVERSITY_PAIR_KEYS + ["score_name", "score_order", "signal_kind",
                                    "interpretation", "u", "baseline_success",
                                    "refined_success"]].rename(columns={
                 "u": "u_member", "baseline_success": "member_baseline_success",
                 "refined_success": "member_refined_success"})
+        members_by_index[member_index] = member
         frame = source.merge(
             member, on=DIVERSITY_PAIR_KEYS + ["score_name"], validate="one_to_one")
         choose_source = frame.u_source.to_numpy(float) <= frame.u_member.to_numpy(float)
@@ -1117,6 +1122,47 @@ def analyze_source_member_ensembles(
         frame["u_m0"] = frame.u_source.to_numpy(float)
         frame["u_m1"] = frame.u_member.to_numpy(float)
         frames.append(frame)
+    if {0, 1}.issubset(members_by_index):
+        m0 = members_by_index[0].rename(columns={
+            "u_member": "u_member0",
+            "member_baseline_success": "member0_baseline_success",
+            "member_refined_success": "member0_refined_success"})
+        m1 = members_by_index[1].rename(columns={
+            "u_member": "u_member1",
+            "member_baseline_success": "member1_baseline_success",
+            "member_refined_success": "member1_refined_success"})
+        metadata = ["score_order", "signal_kind", "interpretation"]
+        triple = source.merge(
+            m0, on=DIVERSITY_PAIR_KEYS + ["score_name"], validate="one_to_one")
+        triple = triple.merge(
+            m1.drop(columns=metadata), on=DIVERSITY_PAIR_KEYS + ["score_name"],
+            validate="one_to_one")
+        uncertainties = np.column_stack([
+            triple.u_source.to_numpy(float), triple.u_member0.to_numpy(float),
+            triple.u_member1.to_numpy(float)])
+        baselines = np.column_stack([
+            triple.source_baseline_success.to_numpy(bool),
+            triple.member0_baseline_success.to_numpy(bool),
+            triple.member1_baseline_success.to_numpy(bool)])
+        refinements = np.column_stack([
+            triple.source_refined_success.to_numpy(bool),
+            triple.member0_refined_success.to_numpy(bool),
+            triple.member1_refined_success.to_numpy(bool)])
+        selected = uncertainties.argmin(axis=1)
+        row_indices = np.arange(len(triple))
+        best_member = 0 if baselines[:, 1].mean() >= baselines[:, 2].mean() else 1
+        triple["ensemble"] = "source_plus_m0_m1"
+        triple["member_index"] = 2
+        triple["selected_policy"] = np.asarray(["source", "model_0", "model_1"])[selected]
+        triple["selected_u"] = uncertainties[row_indices, selected]
+        triple["baseline_success"] = baselines[row_indices, selected]
+        triple["refined_success"] = refinements[row_indices, selected]
+        # These identify the strongest fixed policy among source, m0, and m1.
+        triple["model0_baseline_success"] = baselines[:, 0]
+        triple["model1_baseline_success"] = baselines[:, best_member + 1]
+        triple["u_m0"] = uncertainties[:, 0]
+        triple["u_m1"] = uncertainties[:, best_member + 1]
+        frames.append(triple)
     policy_pairs = pd.concat(frames, ignore_index=True)
 
     overall = pd.DataFrame([
@@ -1718,7 +1764,12 @@ def diversity_selective_refinement_figures(
         fig, ax = plt.subplots(figsize=(13, 5.5))
         x = np.arange(len(oracle))
         ax.bar(x, 100 * oracle.success_rate, color=colors[:len(oracle)])
-        if "source_vs_aggregate_best_windows" in tables:
+        if "optimal_source_window_sr" in oracle.columns:
+            best_source = 100 * float(oracle.optimal_source_window_sr.iloc[0])
+            ax.axhline(best_source, color="black", ls="--", lw=1.5,
+                       label=f"best source uncertainty window ({best_source:.1f}%)")
+            ax.legend(fontsize=8)
+        elif "source_vs_aggregate_best_windows" in tables:
             best_source = 100 * tables[
                 "source_vs_aggregate_best_windows"].source_window_sr.max()
             ax.axhline(best_source, color="black", ls="--", lw=1.5,
@@ -1736,21 +1787,33 @@ def diversity_selective_refinement_figures(
         comparison = tables["source_member_best_window_comparison"].copy()
         comparison["score_name"] = pd.Categorical(
             comparison.score_name, categories=horizon_names, ordered=True)
-        source = comparison.drop_duplicates("score_name").set_index(
-            "score_name").reindex(horizon_names)
         x = np.arange(len(horizon_names))
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        axes[0].plot(x, source.source_window_delta_pp, marker="o", lw=2.5,
-                     label="source alone", color="#222222")
-        axes[1].plot(x, 100 * source.source_window_sr, marker="o", lw=2.5,
-                     label="source alone", color="#222222")
-        pair_colors = {"source_plus_m0": "#4C78A8", "source_plus_m1": "#F58518"}
+        source_profiles = [
+            ("source_plus_m1", "source alone (1,300 cohort)", "-"),
+            ("source_plus_m0", "source alone (650 cohort)", "--")]
+        for ensemble, label, linestyle in source_profiles:
+            source = comparison[comparison["ensemble"].eq(ensemble)].copy()
+            if source.empty:
+                continue
+            source["score_name"] = source.score_name.astype(str)
+            source = source.drop_duplicates("score_name").set_index(
+                "score_name").reindex(horizon_names)
+            axes[0].plot(x, source.source_window_delta_pp, marker="o", lw=2,
+                         ls=linestyle, label=label, color="#222222")
+            axes[1].plot(x, 100 * source.source_window_sr, marker="o", lw=2,
+                         ls=linestyle, label=label, color="#222222")
+        pair_colors = {"source_plus_m0": "#4C78A8", "source_plus_m1": "#F58518",
+                       "source_plus_m0_m1": "#54A24B"}
+        pair_labels = {"source_plus_m0": "source + model 0",
+                       "source_plus_m1": "source + model 1",
+                       "source_plus_m0_m1": "source + models 0 and 1"}
         for ensemble in comparison["ensemble"].drop_duplicates():
             group = comparison[comparison["ensemble"].eq(ensemble)].copy()
             group["score_name"] = group.score_name.astype(str)
             group = group.drop_duplicates("score_name").set_index(
                 "score_name").reindex(horizon_names)
-            label = str(ensemble).replace("source_plus_m", "source + model ")
+            label = pair_labels.get(str(ensemble), str(ensemble))
             color = pair_colors.get(str(ensemble))
             axes[0].plot(x, group.delta_pp, marker="o", label=label, color=color)
             axes[1].plot(x, 100 * group.selective_sr, marker="o", label=label, color=color)
@@ -1763,7 +1826,7 @@ def diversity_selective_refinement_figures(
         for axis in axes:
             axis.set_xticks(x, tick_labels, rotation=25, ha="right")
             axis.legend(fontsize=8)
-        fig.suptitle("Source checkpoint paired with each fine-tuned member")
+        fig.suptitle("Source checkpoint combined with fine-tuned members")
         fig.tight_layout()
         path = output / "source_member_best_windows.png"
         fig.savefig(path, dpi=180); plt.close(fig); written.append(path)

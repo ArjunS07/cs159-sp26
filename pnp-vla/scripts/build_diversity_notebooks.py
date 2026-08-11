@@ -515,8 +515,9 @@ This notebook combines the existing uncertainty-only arms with the matched K=5 `
 refine-last arms for both competent v2 models. The primary predeclared policy uses first-chunk
 uncertainty: select the lower-U model, refine it for the episode only when U is at least `0.03`.
 
-It can be run as a preview after shards 0-1: analysis is restricted to identities completed in
-all four member/method arms. Set `REQUIRE_FULL_COHORT=True` only after shards 0-3 finish.
+Two-model analyses use identities completed in all four member/method arms. The source + model 1
+analysis is built separately, so it uses all 1,300 model-1 identities after model-1 shards 0-3
+finish even if model-0 shards 2-3 have not been run.
 
 Prefix, individual-chunk, and full-episode summaries are also analyzed. Only the first-chunk rule
 is directly deployable from these independently simulated trajectories. Later scores are useful
@@ -539,12 +540,15 @@ from pnp.diversity import (DIVERSITY_FIXED_REFINEMENT_THRESHOLD,
 EXPERIMENT_PREFIX = DIVERSITY_V2_EXPERIMENT_PREFIX
 FIXED_THRESHOLD = DIVERSITY_FIXED_REFINEMENT_THRESHOLD  # predeclared 0.03
 REQUIRE_FULL_COHORT = False      # True only after shards 0,1,2,3 finish for both models
+EXPECTED_FULL_M1_IDENTITIES = 1300
 OUTPUT = Path("diversity_selective_refinement_v2_outputs")
 OUTPUT.mkdir(exist_ok=True)
 
 store = SupabaseStore()
 all_rollouts, all_steps = fetch_diversity_selective_refinement(
     store, experiment_prefix=EXPERIMENT_PREFIX)
+print("Available completed rows before the shared four-arm intersection")
+display(all_rollouts.groupby(["member_index", "method"]).size().rename("n").reset_index())
 arm_counts = (all_rollouts.drop_duplicates(DIVERSITY_PAIR_KEYS + ["member_index", "method"])
               .groupby(DIVERSITY_PAIR_KEYS).size().rename("n_arms").reset_index())
 complete_keys = arm_counts[arm_counts.n_arms == 4][DIVERSITY_PAIR_KEYS]
@@ -672,20 +676,63 @@ if len(matched_keys) != len(paired):
 source_analysis_rollouts = pd.concat(
     [source_observed_rows, source_refined_rows], ignore_index=True).merge(
         matched_keys, on=DIVERSITY_PAIR_KEYS, validate="many_to_one")
+
+def fetch_pnp_steps(rollout_ids):
+    rows = []
+    rollout_ids = [str(value) for value in rollout_ids]
+    for start in range(0, len(rollout_ids), 100):
+        batch = rollout_ids[start:start + 100]
+        rows.extend(store.fetch_all(
+            "pnp_euler_steps", "rollout_id,chunk_idx,euler_step,u_mean",
+            configure=lambda query, ids=batch: query.in_("rollout_id", ids),
+            order_by=("rollout_id",)))
+    return pd.DataFrame(rows)
+
 source_observed_ids = source_analysis_rollouts[
     source_analysis_rollouts.method.eq(Method.UNCERTAINTY)].rollout_id.astype(str).tolist()
-source_step_rows = []
-for start in range(0, len(source_observed_ids), 100):
-    batch = source_observed_ids[start:start + 100]
-    source_step_rows.extend(store.fetch_all(
-        "pnp_euler_steps", "rollout_id,chunk_idx,euler_step,u_mean",
-        configure=lambda query, ids=batch: query.in_("rollout_id", ids),
-        order_by=("rollout_id",)))
-source_steps = pd.DataFrame(source_step_rows)
+source_steps = fetch_pnp_steps(source_observed_ids)
 source_analysis = analyze_checkpoint_refinement(
     source_analysis_rollouts, source_steps, checkpoint_name="source_checkpoint")
 for name, frame in source_analysis.items():
     tables[name.replace("member_refinement", "source_checkpoint_refinement")] = frame
+
+# Model 1 shards 0-3 are complete even when model 0 has only shards 0-1. Build an independent
+# source/model-1 cohort instead of silently discarding model-1's second half in the four-arm join.
+m1_rows = all_rollouts[
+    all_rollouts.member_index.eq(1) & all_rollouts.status.eq("completed") &
+    all_rollouts.method.isin(expected_methods)].copy()
+assert not m1_rows.duplicated(DIVERSITY_PAIR_KEYS + ["method"]).any(), (
+    "Model 1 contains duplicate method/episode identities")
+m1_method_counts = (m1_rows.groupby(DIVERSITY_PAIR_KEYS).method.nunique()
+                    .rename("n_methods").reset_index())
+m1_complete_keys = m1_method_counts[m1_method_counts.n_methods.eq(2)][DIVERSITY_PAIR_KEYS]
+source_complete_keys = source_observed[DIVERSITY_PAIR_KEYS].merge(
+    source_refined[DIVERSITY_PAIR_KEYS], on=DIVERSITY_PAIR_KEYS, validate="one_to_one")
+source_m1_keys = m1_complete_keys.merge(
+    source_complete_keys, on=DIVERSITY_PAIR_KEYS, validate="one_to_one")
+assert len(source_m1_keys) == EXPECTED_FULL_M1_IDENTITIES, (
+    f"Expected {EXPECTED_FULL_M1_IDENTITIES} exact source/model-1 identities after workers 0-3; "
+    f"found {len(source_m1_keys)}")
+
+m1_full_rollouts = m1_rows.merge(
+    source_m1_keys, on=DIVERSITY_PAIR_KEYS, validate="many_to_one")
+m1_full_steps = all_steps[all_steps.rollout_id.isin(m1_full_rollouts.rollout_id)].copy()
+m1_full_analysis = analyze_checkpoint_refinement(
+    m1_full_rollouts, m1_full_steps, checkpoint_name=1)
+source_m1_rollouts = pd.concat(
+    [source_observed_rows, source_refined_rows], ignore_index=True).merge(
+        source_m1_keys, on=DIVERSITY_PAIR_KEYS, validate="many_to_one")
+source_m1_observed_ids = source_m1_rollouts[
+    source_m1_rollouts.method.eq(Method.UNCERTAINTY)].rollout_id.astype(str).tolist()
+source_m1_steps = fetch_pnp_steps(source_m1_observed_ids)
+source_m1_analysis = analyze_checkpoint_refinement(
+    source_m1_rollouts, source_m1_steps, checkpoint_name="source_checkpoint_m1_cohort")
+for name, frame in m1_full_analysis.items():
+    tables[name.replace("member_refinement", "model1_full_refinement")] = frame
+for name, frame in source_m1_analysis.items():
+    tables[name.replace("member_refinement", "source_model1_cohort_refinement")] = frame
+print({"source_plus_model1_exact_identities": len(source_m1_keys),
+       "shared_source_model0_model1_identities": len(matched_keys)})
 
 source_horizons = source_analysis["member_refinement_overall"]
 print("Shared source checkpoint: matched refinement delta and failure AUC")
@@ -800,8 +847,9 @@ The four-arm member oracle succeeds if any of model 0/1 baseline/refinement succ
 oracle also includes source baseline/refinement.
 
 The source-plus-member experiments are implementable selection rules on the recorded trajectories:
-choose the lower-uncertainty policy from `{source, model 0}` or `{source, model 1}`, then refine that
-chosen policy only when its uncertainty falls inside the swept window. Positive
+choose the lowest-uncertainty policy from the named pair or trio, then refine that chosen policy
+only when its uncertainty falls inside the swept window. Source + model 1 uses all 1,300 model-1
+identities; source + model 0 and the three-policy option use the shared 650 identities. Positive
 `pair_minus_optimal_source_pp` means the resulting pair policy beats the source checkpoint after
 the source receives its own optimal uncertainty window at that same horizon. Every displayed SR
 uses the full matched episode cohort, including episodes outside the refinement window."""),
@@ -855,43 +903,68 @@ display(oracle_display.rename(columns={
     "success_rate": "oracle_sr_all_episodes_pct",
     "delta_vs_best_source_window_pp": "oracle_minus_optimal_source_pp"}))
 
-# Source+m0 and source+m1: lower-U policy selection followed by a windowed refinement gate.
-source_member = analyze_source_member_ensembles(
-    tables["member_refinement_pairs"],
-    source_analysis["member_refinement_pairs"],
+# Source+m1 uses all 1,300 identities. Source+m0 and source+m0+m1 use the shared 650.
+source_m1_full = analyze_source_member_ensembles(
+    m1_full_analysis["member_refinement_pairs"],
+    source_m1_analysis["member_refinement_pairs"],
     fixed_threshold=FIXED_THRESHOLD)
-for name, frame in source_member.items():
-    tables[name] = frame
+shared_source_members = analyze_source_member_ensembles(
+    tables["member_refinement_pairs"], source_analysis["member_refinement_pairs"],
+    fixed_threshold=FIXED_THRESHOLD)
+
+source_member = {}
+for name in source_m1_full:
+    shared = shared_source_members[name]
+    # The shared source+m1 duplicate is intentionally replaced by the full 1,300-row version.
+    shared = shared[shared.ensemble.isin(["source_plus_m0", "source_plus_m0_m1"])]
+    source_member[name] = pd.concat([source_m1_full[name], shared], ignore_index=True)
+    tables[name] = source_member[name]
 
 source_member_best = source_member["source_member_best_windows"]
 source_member_overall = source_member["source_member_overall"]
-source_member_reference = window_comparison[[
-    "score_name", "source_window_delta_pp", "source_window_sr"]].copy()
+source_m1_top = source_m1_analysis["member_refinement_top_windows"]
+source_m1_reference = source_m1_top[
+    source_m1_top["rank"].eq(1) & source_m1_top.score_name.isin(horizons)][[
+        "score_name", "delta_pp", "selective_sr"]].rename(columns={
+            "delta_pp": "source_window_delta_pp",
+            "selective_sr": "source_window_sr"})
+source_m1_reference["ensemble"] = "source_plus_m1"
+shared_source_reference = pd.concat([
+    window_comparison[["score_name", "source_window_delta_pp", "source_window_sr"]]
+    .assign(ensemble=ensemble)
+    for ensemble in ("source_plus_m0", "source_plus_m0_m1")], ignore_index=True)
+source_member_reference = pd.concat(
+    [source_m1_reference, shared_source_reference], ignore_index=True)
 source_member_comparison = (
     source_member_best[source_member_best.score_name.isin(horizons)][[
         "ensemble", "member_index", "score_name", "lower", "upper", "n_refined",
         "selective_sr", "delta_pp", "delta_vs_best_fixed_pp"]]
     .merge(source_member_overall[source_member_overall.score_name.isin(horizons)][[
-        "ensemble", "score_name", "lower_u_baseline_sr", "best_fixed_member_sr"]],
+        "ensemble", "score_name", "n_pairs", "lower_u_baseline_sr",
+        "best_fixed_member_sr"]],
         on=["ensemble", "score_name"], validate="one_to_one")
-    .merge(source_member_reference, on="score_name", validate="many_to_one"))
+    .merge(source_member_reference, on=["ensemble", "score_name"], validate="one_to_one"))
 source_member_comparison["delta_advantage_vs_source_pp"] = (
     source_member_comparison.delta_pp - source_member_comparison.source_window_delta_pp)
 source_member_comparison["window_sr_vs_source_window_pp"] = 100 * (
     source_member_comparison.selective_sr - source_member_comparison.source_window_sr)
 source_member_comparison["score_name"] = pd.Categorical(
     source_member_comparison.score_name, categories=horizons, ordered=True)
+ensemble_order = ["source_plus_m1", "source_plus_m0", "source_plus_m0_m1"]
+source_member_comparison["ensemble"] = pd.Categorical(
+    source_member_comparison.ensemble, categories=ensemble_order, ordered=True)
 source_member_comparison = source_member_comparison.sort_values(
-    ["member_index", "score_name"])
+    ["ensemble", "score_name"])
 tables["source_member_best_window_comparison"] = source_member_comparison
 source_member_display = source_member_comparison[[
-    "ensemble", "score_name", "lower", "upper", "n_refined",
+    "ensemble", "score_name", "n_pairs", "lower", "upper", "n_refined",
     "selective_sr", "source_window_sr", "window_sr_vs_source_window_pp"]].copy()
 source_member_display["selective_sr"] *= 100
 source_member_display["source_window_sr"] *= 100
 display(source_member_display.rename(columns={
     "ensemble": "pair",
     "score_name": "uncertainty_horizon",
+    "n_pairs": "episodes_in_sr_denominator",
     "lower": "window_lower",
     "upper": "window_upper",
     "n_refined": "episodes_refined",

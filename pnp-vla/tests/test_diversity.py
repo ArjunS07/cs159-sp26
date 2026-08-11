@@ -619,9 +619,15 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         tables["member_refinement_pairs"],
         source_analysis["member_refinement_pairs"], grid_size=5, min_window=1)
     assert set(source_member["source_member_best_windows"].ensemble) == {
-        "source_plus_m0", "source_plus_m1"}
-    assert len(source_member["source_member_best_windows"]) == 2 * len(set(
+        "source_plus_m0", "source_plus_m1", "source_plus_m0_m1"}
+    assert len(source_member["source_member_best_windows"]) == 3 * len(set(
         tables["member_refinement_pairs"].score_name))
+    model1_only = tables["member_refinement_pairs"][
+        tables["member_refinement_pairs"].member_index.eq(1)]
+    source_m1 = analyze_source_member_ensembles(
+        model1_only, source_analysis["member_refinement_pairs"],
+        grid_size=5, min_window=1)
+    assert set(source_m1["source_member_best_windows"].ensemble) == {"source_plus_m1"}
     tables.update(source_member)
     source_member_comparison = source_member["source_member_best_windows"].merge(
         pd.concat([source_delta, source_sr], axis=1),
