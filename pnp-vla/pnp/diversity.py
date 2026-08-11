@@ -660,7 +660,7 @@ def _selective_score_specs() -> list[dict]:
     specs.extend(
         {"score_name": f"prefix_{count}_chunks", "column": f"u_prefix_{count}",
          "signal_kind": "prefix", "chunk_count": count,
-         "interpretation": "posthoc_separate_trajectories"}
+         "interpretation": "posthoc_prefix_with_whole_episode_fallback"}
         for count in DIVERSITY_PREFIX_CHUNKS if count != 1)
     specs.append({"score_name": "full_episode", "column": "u_full_episode",
                   "signal_kind": "full_episode", "chunk_count": math.nan,
@@ -699,18 +699,16 @@ def build_selective_refinement_pairs(rollouts: pd.DataFrame, steps: pd.DataFrame
     for index in range(8):
         score_rows[f"u_chunk_{index}"] = (
             chunk_scores[index].to_numpy() if index in chunk_scores else math.nan)
-    for count in DIVERSITY_PREFIX_CHUNKS:
-        columns = [index for index in range(count) if index in chunk_scores]
-        if len(columns) != count:
-            score_rows[f"u_prefix_{count}"] = math.nan
-            continue
-        values = chunk_scores[columns]
-        score_rows[f"u_prefix_{count}"] = values.mean(axis=1).where(
-            values.notna().all(axis=1)).to_numpy()
     score_rows = score_rows.merge(
         observed[["member_index", "rollout_id", "u_mean_episode"]],
         on=["member_index", "rollout_id"], validate="one_to_one")
     score_rows = score_rows.rename(columns={"u_mean_episode": "u_full_episode"})
+    for count in DIVERSITY_PREFIX_CHUNKS:
+        values = score_rows[[f"u_chunk_{index}" for index in range(count)]]
+        prefix = values.mean(axis=1)
+        ended_early = values.notna().sum(axis=1) < count
+        score_rows[f"u_prefix_{count}"] = prefix.where(
+            ~ended_early, score_rows.u_full_episode)
 
     members = []
     score_columns = [spec["column"] for spec in _selective_score_specs()]
@@ -828,17 +826,15 @@ def build_checkpoint_refinement_pairs(
     for index in range(8):
         score_rows[f"u_chunk_{index}"] = (
             chunk_scores[index].to_numpy() if index in chunk_scores else math.nan)
-    for count in DIVERSITY_PREFIX_CHUNKS:
-        columns = [index for index in range(count) if index in chunk_scores]
-        if len(columns) != count:
-            score_rows[f"u_prefix_{count}"] = math.nan
-            continue
-        values = chunk_scores[columns]
-        score_rows[f"u_prefix_{count}"] = values.mean(axis=1).where(
-            values.notna().all(axis=1)).to_numpy()
     score_rows = score_rows.merge(
         observed[["rollout_id", "u_mean_episode"]], on="rollout_id",
         validate="one_to_one").rename(columns={"u_mean_episode": "u_full_episode"})
+    for count in DIVERSITY_PREFIX_CHUNKS:
+        values = score_rows[[f"u_chunk_{index}" for index in range(count)]]
+        prefix = values.mean(axis=1)
+        ended_early = values.notna().sum(axis=1) < count
+        score_rows[f"u_prefix_{count}"] = prefix.where(
+            ~ended_early, score_rows.u_full_episode)
     paired = paired.merge(
         score_rows, left_on="rollout_id_observed", right_on="rollout_id",
         validate="one_to_one")

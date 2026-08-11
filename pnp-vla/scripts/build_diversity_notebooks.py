@@ -521,8 +521,10 @@ all four member/method arms. Set `REQUIRE_FULL_COHORT=True` only after shards 0-
 Prefix, individual-chunk, and full-episode summaries are also analyzed. Only the first-chunk rule
 is directly deployable from these independently simulated trajectories. Later scores are useful
 post-hoc evidence about predictiveness and headroom, but they are not presented as an online
-policy. The best in-sample window is exploratory; leave-one-suite-out (LOSO) window selection is
-reported separately to reduce threshold-selection optimism."""),
+policy. For `prefix_N`, trajectories with fewer than N chunks use their whole-episode uncertainty,
+so every prefix sweep retains the entire matched cohort in its SR denominator. The best in-sample
+window is exploratory; leave-one-suite-out (LOSO) window selection is reported separately to
+reduce threshold-selection optimism."""),
     md("## 1. Setup"), code(bootstrap(extras="analysis", setup_env=False)),
     md("## 2. Fetch and validate the exact four-arm cohort"),
     code(r'''from pathlib import Path

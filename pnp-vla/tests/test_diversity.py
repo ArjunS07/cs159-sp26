@@ -606,3 +606,40 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         "selective_refinement_window_full_episode.png",
     }
     assert expected == {path.name for path in figures}
+
+
+def test_prefix_scores_use_whole_episode_u_for_short_trajectories():
+    identities = [
+        {"suite": "libero_goal_swap", "task_idx": 0, "episode_idx": index,
+         "init_state_hash": str(index)}
+        for index in range(2)]
+    rows, steps = [], []
+    for index, identity in enumerate(identities):
+        observed_id = f"observed-{index}"
+        rows.extend([
+            {**identity, "rollout_id": observed_id, "method": "pnp_uncertainty_only",
+             "status": "completed", "success": False,
+             "u_mean_episode": .05 if index == 0 else .025},
+            {**identity, "rollout_id": f"refined-{index}", "method": "pnp_refinement",
+             "status": "completed", "success": index == 0,
+             "u_mean_episode": .05 if index == 0 else .025},
+        ])
+        chunk_count = 1 if index == 0 else 4
+        for chunk_idx in range(chunk_count):
+            for euler_step in (3, 4):
+                steps.append({"rollout_id": observed_id, "chunk_idx": chunk_idx,
+                              "euler_step": euler_step, "u_mean": .01 + .01 * chunk_idx})
+
+    analysis = analyze_checkpoint_refinement(
+        pd.DataFrame(rows), pd.DataFrame(steps), grid_size=5, min_window=1)
+    pairs = analysis["member_refinement_pairs"]
+    prefix4 = pairs[pairs.score_name == "prefix_4_chunks"].sort_values("episode_idx")
+    assert len(prefix4) == 2
+    assert np.isclose(prefix4.iloc[0].u, .05)  # whole-episode fallback, not chunk-0 U
+    assert np.isclose(prefix4.iloc[1].u, .025)  # mean of chunks 0..3
+    sweep = analysis["member_refinement_window_sweep"]
+    full_window = sweep[
+        (sweep.score_name == "prefix_4_chunks") & sweep.lower.eq(0.) & sweep.upper.eq(.08)]
+    assert len(full_window) == 1
+    assert full_window.iloc[0].n_refined == 2
+    assert np.isclose(full_window.iloc[0].delta_pp, 50.)  # one net fix / both episodes
