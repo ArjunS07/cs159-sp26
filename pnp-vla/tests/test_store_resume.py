@@ -109,3 +109,17 @@ def test_iter_todo_skips_completed_and_yields_the_rest():
     todo = list(store.iter_todo("exp", episodes, methods, done=done))
     assert len(todo) == 5
     assert done.isdisjoint({rid for *_, rid in todo})
+
+
+def test_multisample_denorm_records_its_probe_and_candidate_identity():
+    from pnp.config import Method, RolloutConfig
+
+    config = RolloutConfig(
+        num_samples=2, pnp_k=5, ms_probe_steps=(3, 4),
+        candidate_set_id="source@a|m1@b")
+    row = SupabaseStore._denorm(Method.CHUNK_SOURCE_M1, config)
+    assert row["pnp_enabled"] is True
+    assert row["pnp_k"] == 5
+    assert row["pnp_step_indices"] == [3, 4]
+    assert config.logical_dict()["candidate_set_id"] == "source@a|m1@b"
+    assert "candidate_set_id" not in RolloutConfig().logical_dict()

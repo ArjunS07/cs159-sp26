@@ -194,7 +194,9 @@ HISTORICAL_PRO_BASELINE_SR = {
 }
 
 _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
-                  Method.EXTRA_STEPS: "control"}
+                  Method.EXTRA_STEPS: "control",
+                  Method.CHUNK_SOURCE_SOURCE: "source x2",
+                  Method.CHUNK_SOURCE_M1: "source + m1"}
 
 
 def format_progress_table(tally, method_names) -> str:
@@ -287,7 +289,8 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
 def _run_collection(*, store, policy, preprocess, postprocess, device, experiment, episodes,
                     methods, cohort, shard_count, shard_index,
                     benchmark="libero", driver="hybrid_schedules", run_metadata=None,
-                    report_every=50, provenance=None, initial_tally=None):
+                    report_every=50, provenance=None, initial_tally=None,
+                    candidate_bundles_by_method=None):
     from tqdm.auto import tqdm
     from .rollout import iter_task_envs, run_episode
 
@@ -322,7 +325,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                 for ep, name, cfg, rid in store.iter_todo(
                         experiment, task_episodes, methods, done=done):
                     result = run_episode(
-                        env, ep, policy, preprocess, postprocess, device, cfg)
+                        env, ep, policy, preprocess, postprocess, device, cfg,
+                        candidate_bundles=(candidate_bundles_by_method or {}).get(name))
                     store.log_result(rid, ep, name, cfg, result)
                     completed += 1
                     counts = tally[(ep["suite"], name)]

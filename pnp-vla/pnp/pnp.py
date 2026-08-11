@@ -211,7 +211,7 @@ class PnPRecorder:
 # Multi-sample selection: sample N chunks, keep the lowest-uncertainty one.
 # ─────────────────────────────────────────────────────────────────────────────
 def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_steps,
-                        noise_of):
+                        noise_of, num_iterations=3):
     """Return (chosen_action_chunk, chosen_idx, per_candidate_u).
 
     `noise_of(si)` yields the initial noise for candidate si (from the rollout's per-episode
@@ -222,11 +222,40 @@ def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_
     for si in range(num_samples):
         noise = noise_of(si)
         _pnp_seed_perturb(base_seed + chunk_idx * 1000 + si)
-        action, u = measure_chunk_uncertainty(policy, batch, noise=noise, probe_steps=probe_steps)
+        action, u = measure_chunk_uncertainty(
+            policy, batch, noise=noise, probe_steps=probe_steps,
+            num_iterations=num_iterations)
         cand_actions.append(action)
         cand_u.append(float(u))
     chosen = int(np.argmin(cand_u))
     return cand_actions[chosen], chosen, cand_u
+
+
+def multi_policy_select(candidates, noises, probe_steps, num_iterations=3,
+                        perturb_seeds=None):
+    """Select the lowest-uncertainty action from policy/batch candidates.
+
+    ``candidates`` is an ordered sequence of ``(policy, preprocessed_batch)`` pairs and
+    ``noises`` supplies the matched initial noise for each slot. Keeping slot order explicit lets
+    source+m1 and source+source controls use the same candidate seeds at every decision point.
+    """
+    from .sampler import measure_chunk_uncertainty
+
+    if len(candidates) != len(noises) or not candidates:
+        raise ValueError("candidates and noises must have the same non-zero length")
+    if perturb_seeds is not None and len(perturb_seeds) != len(candidates):
+        raise ValueError("perturb_seeds must match the candidate count")
+    actions, uncertainties = [], []
+    for index, ((policy, batch), noise) in enumerate(zip(candidates, noises)):
+        if perturb_seeds is not None:
+            _pnp_seed_perturb(int(perturb_seeds[index]))
+        action, uncertainty = measure_chunk_uncertainty(
+            policy, batch, noise=noise, probe_steps=tuple(probe_steps),
+            num_iterations=int(num_iterations))
+        actions.append(action)
+        uncertainties.append(float(uncertainty))
+    chosen = int(np.argmin(uncertainties))
+    return actions[chosen], chosen, uncertainties, actions
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1029,6 +1029,210 @@ print("\nFirst chunk is deployable at the initial observation; later horizons ar
 ], "21_analyze_diversity_selective_refinement_v2.ipynb")
 
 
+def chunk_selector_worker_notebook(shard_index: int):
+    return notebook([
+        md(f"""# 22 - Online per-chunk selector worker {shard_index}
+
+This is the causal online aggregation experiment. At every 10-action decision chunk, both arms
+generate two clean candidates from the same live observation and execute the lower-uncertainty
+candidate:
+
+- `source, 2 queries`: two independent source-checkpoint queries;
+- `source + model 1`: one source query and one v2 model-1 query.
+
+Both use K=5 uncertainty at Euler steps `(3,4)` and matched candidate-slot seeds. The two arms
+start from exactly the same LIBERO-PRO identity, although their states may diverge after executing
+different chunks. Candidate uncertainties, choices, clean-action disagreement metrics, and raw
+candidate chunks are logged. No Supabase migration is required.
+
+This notebook is shard {shard_index} of 4. It is resumable and uses 10 episodes per task, so all
+four workers together produce 1,300 matched identities per arm. Before committing compute, worker
+0 can be run once with `EPISODE_LIMIT=1`; after those two rollouts succeed, set it back to `None`
+and rerun. Those smoke-test rows are reused rather than repeated. Use an A100 if available because
+source+m1 keeps two pi0.5 policies resident simultaneously; an L4 is not assumed to fit."""),
+        md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
+        md("## 2. Configuration and resumable collection"),
+        code(f'''from pathlib import Path
+from google.colab import drive
+from pnp.config import PI05_REPO_ID
+from pnp.diversity import (DIVERSITY_CHUNK_SELECTOR_EXPERIMENT,
+    DIVERSITY_V2_EXPERIMENT_PREFIX, load_bootstrap_manifest,
+    run_diversity_chunk_selector_worker)
+
+drive.mount("/content/drive")
+
+EPISODES_PER_TASK = 10
+SHARD_COUNT = 4
+SHARD_INDEX = {shard_index}
+EPISODE_LIMIT = None  # optional worker-0 smoke test: set 1, run, then restore None
+EXPERIMENT = DIVERSITY_CHUNK_SELECTOR_EXPERIMENT
+MANIFEST_PATH = Path(
+    "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
+manifest = load_bootstrap_manifest(MANIFEST_PATH)
+assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+
+print({{"experiment": EXPERIMENT, "episodes_per_task": EPISODES_PER_TASK,
+       "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+       "episode_limit": EPISODE_LIMIT,
+       "manifest_hash": manifest["manifest_hash"]}})
+run_diversity_chunk_selector_worker(
+    episodes_per_task=EPISODES_PER_TASK,
+    episode_limit=EPISODE_LIMIT,
+    shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+    manifest_hash=manifest["manifest_hash"],
+    diversity_experiment_prefix=DIVERSITY_V2_EXPERIMENT_PREFIX,
+    experiment=EXPERIMENT)'''),
+    ], f"22_diversity_chunk_selector_worker_{shard_index}.ipynb")
+
+
+ANALYZE_CHUNK_SELECTOR = notebook([
+    md("""# 23 - Analyze online per-chunk source+m1 aggregation
+
+Primary question: does choosing between source and model 1 at every live decision chunk outperform
+the matched control that chooses between two stochastic source queries? All SR comparisons use
+exact episode identities. The old single-source K=5 `(3,4)` rollout is also matched as context.
+
+Action-diversity metrics compare the two original clean candidate predictions before selection.
+This tests whether model 1 contributes meaningfully more behavioral diversity than simply
+re-querying the source model."""),
+    md("## 1. Setup"), code(bootstrap(extras="analysis", setup_env=False)),
+    md("## 2. Fetch the exact matched online cohort"),
+    code(r'''from pathlib import Path
+import pandas as pd
+from IPython.display import display, Image
+from pnp.config import Method
+from pnp.diversity import (DIVERSITY_CHUNK_SELECTOR_EXPERIMENT,
+    DIVERSITY_PAIR_KEYS, analyze_diversity_chunk_selector,
+    diversity_chunk_selector_figures, fetch_diversity_chunk_selector)
+from pnp.experiments import PRO_EXPANDED_EXPERIMENT
+from pnp.store import SupabaseStore
+
+EXPERIMENT = DIVERSITY_CHUNK_SELECTOR_EXPERIMENT
+REQUIRE_FULL_COHORT = False  # set True only after workers 0,1,2,3 finish
+OUTPUT = Path("diversity_chunk_selector_outputs")
+OUTPUT.mkdir(exist_ok=True)
+
+store = SupabaseStore()
+all_rollouts = fetch_diversity_chunk_selector(store, experiment=EXPERIMENT)
+counts = (all_rollouts.drop_duplicates(DIVERSITY_PAIR_KEYS + ["method"])
+          .groupby(DIVERSITY_PAIR_KEYS).method.nunique().rename("n_arms").reset_index())
+complete_keys = counts[counts.n_arms.eq(2)][DIVERSITY_PAIR_KEYS]
+rollouts = all_rollouts.merge(complete_keys, on=DIVERSITY_PAIR_KEYS, validate="many_to_one")
+arm_counts = rollouts.groupby("method").size().rename("n").reset_index()
+display(arm_counts)
+assert arm_counts.n.nunique() == 1
+N_PAIRS = int(arm_counts.n.iloc[0])
+if REQUIRE_FULL_COHORT:
+    assert N_PAIRS == 1300, f"Full cohort requires 1,300 pairs; found {N_PAIRS}"
+print({"analysis_mode": "FULL" if REQUIRE_FULL_COHORT else "PARTIAL PREVIEW",
+       "matched_episode_identities": N_PAIRS,
+       "incomplete_identities_ignored": int(counts.n_arms.lt(2).sum())})
+
+tables = analyze_diversity_chunk_selector(rollouts)'''),
+    md("## 3. Match the old single-source baseline"),
+    code(r'''source_rows = pd.DataFrame(store.fetch_all(
+    "rollouts", "rollout_id,suite,task_idx,episode_idx,init_state_hash,method,status,success,"
+    "max_steps,pnp_k,pnp_step_indices",
+    configure=lambda query: query.eq("experiment", PRO_EXPANDED_EXPERIMENT),
+    order_by=("rollout_id",)))
+source_rows = source_rows[
+    source_rows.status.eq("completed") & source_rows.method.eq(Method.UNCERTAINTY) &
+    source_rows.pnp_k.eq(5) &
+    source_rows.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4))]
+assert not source_rows.duplicated(DIVERSITY_PAIR_KEYS).any()
+paired = tables["chunk_selector_paired_episodes"]
+source = source_rows[DIVERSITY_PAIR_KEYS + ["success", "max_steps"]].rename(
+    columns={"success": "source_baseline_success", "max_steps": "source_max_steps"})
+paired_with_source = paired.merge(
+    source, on=DIVERSITY_PAIR_KEYS, validate="one_to_one")
+assert len(paired_with_source) == len(paired), (
+    f"Source baseline matched {len(paired_with_source)}/{len(paired)} identities")
+assert (paired_with_source.source_max_steps == paired_with_source[
+    f"max_steps_{Method.CHUNK_SOURCE_SOURCE}"]).all(), (
+    "The historical source baseline uses a different episode horizon")
+source_success = paired_with_source.source_baseline_success.astype(bool)
+control_success = paired_with_source[
+    f"success_{Method.CHUNK_SOURCE_SOURCE}"].astype(bool)
+treatment_success = paired_with_source[
+    f"success_{Method.CHUNK_SOURCE_M1}"].astype(bool)
+source_comparison = pd.DataFrame([{
+    "n_matched_episodes": len(paired_with_source),
+    "single_source_sr": source_success.mean(),
+    "source_two_queries_sr": control_success.mean(),
+    "source_plus_m1_sr": treatment_success.mean(),
+    "two_queries_minus_single_source_pp": 100 * (
+        control_success.mean() - source_success.mean()),
+    "source_m1_minus_single_source_pp": 100 * (
+        treatment_success.mean() - source_success.mean()),
+    "source_m1_minus_two_queries_pp": 100 * (
+        treatment_success.mean() - control_success.mean()),
+}])
+tables["chunk_selector_source_baseline"] = pd.DataFrame([{
+    "n": len(paired_with_source), "source_baseline_sr": source_success.mean()}])
+tables["chunk_selector_paired_with_source"] = paired_with_source
+tables["chunk_selector_source_comparison"] = source_comparison
+display(source_comparison)'''),
+    md("## 4. Paired outcome result"),
+    code(r'''print("Source+m1 versus the two-source-query control")
+display(tables["chunk_selector_paired_summary"])
+display(tables["chunk_selector_by_suite"][[
+    "suite", "n_pairs", "source_requery_sr", "source_m1_sr",
+    "source_m1_minus_requery_pp", "F_to_S", "S_to_F"]])'''),
+    md("""## 5. Are source+m1 predictions more diverse?
+
+These metrics compare the two clean policy-space candidate chunks before the lower-U choice.
+Higher L2/lower cosine means greater prediction diversity. `candidate1_selected_rate` reports how
+often the second source query or model 1 had lower uncertainty."""),
+    code(r'''diversity = tables["chunk_selector_diversity_overall"].copy()
+diversity["pair"] = diversity.method.map({
+    Method.CHUNK_SOURCE_SOURCE: "source vs source",
+    Method.CHUNK_SOURCE_M1: "source vs model 1"})
+display(diversity[[
+    "pair", "n_chunks", "candidate1_selected_rate", "candidate_u_gap_mean",
+    "action_l2_mean_mean", "action_l2_normalized_mean", "action_cosine_mean",
+    "gripper_sign_disagreement_mean"]])
+
+wide = diversity.set_index("pair")
+diversity_comparison = pd.DataFrame([{
+    "metric": "clean_action_l2",
+    "source_vs_source": wide.loc["source vs source", "action_l2_mean_mean"],
+    "source_vs_model1": wide.loc["source vs model 1", "action_l2_mean_mean"],
+    "source_m1_over_requery_ratio": (
+        wide.loc["source vs model 1", "action_l2_mean_mean"] /
+        wide.loc["source vs source", "action_l2_mean_mean"]),
+}, {
+    "metric": "normalized_clean_action_l2",
+    "source_vs_source": wide.loc["source vs source", "action_l2_normalized_mean"],
+    "source_vs_model1": wide.loc["source vs model 1", "action_l2_normalized_mean"],
+    "source_m1_over_requery_ratio": (
+        wide.loc["source vs model 1", "action_l2_normalized_mean"] /
+        wide.loc["source vs source", "action_l2_normalized_mean"]),
+}])
+tables["chunk_selector_diversity_comparison"] = diversity_comparison
+display(diversity_comparison)
+print("Raw candidate chunks are preserved in each rollout's generated_chunks_path blob.")'''),
+    md("## 6. Save tables and plots"),
+    code(r'''for name, frame in tables.items():
+    frame.to_csv(OUTPUT / f"{name}.csv", index=False)
+paths = diversity_chunk_selector_figures(tables, OUTPUT / "figures")
+for path in paths:
+    print(path.name)
+    display(Image(filename=str(path)))'''),
+    md("## 7. Concise readout"),
+    code(r'''result = source_comparison.iloc[0]
+diversity_result = diversity_comparison.set_index("metric")
+print(f"Matched episodes: {int(result.n_matched_episodes)}")
+print(f"Single source:       {result.single_source_sr:.1%}")
+print(f"Source, two queries: {result.source_two_queries_sr:.1%} "
+      f"({result.two_queries_minus_single_source_pp:+.2f} pp vs single source)")
+print(f"Source + model 1:    {result.source_plus_m1_sr:.1%} "
+      f"({result.source_m1_minus_two_queries_pp:+.2f} pp vs two-query control)")
+print("Source+m1 / source-requery normalized action-diversity ratio: %.2fx" %
+      diversity_result.loc["normalized_clean_action_l2",
+                           "source_m1_over_requery_ratio"])'''),
+], "23_analyze_diversity_chunk_selector.ipynb")
+
+
 def main():
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05.ipynb", TRAIN)
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05_v2.ipynb", TRAIN_V2)
@@ -1047,6 +1251,12 @@ def main():
     write_notebook(ROOT / "notebooks" /
                    "21_analyze_diversity_selective_refinement_v2.ipynb",
                    ANALYZE_SELECTIVE_REFINEMENT_V2)
+    for shard_index in range(4):
+        write_notebook(ROOT / "notebooks" / "workers" /
+                       f"22_diversity_chunk_selector_worker_{shard_index}.ipynb",
+                       chunk_selector_worker_notebook(shard_index))
+    write_notebook(ROOT / "notebooks" / "23_analyze_diversity_chunk_selector.ipynb",
+                   ANALYZE_CHUNK_SELECTOR)
 
 
 if __name__ == "__main__":

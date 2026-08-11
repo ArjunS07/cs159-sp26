@@ -5,7 +5,8 @@ import numpy as np
 import torch
 
 from pnp.config import RolloutConfig
-from pnp.rollout import run_episode
+from pnp.rollout import (candidate_action_disagreement, candidate_chunk_noise_seed,
+                         chunk_noise_seed, run_episode)
 
 
 def _observation():
@@ -88,3 +89,42 @@ def test_run_episode_can_save_exact_policy_space_chunks():
     assert result["generated_chunks"]["chunks"].shape == (1, 2, 7)
     assert np.allclose(result["generated_chunks"]["chunks"], 1.0)
     assert np.allclose(result["trajectory"]["actions"], 2.0)
+
+
+def test_dual_policy_episode_selects_and_logs_clean_candidate_diversity():
+    env = _Env()
+    ep = {
+        "task_desc": "test task", "max_steps": 1,
+        "init_state": np.zeros(3), "ep_idx": 0,
+        "suite": "test", "task_idx": 0,
+    }
+    source, member = _Policy(), _Policy()
+    candidate_actions = [torch.ones((1, 2, 7)), torch.full((1, 2, 7), 2.0)]
+    bundles = [
+        ("source", source, lambda obs: obs, lambda action: action * 2),
+        ("model_1", member, lambda obs: obs, lambda action: action * 3),
+    ]
+    config = RolloutConfig(
+        num_samples=2, pnp_k=5, ms_probe_steps=(3, 4),
+        candidate_set_id="source|m1", save_generated_chunks=True)
+    with (patch("pnp.rollout.obs_to_policy", return_value={}),
+          patch("pnp.rollout.multi_policy_select", return_value=(
+              candidate_actions[1], 1, [.2, .1], candidate_actions))):
+        result = run_episode(
+            env, ep, source, lambda obs: obs, lambda action: action,
+            torch.device("cpu"), config, candidate_bundles=bundles)
+
+    assert np.allclose(env.actions[-1], 6.0)
+    assert result["ms_selections"][0]["chosen_label"] == "model_1"
+    assert result["ms_selections"][0]["action_disagreement"]["action_l2_mean"] > 0
+    assert result["generated_chunks"]["candidate_chunks"].shape == (1, 2, 2, 7)
+    assert candidate_chunk_noise_seed(123, 4, 0) == chunk_noise_seed(123, 4)
+    assert candidate_chunk_noise_seed(123, 4, 1) != chunk_noise_seed(123, 4)
+
+
+def test_candidate_action_disagreement_is_zero_for_identical_chunks():
+    action = torch.ones((1, 2, 7))
+    metrics = candidate_action_disagreement([action, action.clone()])
+    assert metrics["action_l2_mean"] == 0.0
+    assert metrics["action_l2_normalized"] == 0.0
+    assert np.isclose(metrics["action_cosine"], 1.0)

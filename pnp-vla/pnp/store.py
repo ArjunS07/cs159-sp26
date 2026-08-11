@@ -301,11 +301,15 @@ class SupabaseStore:
 
         The flat RolloutConfig fields map 1:1 to these columns, so this is near-identity."""
         on = config.has_probe
+        multisample = config.num_samples is not None
+        measurement = on or multisample
+        steps = (list(config.pnp_steps) if on and config.pnp_steps else
+                 list(config.ms_probe_steps) if multisample else None)
         return {
             "method": method,
-            "pnp_enabled": on,
-            "pnp_step_indices": list(config.pnp_steps) if (on and config.pnp_steps) else None,
-            "pnp_k": config.pnp_k if on else None,
+            "pnp_enabled": measurement,
+            "pnp_step_indices": steps,
+            "pnp_k": config.pnp_k if measurement else None,
             "refine_average": (config.refine_average if config.refine else None),
             "pnp_time_min": config.pnp_time_min if on else None,
             "num_inference_steps": config.num_inference_steps,
@@ -409,6 +413,13 @@ class SupabaseStore:
             row["ms_chosen_idx"] = sels[0]["chosen"]
             row["ms_candidate_u"] = {"chosen": [s["chosen"] for s in sels],
                                      "u": [s["cand_u"] for s in sels]}
+            if sels[0].get("labels"):
+                row["ms_candidate_u"]["labels"] = sels[0]["labels"]
+                row["ms_candidate_u"]["chosen_label"] = [
+                    s.get("chosen_label") for s in sels]
+            if sels[0].get("action_disagreement"):
+                row["ms_candidate_u"]["action_disagreement"] = [
+                    s.get("action_disagreement") for s in sels]
         blobs = {}
         if result.get("trajectory"):
             blobs["trajectory"] = result["trajectory"]

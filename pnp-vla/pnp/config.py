@@ -81,13 +81,16 @@ class Method:
     UNCERTAINTY = "pnp_uncertainty_only"    # probe set, no action (RNG-isolated no-op)
     REFINEMENT = "pnp_refinement"           # refine; last vs avg = refine_average column
     MULTI_SAMPLE = "multi_sample_select"
+    CHUNK_SOURCE_SOURCE = "chunk_select_source_source"
+    CHUNK_SOURCE_M1 = "chunk_select_source_m1"
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
 
 
 ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.REFINEMENT,
-               Method.MULTI_SAMPLE, Method.PNP_ONLY, Method.PCP)
+               Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_M1,
+               Method.PNP_ONLY, Method.PCP)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 
 
@@ -127,6 +130,7 @@ class RolloutConfig:
     q_scaler: object = field(default=None, repr=False, compare=False)  # runtime handle, not serialized
     num_samples: Optional[int] = None           # set => multi-sample-select (chunk level)
     ms_probe_steps: Sequence[int] = (1, 2)      # probe steps for multi-sample uncertainty
+    candidate_set_id: Optional[str] = None       # immutable model/revision set for online selection
     # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
     save_uncertainty: Optional[bool] = None     # default: on iff a probe is set
@@ -193,13 +197,19 @@ class RolloutConfig:
         under one method name. Excludes: sinks + video (persistence-only), compute_multimodal
         (recording-only), and q_model/q_scaler (runtime handles — q_ckpt_id captures their identity).
         """
-        return {f: getattr(self, f) for f in LOGICAL_FIELDS}
+        logical = {f: getattr(self, f) for f in LOGICAL_FIELDS}
+        # Added after historical experiments were collected. Omitting its default preserves every
+        # old config hash/rollout ID; online multi-policy runs set it explicitly and are revision-
+        # bound in their IDs.
+        if logical.get("candidate_set_id") is None:
+            logical.pop("candidate_set_id")
+        return logical
 
 
 # Behavior-defining fields of RolloutConfig (see RolloutConfig.logical_dict).
 LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "refine", "refine_average", "correction_lambda", "q_gate", "q_ckpt_id",
-                  "num_samples", "ms_probe_steps", "num_inference_steps")
+                  "num_samples", "ms_probe_steps", "candidate_set_id", "num_inference_steps")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

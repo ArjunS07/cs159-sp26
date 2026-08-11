@@ -26,6 +26,7 @@ DIVERSITY_EXPECTED_TASKS = 40
 DIVERSITY_EXPECTED_EPISODES = 1693
 DIVERSITY_EXPERIMENT_PREFIX = "pi05-diversity-signal-v1"
 DIVERSITY_V2_EXPERIMENT_PREFIX = "pi05-diversity-signal-v2"
+DIVERSITY_CHUNK_SELECTOR_EXPERIMENT = "pi05-diversity-chunk-selector-v1"
 DIVERSITY_PAIR_KEYS = ["suite", "task_idx", "episode_idx", "init_state_hash"]
 DIVERSITY_PREFIX_CHUNKS = (1, 2, 4, 8)
 DIVERSITY_FIXED_REFINEMENT_THRESHOLD = 0.03
@@ -481,6 +482,116 @@ def run_diversity_refinement_worker(*, member_index: int,
     )
 
 
+def source_checkpoint_model_source(store) -> tuple[str, str]:
+    """Return the immutable source checkpoint used by the expanded PRO experiment."""
+    from .config import PI05_REPO_ID
+    from .experiments import PRO_EXPANDED_EXPERIMENT
+
+    runs = store.fetch_all(
+        "experiment_runs", "model_repo_id,model_revision",
+        configure=lambda query: query.eq("experiment", PRO_EXPANDED_EXPERIMENT),
+        order_by=("run_id",))
+    sources = {
+        (str(row.get("model_repo_id") or ""), str(row.get("model_revision") or ""))
+        for row in runs if row.get("model_repo_id") == PI05_REPO_ID and row.get("model_revision")
+    }
+    if len(sources) != 1:
+        raise ValueError(
+            f"{PRO_EXPANDED_EXPERIMENT} must identify one immutable {PI05_REPO_ID} revision; "
+            f"found {sorted(sources)}")
+    return next(iter(sources))
+
+
+def run_diversity_chunk_selector_worker(*, shard_count: int = 4, shard_index: int = 0,
+                                        episodes_per_task: int = 10,
+                                        episode_limit: int | None = None,
+                                        manifest_hash: str = "",
+                                        diversity_experiment_prefix: str =
+                                        DIVERSITY_V2_EXPERIMENT_PREFIX,
+                                        experiment: str =
+                                        DIVERSITY_CHUNK_SELECTOR_EXPERIMENT):
+    """Online per-chunk selection: source+m1 versus two source queries.
+
+    Every arm starts from the exact same PRO identity. At each decision point both candidate
+    policies receive the live observation, use matched candidate-slot noise, and execute the
+    clean chunk with lower K=5 (3,4) uncertainty. Candidate actions and disagreement summaries
+    are persisted through the existing generated-chunks blob and ``ms_candidate_u`` JSON.
+    """
+    from . import models
+    from .config import Method, RolloutConfig
+    from .experiments import (_prepare_libero_pro_expanded_episodes, _run_collection,
+                              identity_shard)
+    from .store import SupabaseStore, gather_provenance
+    import torch
+
+    if not manifest_hash:
+        raise ValueError("manifest_hash is required; load the shared v2 Drive manifest")
+    if not torch.cuda.is_available():
+        raise RuntimeError("the online two-policy selector requires a CUDA GPU")
+    store = SupabaseStore()
+    source_repo, source_revision = source_checkpoint_model_source(store)
+    m1_repo, m1_revision = diversity_model_source(
+        store, member_index=1, experiment_prefix=diversity_experiment_prefix)
+    manifest = _prepare_libero_pro_expanded_episodes(episodes_per_task)
+    expected_identities = 13 * 10 * int(episodes_per_task)
+    if len(manifest) != expected_identities:
+        raise ValueError(
+            f"expected {expected_identities} identities for 13 suites x 10 tasks x "
+            f"{episodes_per_task} episodes, found {len(manifest)}")
+    episodes = identity_shard(manifest, shard_count, shard_index)
+    if episode_limit is not None:
+        if int(episode_limit) < 1:
+            raise ValueError("episode_limit must be positive or None")
+        episodes = episodes[:int(episode_limit)]
+
+    source_id = f"{source_repo}@{source_revision}"
+    m1_id = f"{m1_repo}@{m1_revision}"
+    common = dict(num_samples=2, pnp_k=5, ms_probe_steps=(3, 4),
+                  save_trajectory=True, save_generated_chunks=True,
+                  skip_unused_renders=True, render_lead=2)
+    methods = [
+        (Method.CHUNK_SOURCE_SOURCE, RolloutConfig(
+            **common, candidate_set_id=f"{source_id}|{source_id}")),
+        (Method.CHUNK_SOURCE_M1, RolloutConfig(
+            **common, candidate_set_id=f"{source_id}|{m1_id}")),
+    ]
+    props = torch.cuda.get_device_properties(0)
+    print({"gpu": props.name, "gpu_memory_gib": round(props.total_memory / 2 ** 30, 1),
+           "source": source_id, "model_1": m1_id,
+           "episodes_in_shard": len(episodes), "arms": [name for name, _ in methods]})
+    source_policy, source_preprocess, source_postprocess = models.load_pi05(
+        repo_id=source_repo, revision=source_revision)
+    m1_policy, m1_preprocess, m1_postprocess = models.load_pi05(
+        repo_id=m1_repo, revision=m1_revision)
+    device = models.default_device()
+    candidate_bundles = {
+        Method.CHUNK_SOURCE_SOURCE: [
+            ("source_query_0", source_policy, source_preprocess, source_postprocess),
+            ("source_query_1", source_policy, source_preprocess, source_postprocess)],
+        Method.CHUNK_SOURCE_M1: [
+            ("source", source_policy, source_preprocess, source_postprocess),
+            ("model_1", m1_policy, m1_preprocess, m1_postprocess)],
+    }
+    _run_collection(
+        store=store, policy=source_policy, preprocess=source_preprocess,
+        postprocess=source_postprocess, device=device, experiment=experiment,
+        episodes=episodes, methods=methods,
+        cohort="per_chunk_source_m1_vs_source_requery",
+        shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="pi05_diversity_chunk_selector",
+        run_metadata={
+            "source_model_repo_id": source_repo, "source_model_revision": source_revision,
+            "member1_model_repo_id": m1_repo, "member1_model_revision": m1_revision,
+            "diversity_experiment_prefix": diversity_experiment_prefix,
+            "bootstrap_manifest_hash": manifest_hash, "pnp_k": 5,
+            "pnp_steps": [3, 4], "episodes_per_task": episodes_per_task,
+            "episode_limit": episode_limit,
+            "requested_methods": [name for name, _ in methods]},
+        provenance=gather_provenance(
+            model_repo_id=source_repo, model_revision=source_revision),
+        report_every=50, candidate_bundles_by_method=candidate_bundles)
+
+
 def _fetch_for_rollouts(store, table: str, rollout_ids: list[str], columns: str = "*") -> list[dict]:
     rows = []
     for start in range(0, len(rollout_ids), 100):
@@ -651,6 +762,160 @@ def _paired_delta_ci(baseline, policy, *, n_boot: int = 5000,
     rng = np.random.default_rng(seed)
     sampled = rng.choice(delta, size=(n_boot, len(delta)), replace=True).mean(axis=1)
     return tuple(map(float, np.quantile(sampled, [.025, .975])))
+
+
+def fetch_diversity_chunk_selector(
+        store, *, experiment: str = DIVERSITY_CHUNK_SELECTOR_EXPERIMENT) -> pd.DataFrame:
+    """Fetch and validate completed online source-requery/source+m1 selector rollouts."""
+    from .config import Method
+
+    methods = {Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_M1}
+    rows = store.fetch_all(
+        "rollouts", "*", configure=lambda query: query.eq("experiment", experiment),
+        order_by=("rollout_id",))
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        raise ValueError(f"no rollouts found for {experiment}")
+    frame = frame[frame.method.isin(methods)].copy()
+    if set(frame.method.unique()) != methods:
+        raise ValueError(
+            f"chunk selector requires {sorted(methods)}; found {sorted(frame.method.unique())}")
+    if frame.status.ne("completed").any():
+        raise ValueError("chunk selector analysis requires completed rollout rows")
+    if set(frame.pnp_k.dropna().astype(int)) != {5}:
+        raise ValueError("chunk selector rollouts are not uniformly K=5")
+    schedules = {tuple(value or []) for value in frame.pnp_step_indices}
+    if schedules != {(3, 4)}:
+        raise ValueError(f"chunk selector schedules are {sorted(schedules)}, not (3,4)")
+    if frame.duplicated(DIVERSITY_PAIR_KEYS + ["method"]).any():
+        raise ValueError("chunk selector contains duplicate method/episode identities")
+    return frame
+
+
+def _candidate_trace_rows(rollouts: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for rollout in rollouts.to_dict("records"):
+        trace = rollout.get("ms_candidate_u")
+        if isinstance(trace, str):
+            trace = json.loads(trace)
+        if not isinstance(trace, dict):
+            raise ValueError(f"rollout {rollout['rollout_id']} has no candidate trace")
+        choices, uncertainties = trace.get("chosen", []), trace.get("u", [])
+        disagreements = trace.get("action_disagreement", [])
+        chosen_labels = trace.get("chosen_label", [])
+        labels = list(trace.get("labels", []))
+        if len(choices) != len(uncertainties) or len(choices) != int(rollout["n_chunks"]):
+            raise ValueError(f"rollout {rollout['rollout_id']} has an incomplete candidate trace")
+        for chunk_idx, (chosen, candidate_u) in enumerate(zip(choices, uncertainties)):
+            if len(candidate_u) != 2:
+                raise ValueError("online selector analysis requires exactly two candidates")
+            disagreement = (disagreements[chunk_idx]
+                            if chunk_idx < len(disagreements) else {}) or {}
+            rows.append({
+                **{key: rollout[key] for key in DIVERSITY_PAIR_KEYS},
+                "rollout_id": rollout["rollout_id"], "method": rollout["method"],
+                "success": bool(rollout["success"]), "chunk_idx": chunk_idx,
+                "chosen_idx": int(chosen),
+                "chosen_label": (chosen_labels[chunk_idx]
+                                 if chunk_idx < len(chosen_labels) else None),
+                "candidate0_label": labels[0] if len(labels) > 0 else None,
+                "candidate1_label": labels[1] if len(labels) > 1 else None,
+                "candidate0_u": float(candidate_u[0]),
+                "candidate1_u": float(candidate_u[1]),
+                "candidate_u_gap": float(abs(candidate_u[0] - candidate_u[1])),
+                **{key: disagreement.get(key) for key in (
+                    "action_l2_mean", "action_l2_max", "first_action_l2",
+                    "action_abs_mean", "action_l2_normalized", "action_cosine",
+                    "gripper_sign_disagreement")},
+            })
+    return pd.DataFrame(rows)
+
+
+def _chunk_diversity_summary(group: pd.DataFrame) -> dict:
+    return {
+        "n_chunks": len(group),
+        "candidate1_selected_rate": float(group.chosen_idx.eq(1).mean()),
+        "candidate0_u_mean": float(group.candidate0_u.mean()),
+        "candidate1_u_mean": float(group.candidate1_u.mean()),
+        "candidate_u_gap_mean": float(group.candidate_u_gap.mean()),
+        **{f"{column}_mean": float(group[column].dropna().mean())
+           for column in ("action_l2_mean", "action_l2_max", "first_action_l2",
+                          "action_abs_mean", "action_l2_normalized", "action_cosine",
+                          "gripper_sign_disagreement")},
+    }
+
+
+def analyze_diversity_chunk_selector(rollouts: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Paired SR and clean-action diversity for online source+m1 versus source requery."""
+    from .config import Method
+
+    arms = {}
+    metrics = ("rollout_id", "success", "max_steps", "n_steps", "n_chunks", "elapsed_s",
+               "inference_ms_total", "generated_chunks_path", "ms_candidate_u")
+    for method in (Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_M1):
+        arm = rollouts[rollouts.method.eq(method)].copy()
+        if arm.duplicated(DIVERSITY_PAIR_KEYS).any():
+            raise ValueError(f"{method} contains duplicate episode identities")
+        arms[method] = arm[DIVERSITY_PAIR_KEYS + list(metrics)].rename(columns={
+            column: f"{column}_{method}" for column in metrics})
+    paired = arms[Method.CHUNK_SOURCE_SOURCE].merge(
+        arms[Method.CHUNK_SOURCE_M1], on=DIVERSITY_PAIR_KEYS, validate="one_to_one")
+    if len(paired) != len(arms[Method.CHUNK_SOURCE_SOURCE]) or len(paired) != len(
+            arms[Method.CHUNK_SOURCE_M1]):
+        raise ValueError("chunk selector arms do not contain identical episode identities")
+    if not paired[f"max_steps_{Method.CHUNK_SOURCE_SOURCE}"].equals(
+            paired[f"max_steps_{Method.CHUNK_SOURCE_M1}"]):
+        raise ValueError("chunk selector arms contain different episode horizons")
+    control = paired[f"success_{Method.CHUNK_SOURCE_SOURCE}"].to_numpy(bool)
+    treatment = paired[f"success_{Method.CHUNK_SOURCE_M1}"].to_numpy(bool)
+    lo, hi = _paired_delta_ci(control, treatment)
+    paired_summary = pd.DataFrame([{
+        "n_pairs": len(paired), "source_requery_sr": float(control.mean()),
+        "source_m1_sr": float(treatment.mean()),
+        "source_m1_minus_requery_pp": float(100 * (treatment.mean() - control.mean())),
+        "delta_ci_low_pp": float(100 * lo), "delta_ci_high_pp": float(100 * hi),
+        "requery_fail_to_source_m1_success": int((~control & treatment).sum()),
+        "requery_success_to_source_m1_fail": int((control & ~treatment).sum()),
+    }])
+    by_suite_rows = []
+    for suite, group in paired.groupby("suite", sort=True):
+        suite_control = group[f"success_{Method.CHUNK_SOURCE_SOURCE}"].to_numpy(bool)
+        suite_treatment = group[f"success_{Method.CHUNK_SOURCE_M1}"].to_numpy(bool)
+        suite_lo, suite_hi = _paired_delta_ci(suite_control, suite_treatment)
+        by_suite_rows.append({
+            "suite": suite, "n_pairs": len(group),
+            "source_requery_sr": float(suite_control.mean()),
+            "source_m1_sr": float(suite_treatment.mean()),
+            "source_m1_minus_requery_pp": float(
+                100 * (suite_treatment.mean() - suite_control.mean())),
+            "delta_ci_low_pp": float(100 * suite_lo),
+            "delta_ci_high_pp": float(100 * suite_hi),
+            "F_to_S": int((~suite_control & suite_treatment).sum()),
+            "S_to_F": int((suite_control & ~suite_treatment).sum()),
+        })
+    chunks = _candidate_trace_rows(rollouts)
+    diversity_overall = pd.DataFrame([
+        {"method": method, **_chunk_diversity_summary(group)}
+        for method, group in chunks.groupby("method", sort=True)])
+    diversity_by_chunk = pd.DataFrame([
+        {"method": method, "chunk_idx": int(chunk_idx),
+         **_chunk_diversity_summary(group)}
+        for (method, chunk_idx), group in chunks.groupby(
+            ["method", "chunk_idx"], sort=True)])
+    diversity_by_outcome = pd.DataFrame([
+        {"method": method, "success": bool(success),
+         **_chunk_diversity_summary(group)}
+        for (method, success), group in chunks.groupby(
+            ["method", "success"], sort=True)])
+    return {
+        "chunk_selector_paired_episodes": paired,
+        "chunk_selector_paired_summary": paired_summary,
+        "chunk_selector_by_suite": pd.DataFrame(by_suite_rows),
+        "chunk_selector_candidate_chunks": chunks,
+        "chunk_selector_diversity_overall": diversity_overall,
+        "chunk_selector_diversity_by_chunk": diversity_by_chunk,
+        "chunk_selector_diversity_by_outcome": diversity_by_outcome,
+    }
 
 
 def _selective_score_specs() -> list[dict]:
@@ -1406,6 +1671,93 @@ def diversity_signal_figures(tables: dict[str, pd.DataFrame], output_dir: str | 
                title="Does action diversity create complementary outcomes?")
         fig.tight_layout(); path = output / "diversity_action_disagreement.png"
         fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+    return written
+
+
+def diversity_chunk_selector_figures(tables: dict[str, pd.DataFrame],
+                                     output_dir: str | Path) -> list[Path]:
+    """Primary SR and clean-action-diversity plots for the online selector experiment."""
+    import matplotlib.pyplot as plt
+    from .config import Method
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    written = []
+    summary = tables["chunk_selector_paired_summary"].iloc[0]
+    labels, values, colors = [], [], []
+    if "chunk_selector_source_baseline" in tables:
+        labels.append("single source")
+        values.append(float(tables["chunk_selector_source_baseline"].source_baseline_sr.iloc[0]))
+        colors.append("#9D9D9D")
+    labels.extend(["source, 2 queries", "source + model 1"])
+    values.extend([summary.source_requery_sr, summary.source_m1_sr])
+    colors.extend(["#4C78A8", "#F58518"])
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(labels, 100 * np.asarray(values), color=colors)
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, 100 * value + .7,
+                f"{100 * value:.1f}%", ha="center")
+    ax.set(ylabel="Success rate (%)", ylim=(0, 105),
+           title=f"Online per-chunk selection ({int(summary.n_pairs)} matched episodes)")
+    fig.tight_layout()
+    path = output / "chunk_selector_success_rates.png"
+    fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+    by_suite = tables["chunk_selector_by_suite"].sort_values("suite")
+    x = np.arange(len(by_suite))
+    fig, ax = plt.subplots(figsize=(15, 5.5))
+    ax.bar(x - .2, 100 * by_suite.source_requery_sr, width=.4,
+           label="source, 2 queries", color="#4C78A8")
+    ax.bar(x + .2, 100 * by_suite.source_m1_sr, width=.4,
+           label="source + model 1", color="#F58518")
+    ax.set_xticks(x, by_suite.suite.str.removeprefix("libero_"), rotation=35, ha="right")
+    ax.set(ylabel="Success rate (%)", ylim=(0, 105),
+           title="Per-suite online selector success rates")
+    ax.legend()
+    fig.tight_layout()
+    path = output / "chunk_selector_success_by_suite.png"
+    fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+    chunks = tables["chunk_selector_candidate_chunks"].copy()
+    method_labels = {Method.CHUNK_SOURCE_SOURCE: "source vs source",
+                     Method.CHUNK_SOURCE_M1: "source vs model 1"}
+    method_colors = {Method.CHUNK_SOURCE_SOURCE: "#4C78A8",
+                     Method.CHUNK_SOURCE_M1: "#F58518"}
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    for method, group in chunks.groupby("method", sort=True):
+        label, color = method_labels.get(method, method), method_colors.get(method)
+        axes[0].hist(group.action_l2_mean.dropna(), bins=30, alpha=.55,
+                     density=True, label=label, color=color)
+        axes[1].hist(group.action_l2_normalized.dropna(), bins=30, alpha=.55,
+                     density=True, label=label, color=color)
+    axes[0].set(xlabel="Mean clean-chunk action L2", ylabel="Density",
+                title="Absolute candidate disagreement")
+    axes[1].set(xlabel="Normalized clean-chunk action L2", ylabel="Density",
+                title="Scale-normalized disagreement")
+    for axis in axes:
+        axis.legend()
+    fig.tight_layout()
+    path = output / "chunk_selector_action_diversity.png"
+    fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+    by_chunk = tables["chunk_selector_diversity_by_chunk"]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    for method, group in by_chunk.groupby("method", sort=True):
+        group = group.sort_values("chunk_idx")
+        label, color = method_labels.get(method, method), method_colors.get(method)
+        axes[0].plot(group.chunk_idx, group.action_l2_normalized_mean,
+                     marker="o", label=label, color=color)
+        axes[1].plot(group.chunk_idx, 100 * group.candidate1_selected_rate,
+                     marker="o", label=label, color=color)
+    axes[0].set(xlabel="Chunk index", ylabel="Mean normalized action L2",
+                title="Candidate diversity over the rollout")
+    axes[1].set(xlabel="Chunk index", ylabel="Candidate 1 selected (%)",
+                title="Which candidate has lower uncertainty?")
+    for axis in axes:
+        axis.legend()
+    fig.tight_layout()
+    path = output / "chunk_selector_diversity_by_chunk.png"
+    fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
     return written
 
 

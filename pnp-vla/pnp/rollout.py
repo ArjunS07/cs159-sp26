@@ -19,7 +19,7 @@ import torch
 
 from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, VIDEO_FPS, RolloutConfig
 from .libero_env import make_env, obs_to_policy, set_camera_observables
-from .pnp import PnPRecorder, _pnp_seed_perturb, multi_sample_select
+from .pnp import PnPRecorder, _pnp_seed_perturb, multi_policy_select, multi_sample_select
 from .tap import RolloutTap
 from . import sampler as _sampler
 
@@ -35,6 +35,15 @@ def episode_seed(init_state, episode_idx) -> int:
 def chunk_noise_seed(ep_seed: int, chunk_idx: int) -> int:
     """Deterministic per-(episode,chunk) noise seed — the same across every method."""
     b = hashlib.md5(f"{int(ep_seed)}:{int(chunk_idx)}".encode()).digest()
+    return int.from_bytes(b[:4], "big")
+
+
+def candidate_chunk_noise_seed(ep_seed: int, chunk_idx: int, candidate_idx: int) -> int:
+    """Stable candidate seed; slot 0 retains the ordinary rollout's chunk seed."""
+    if int(candidate_idx) == 0:
+        return chunk_noise_seed(ep_seed, chunk_idx)
+    b = hashlib.md5(
+        f"{int(ep_seed)}:{int(chunk_idx)}:candidate:{int(candidate_idx)}".encode()).digest()
     return int.from_bytes(b[:4], "big")
 
 
@@ -92,6 +101,37 @@ def compute_instability(executed_actions, chunk_boundary_actions=None, gripper_d
     )
 
 
+def candidate_action_disagreement(actions, action_dim: int = ADIM,
+                                  gripper_dim: int = 6) -> dict:
+    """Compact diversity metrics for two clean, non-perturbed candidate action chunks."""
+    if len(actions) != 2:
+        raise ValueError("candidate disagreement currently requires exactly two actions")
+    arrays = [action.squeeze(0).detach().float().cpu().numpy() for action in actions]
+    horizon = min(len(array) for array in arrays)
+    a0 = arrays[0][:horizon, :action_dim]
+    a1 = arrays[1][:horizon, :action_dim]
+    delta = a0 - a1
+    per_action_l2 = np.linalg.norm(delta, axis=1)
+    scale = np.mean((np.linalg.norm(a0, axis=1) + np.linalg.norm(a1, axis=1)) / 2)
+    flat0, flat1 = a0.reshape(-1), a1.reshape(-1)
+    cosine_denominator = np.linalg.norm(flat0) * np.linalg.norm(flat1)
+    cosine = (float(np.dot(flat0, flat1) / cosine_denominator)
+              if cosine_denominator > 0 else None)
+    gripper_disagreement = None
+    if gripper_dim < action_dim:
+        gripper_disagreement = float(np.mean(
+            (a0[:, gripper_dim] > 0) != (a1[:, gripper_dim] > 0)))
+    return {
+        "action_l2_mean": float(per_action_l2.mean()),
+        "action_l2_max": float(per_action_l2.max()),
+        "first_action_l2": float(per_action_l2[0]),
+        "action_abs_mean": float(np.abs(delta).mean()),
+        "action_l2_normalized": float(per_action_l2.mean() / max(scale, 1e-12)),
+        "action_cosine": cosine,
+        "gripper_sign_disagreement": gripper_disagreement,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config -> tap (the notebook never constructs the tap directly)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +147,7 @@ def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int):
 # The one rollout primitive.
 # ─────────────────────────────────────────────────────────────────────────────
 def run_episode(env, ep, policy, preprocess, postprocess, device,
-                config: RolloutConfig | None = None):
+                config: RolloutConfig | None = None, *, candidate_bundles=None):
     """Run one episode under `config`. Returns a result dict (outcome, metrics, trajectory,
     recorder episode, and sink outputs — pcp_chunks / pcp_telemetry / ms_selections).
 
@@ -119,10 +159,22 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     max_steps = ep["max_steps"]
     chunk_size = policy.config.chunk_size
     multisample = config.num_samples is not None
+    if candidate_bundles is not None:
+        candidate_bundles = list(candidate_bundles)
+        if not multisample or len(candidate_bundles) != int(config.num_samples):
+            raise ValueError(
+                "candidate_bundles requires num_samples equal to the number of candidates")
+        if any(len(bundle) != 4 for bundle in candidate_bundles):
+            raise ValueError(
+                "each candidate bundle must be (label, policy, preprocess, postprocess)")
 
     recorder = PnPRecorder()
     tap = build_tap(config, recorder, device, adim)
-    model._pnp.num_steps = config.num_inference_steps   # extra_steps override (None = default)
+    runtime_policies = ([bundle[1] for bundle in candidate_bundles]
+                        if candidate_bundles is not None else [policy])
+    unique_policies = list({id(item): item for item in runtime_policies}.values())
+    for runtime_policy in unique_policies:
+        runtime_policy.model._pnp.num_steps = config.num_inference_steps
 
     ep_seed = episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
     torch.manual_seed(ep_seed)
@@ -131,13 +183,17 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     _pnp_seed_perturb(ep_seed)                           # isolated perturbation stream
 
     _sampler.set_strategy(model, tap)
-    model._pnp.vf_evals = 0
+    for runtime_policy in unique_policies:
+        runtime_policy.model._pnp.vf_evals = 0
     recorder.new_episode(meta={k: ep.get(k) for k in ("suite", "task_idx", "ep_idx")})
 
     est_chunks = max(1, round(max_steps / chunk_size))
     queue, ci = [], 0
+    queue_postprocess = postprocess
     executed_actions, robot_states, chunk_boundary_actions, chunk_noise_seeds = [], [], [], []
     generated_chunks = [] if config.save_generated_chunks else None
+    candidate_generated_chunks = (
+        [] if config.save_generated_chunks and candidate_bundles is not None else None)
     ms_selections = [] if multisample else None
     # capture agentview frames when either sink wants them (obs_frames OR a video)
     frames = [] if (config.save_observations or config.video != "off") else None
@@ -165,7 +221,8 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
 
     try:
         env.reset()
-        policy.reset()
+        for runtime_policy in unique_policies:
+            runtime_policy.reset()
         obs = env.set_init_state(ep["init_state"])
         for wait_step in range(NUM_STEPS_WAIT):
             # Only the final settling observation feeds the first policy call, but the cameras
@@ -175,23 +232,54 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
 
         for step in range(max_steps):
             if not queue:
-                model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
+                for runtime_policy in unique_policies:
+                    runtime_policy.model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
                 cns = chunk_noise_seed(ep_seed, ci)
                 chunk_noise_seeds.append(cns)
                 noise = _draw_chunk_noise(policy, device, cns)
-                batch = preprocess(obs_to_policy(obs, task_desc))
                 inference_t0 = time.perf_counter()
-                if multisample:
+                if candidate_bundles is not None:
+                    candidate_inputs, candidate_noises, perturb_seeds = [], [], []
+                    for candidate_index, (_, candidate_policy, candidate_preprocess,
+                                          _) in enumerate(candidate_bundles):
+                        candidate_inputs.append((
+                            candidate_policy,
+                            candidate_preprocess(obs_to_policy(obs, task_desc))))
+                        candidate_seed = candidate_chunk_noise_seed(
+                            ep_seed, ci, candidate_index)
+                        candidate_noises.append(
+                            _draw_chunk_noise(candidate_policy, device, candidate_seed))
+                        perturb_seeds.append(candidate_seed)
+                    chunk, chosen, cand_u, candidate_actions = multi_policy_select(
+                        candidate_inputs, candidate_noises, tuple(config.ms_probe_steps),
+                        num_iterations=config.pnp_k, perturb_seeds=perturb_seeds)
+                    labels = [str(bundle[0]) for bundle in candidate_bundles]
+                    ms_selections.append({
+                        "chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u,
+                        "labels": labels, "chosen_label": labels[chosen],
+                        "action_disagreement": candidate_action_disagreement(
+                            candidate_actions, action_dim=adim)})
+                    if candidate_generated_chunks is not None:
+                        candidate_generated_chunks.append(np.stack([
+                            action.squeeze(0).detach().float().cpu().numpy()
+                            for action in candidate_actions]))
+                    queue_postprocess = candidate_bundles[chosen][3]
+                elif multisample:
+                    batch = preprocess(obs_to_policy(obs, task_desc))
                     def _noise_of(si, _ci=ci):
                         return _draw_chunk_noise(policy, device,
                                                  chunk_noise_seed(ep_seed, _ci * 1000 + si))
                     chunk, chosen, cand_u = multi_sample_select(
                         policy, batch, ep_seed, ci, config.num_samples,
-                        tuple(config.ms_probe_steps), _noise_of)
+                        tuple(config.ms_probe_steps), _noise_of,
+                        num_iterations=config.pnp_k)
                     ms_selections.append({"chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u})
+                    queue_postprocess = postprocess
                 else:
+                    batch = preprocess(obs_to_policy(obs, task_desc))
                     with torch.no_grad():
                         chunk = policy.predict_action_chunk(batch, noise=noise)
+                    queue_postprocess = postprocess
                 arr = chunk.squeeze(0).detach().cpu().numpy()
                 if generated_chunks is not None:
                     generated_chunks.append(arr.copy())
@@ -207,7 +295,7 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
             # the official postprocessor's environment-space action, exactly as in LeRobot's
             # select_action evaluation path and the pre-refactor notebooks.
             action = torch.as_tensor(a, device=device).unsqueeze(0)
-            action = postprocess(action)
+            action = queue_postprocess(action)
             if isinstance(action, torch.Tensor):
                 a = action.squeeze(0).detach().cpu().numpy()
             else:
@@ -242,7 +330,8 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     recorder.close_episode(success, n_steps)
     inst = compute_instability(executed_actions, chunk_boundary_actions)
 
-    vf_evals = int(model._pnp.vf_evals)
+    vf_evals = sum(int(runtime_policy.model._pnp.vf_evals)
+                   for runtime_policy in unique_policies)
     if vf_evals == 0:                                   # vanilla path (orig sampler doesn't count)
         vf_evals = (config.num_inference_steps or policy.config.num_inference_steps) * max(ci, 1)
 
@@ -264,8 +353,12 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
             actions=np.asarray(executed_actions, dtype=np.float32),
             robot_state=np.asarray(robot_states, dtype=np.float32),
         ) if config.save_trajectory else None,
-        generated_chunks=(dict(chunks=np.asarray(generated_chunks, dtype=np.float32))
-                          if generated_chunks is not None else None),
+        generated_chunks=(dict(
+            chunks=np.asarray(generated_chunks, dtype=np.float32),
+            **({"candidate_chunks": np.asarray(
+                candidate_generated_chunks, dtype=np.float32)}
+               if candidate_generated_chunks is not None else {}))
+            if generated_chunks is not None else None),
         obs_frames=frames if config.save_observations else None,
         video=video_bytes,
     )

@@ -11,14 +11,62 @@ from pnp.config import RolloutConfig
 from pnp.diversity import (DIVERSITY_EXPERIMENT_PREFIX, DIVERSITY_V2_EXPERIMENT_PREFIX,
                            aggregation_gate_signal_window_sweep,
                            analyze_checkpoint_refinement,
+                           analyze_diversity_chunk_selector,
                            analyze_diversity_selective_refinement, analyze_diversity_signal,
                            analyze_source_member_ensembles,
                            bootstrap_manifest_summary,
                            bootstrap_sampler_class, build_bootstrap_manifest,
                            diversity_baseline_cohort, diversity_experiment,
+                           diversity_chunk_selector_figures,
                            diversity_model_source,
                            diversity_selective_refinement_figures,
                            validate_bootstrap_manifest)
+
+
+def test_online_chunk_selector_reports_paired_sr_and_action_diversity(tmp_path):
+    from pnp.config import Method
+
+    rows = []
+    control_success = [False, False, True, True]
+    treatment_success = [True, False, True, False]
+    for episode_idx in range(4):
+        identity = {"suite": f"suite_{episode_idx % 2}", "task_idx": 0,
+                    "episode_idx": episode_idx, "init_state_hash": f"h{episode_idx}"}
+        for method, success, labels, disagreement in [
+                (Method.CHUNK_SOURCE_SOURCE, control_success[episode_idx],
+                 ["source_query_0", "source_query_1"], .1),
+                (Method.CHUNK_SOURCE_M1, treatment_success[episode_idx],
+                 ["source", "model_1"], .3)]:
+            trace = {
+                "chosen": [0, 1], "u": [[.02, .03], [.04, .01]], "labels": labels,
+                "chosen_label": [labels[0], labels[1]],
+                "action_disagreement": [{
+                    "action_l2_mean": disagreement, "action_l2_max": disagreement,
+                    "first_action_l2": disagreement, "action_abs_mean": disagreement / 2,
+                    "action_l2_normalized": disagreement,
+                    "action_cosine": 1 - disagreement,
+                    "gripper_sign_disagreement": 0.0} for _ in range(2)]}
+            rows.append({**identity, "rollout_id": f"{method}-{episode_idx}",
+                         "method": method, "success": success, "n_steps": 20,
+                         "max_steps": 20,
+                         "n_chunks": 2, "elapsed_s": 1., "inference_ms_total": 100.,
+                         "generated_chunks_path": f"chunks/{method}-{episode_idx}.npz",
+                         "ms_candidate_u": trace})
+    tables = analyze_diversity_chunk_selector(pd.DataFrame(rows))
+    summary = tables["chunk_selector_paired_summary"].iloc[0]
+    assert summary.n_pairs == 4
+    assert summary.requery_fail_to_source_m1_success == 1
+    assert summary.requery_success_to_source_m1_fail == 1
+    diversity = tables["chunk_selector_diversity_overall"].set_index("method")
+    assert diversity.loc[
+        Method.CHUNK_SOURCE_M1, "action_l2_mean_mean"] > diversity.loc[
+            Method.CHUNK_SOURCE_SOURCE, "action_l2_mean_mean"]
+    tables["chunk_selector_source_baseline"] = pd.DataFrame([
+        {"n": 4, "source_baseline_sr": .25}])
+    figures = diversity_chunk_selector_figures(tables, tmp_path)
+    assert {path.name for path in figures} == {
+        "chunk_selector_success_rates.png", "chunk_selector_success_by_suite.png",
+        "chunk_selector_action_diversity.png", "chunk_selector_diversity_by_chunk.png"}
 
 
 def _training_module():
