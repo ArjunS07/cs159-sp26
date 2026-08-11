@@ -858,6 +858,8 @@ for name, frame in source_member.items():
 
 source_member_best = source_member["source_member_best_windows"]
 source_member_overall = source_member["source_member_overall"]
+source_member_reference = window_comparison[[
+    "score_name", "source_window_delta_pp", "source_window_sr"]].copy()
 source_member_comparison = (
     source_member_best[source_member_best.score_name.isin(horizons)][[
         "ensemble", "member_index", "score_name", "lower", "upper", "n_refined",
@@ -865,7 +867,7 @@ source_member_comparison = (
     .merge(source_member_overall[source_member_overall.score_name.isin(horizons)][[
         "ensemble", "score_name", "lower_u_baseline_sr", "best_fixed_member_sr"]],
         on=["ensemble", "score_name"], validate="one_to_one")
-    .merge(source_reference, on="score_name", validate="many_to_one"))
+    .merge(source_member_reference, on="score_name", validate="many_to_one"))
 source_member_comparison["delta_advantage_vs_source_pp"] = (
     source_member_comparison.delta_pp - source_member_comparison.source_window_delta_pp)
 source_member_comparison["window_sr_vs_source_window_pp"] = 100 * (
