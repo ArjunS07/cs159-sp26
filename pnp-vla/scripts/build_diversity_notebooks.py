@@ -1070,16 +1070,20 @@ MANIFEST_PATH = Path(
     "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
 manifest = load_bootstrap_manifest(MANIFEST_PATH)
 assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+SOURCE_MODEL_REVISION = manifest["source_model_revision"]
+assert SOURCE_MODEL_REVISION, "v2 manifest is missing source_model_revision"
 
 print({{"experiment": EXPERIMENT, "episodes_per_task": EPISODES_PER_TASK,
        "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
        "episode_limit": EPISODE_LIMIT,
-       "manifest_hash": manifest["manifest_hash"]}})
+       "manifest_hash": manifest["manifest_hash"],
+       "source_model_revision": SOURCE_MODEL_REVISION}})
 run_diversity_chunk_selector_worker(
     episodes_per_task=EPISODES_PER_TASK,
     episode_limit=EPISODE_LIMIT,
     shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
     manifest_hash=manifest["manifest_hash"],
+    source_model_revision=SOURCE_MODEL_REVISION,
     diversity_experiment_prefix=DIVERSITY_V2_EXPERIMENT_PREFIX,
     experiment=EXPERIMENT)'''),
     ], f"22_diversity_chunk_selector_worker_{shard_index}.ipynb")

@@ -20,7 +20,36 @@ from pnp.diversity import (DIVERSITY_EXPERIMENT_PREFIX, DIVERSITY_V2_EXPERIMENT_
                            diversity_chunk_selector_figures,
                            diversity_model_source,
                            diversity_selective_refinement_figures,
+                           source_checkpoint_model_source,
                            validate_bootstrap_manifest)
+
+
+class _SourceRunStore:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetch_all(self, *_args, **_kwargs):
+        return self.rows
+
+
+def test_source_checkpoint_uses_explicit_manifest_revision_when_history_omits_it():
+    from pnp.config import PI05_REPO_ID
+
+    store = _SourceRunStore([
+        {"model_repo_id": PI05_REPO_ID, "model_revision": None},
+    ])
+    assert source_checkpoint_model_source(
+        store, expected_revision="manifest-sha") == (PI05_REPO_ID, "manifest-sha")
+
+
+def test_source_checkpoint_rejects_manifest_history_revision_disagreement():
+    from pnp.config import PI05_REPO_ID
+
+    store = _SourceRunStore([
+        {"model_repo_id": PI05_REPO_ID, "model_revision": "historical-sha"},
+    ])
+    with np.testing.assert_raises_regex(ValueError, "manifest pins"):
+        source_checkpoint_model_source(store, expected_revision="different-sha")
 
 
 def test_online_chunk_selector_reports_paired_sr_and_action_diversity(tmp_path):

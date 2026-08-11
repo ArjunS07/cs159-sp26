@@ -482,8 +482,14 @@ def run_diversity_refinement_worker(*, member_index: int,
     )
 
 
-def source_checkpoint_model_source(store) -> tuple[str, str]:
-    """Return the immutable source checkpoint used by the expanded PRO experiment."""
+def source_checkpoint_model_source(store, *, expected_revision: str = "") -> tuple[str, str]:
+    """Return the immutable source checkpoint, using the v2 manifest revision when supplied.
+
+    Older expanded-PRO ``experiment_runs`` rows recorded the source repository but not its
+    immutable Hub revision.  The v2 bootstrap manifest does record that revision, so online
+    source/member comparisons must pass it explicitly.  Any historical non-null revisions are
+    still checked for disagreement.
+    """
     from .config import PI05_REPO_ID
     from .experiments import PRO_EXPANDED_EXPERIMENT
 
@@ -491,21 +497,34 @@ def source_checkpoint_model_source(store) -> tuple[str, str]:
         "experiment_runs", "model_repo_id,model_revision",
         configure=lambda query: query.eq("experiment", PRO_EXPANDED_EXPERIMENT),
         order_by=("run_id",))
-    sources = {
-        (str(row.get("model_repo_id") or ""), str(row.get("model_revision") or ""))
-        for row in runs if row.get("model_repo_id") == PI05_REPO_ID and row.get("model_revision")
-    }
-    if len(sources) != 1:
+    repos = {str(row.get("model_repo_id")) for row in runs if row.get("model_repo_id")}
+    if repos and repos != {PI05_REPO_ID}:
         raise ValueError(
-            f"{PRO_EXPANDED_EXPERIMENT} must identify one immutable {PI05_REPO_ID} revision; "
-            f"found {sorted(sources)}")
-    return next(iter(sources))
+            f"{PRO_EXPANDED_EXPERIMENT} must use only {PI05_REPO_ID}; found {sorted(repos)}")
+    revisions = {
+        str(row["model_revision"])
+        for row in runs
+        if row.get("model_repo_id") == PI05_REPO_ID and row.get("model_revision")
+    }
+    expected_revision = str(expected_revision or "").strip()
+    if expected_revision:
+        if revisions and revisions != {expected_revision}:
+            raise ValueError(
+                f"v2 manifest pins {PI05_REPO_ID}@{expected_revision}, but historical "
+                f"{PRO_EXPANDED_EXPERIMENT} rows record {sorted(revisions)}")
+        return PI05_REPO_ID, expected_revision
+    if len(revisions) == 1:
+        return PI05_REPO_ID, next(iter(revisions))
+    raise ValueError(
+        f"No unique immutable revision is recorded for {PI05_REPO_ID}; pass the "
+        "source_model_revision from the shared v2 bootstrap manifest")
 
 
 def run_diversity_chunk_selector_worker(*, shard_count: int = 4, shard_index: int = 0,
                                         episodes_per_task: int = 10,
                                         episode_limit: int | None = None,
                                         manifest_hash: str = "",
+                                        source_model_revision: str = "",
                                         diversity_experiment_prefix: str =
                                         DIVERSITY_V2_EXPERIMENT_PREFIX,
                                         experiment: str =
@@ -526,10 +545,14 @@ def run_diversity_chunk_selector_worker(*, shard_count: int = 4, shard_index: in
 
     if not manifest_hash:
         raise ValueError("manifest_hash is required; load the shared v2 Drive manifest")
+    if not source_model_revision:
+        raise ValueError(
+            "source_model_revision is required; pass it from the shared v2 Drive manifest")
     if not torch.cuda.is_available():
         raise RuntimeError("the online two-policy selector requires a CUDA GPU")
     store = SupabaseStore()
-    source_repo, source_revision = source_checkpoint_model_source(store)
+    source_repo, source_revision = source_checkpoint_model_source(
+        store, expected_revision=source_model_revision)
     m1_repo, m1_revision = diversity_model_source(
         store, member_index=1, experiment_prefix=diversity_experiment_prefix)
     manifest = _prepare_libero_pro_expanded_episodes(episodes_per_task)
