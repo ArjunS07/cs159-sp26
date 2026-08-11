@@ -515,6 +515,9 @@ This notebook combines the existing uncertainty-only arms with the matched K=5 `
 refine-last arms for both competent v2 models. The primary predeclared policy uses first-chunk
 uncertainty: select the lower-U model, refine it for the episode only when U is at least `0.03`.
 
+It can be run as a preview after shards 0-1: analysis is restricted to identities completed in
+all four member/method arms. Set `REQUIRE_FULL_COHORT=True` only after shards 0-3 finish.
+
 Prefix, individual-chunk, and full-episode summaries are also analyzed. Only the first-chunk rule
 is directly deployable from these independently simulated trajectories. Later scores are useful
 post-hoc evidence about predictiveness and headroom, but they are not presented as an online
@@ -528,71 +531,164 @@ from IPython.display import display, Image
 from pnp.config import Method
 from pnp.store import SupabaseStore
 from pnp.diversity import (DIVERSITY_FIXED_REFINEMENT_THRESHOLD,
-    DIVERSITY_V2_EXPERIMENT_PREFIX, analyze_diversity_selective_refinement,
+    DIVERSITY_PAIR_KEYS, DIVERSITY_V2_EXPERIMENT_PREFIX,
+    analyze_diversity_selective_refinement,
     diversity_selective_refinement_figures, fetch_diversity_selective_refinement)
 
 EXPERIMENT_PREFIX = DIVERSITY_V2_EXPERIMENT_PREFIX
 FIXED_THRESHOLD = DIVERSITY_FIXED_REFINEMENT_THRESHOLD  # predeclared 0.03
+REQUIRE_FULL_COHORT = False      # True only after shards 0,1,2,3 finish for both models
 OUTPUT = Path("diversity_selective_refinement_v2_outputs")
 OUTPUT.mkdir(exist_ok=True)
 
 store = SupabaseStore()
-rollouts, steps = fetch_diversity_selective_refinement(
+all_rollouts, all_steps = fetch_diversity_selective_refinement(
     store, experiment_prefix=EXPERIMENT_PREFIX)
+arm_counts = (all_rollouts.drop_duplicates(DIVERSITY_PAIR_KEYS + ["member_index", "method"])
+              .groupby(DIVERSITY_PAIR_KEYS).size().rename("n_arms").reset_index())
+complete_keys = arm_counts[arm_counts.n_arms == 4][DIVERSITY_PAIR_KEYS]
+rollouts = all_rollouts.merge(complete_keys, on=DIVERSITY_PAIR_KEYS, validate="many_to_one")
+steps = all_steps[all_steps.rollout_id.isin(rollouts.rollout_id)].copy()
 counts = (rollouts.groupby(["member_index", "method"]).size()
           .rename("n").reset_index())
 display(counts)
 expected_methods = {Method.UNCERTAINTY, Method.REFINEMENT}
 assert set(rollouts.method) == expected_methods
-assert set(counts.n) == {1300}, "Expected 1,300 matched identities in every member/method arm"
-assert len(rollouts) == 5200
-print({"rollouts": len(rollouts), "step_rows": len(steps),
+assert counts.n.nunique() == 1, "Four arms are not balanced after intersection"
+N_PER_ARM = int(counts.n.iloc[0])
+assert rollouts.suite.nunique() == 13
+if REQUIRE_FULL_COHORT:
+    assert N_PER_ARM == 1300, f"Full cohort requires 1,300/arm, found {N_PER_ARM}"
+print({"analysis_mode": "FULL" if REQUIRE_FULL_COHORT else "PARTIAL PREVIEW",
+       "identities_per_arm": N_PER_ARM,
+       "ignored_incomplete_identity_rows": int((arm_counts.n_arms < 4).sum()),
+       "rollouts": len(rollouts), "step_rows": len(steps),
        "experiments": sorted(rollouts.experiment.unique()),
        "fixed_threshold": FIXED_THRESHOLD})'''),
-    md("## 3. Build matched policies and uncertainty-horizon analyses"),
+    md("## 3. Per-model baseline, refinement, AUC, and windows"),
     code(r'''tables = analyze_diversity_selective_refinement(
     rollouts, steps, fixed_threshold=FIXED_THRESHOLD)
-
-overall = tables["selective_refinement_overall"]
 horizons = ["first_chunk", "prefix_2_chunks", "prefix_4_chunks",
             "prefix_8_chunks", "full_episode"]
+member_overall = tables["member_refinement_overall"]
+member_columns = ["member_index", "score_name", "n_pairs", "baseline_sr",
+                  "refinement_sr", "delta_pp", "delta_ci_low_pp", "delta_ci_high_pp",
+                  "F_to_S", "S_to_F", "failure_auc"]
+for member_index in (0, 1):
+    print(f"Model {member_index}: overall SR, matched refinement delta, and failure AUC")
+    display(member_overall[(member_overall.member_index == member_index) &
+                           member_overall.score_name.isin(horizons)][member_columns])
+    print(f"Model {member_index}: top exploratory uncertainty windows")
+    member_top = tables["member_refinement_top_windows"]
+    display(member_top[(member_top.member_index == member_index) &
+                       member_top.score_name.isin(horizons) & (member_top["rank"] <= 5)][[
+        "score_name", "rank", "lower", "upper", "n_refined", "selective_sr",
+        "delta_pp", "selected_F_to_S", "selected_S_to_F"]])'''),
+    md("""## 4. Match the shared source checkpoint on the same episodes
+
+The v2 members started from `lerobot/pi05_libero_finetuned`. This loads that checkpoint's previous
+K=5 `(3,4)` expanded-PRO rollouts and restricts them to the exact four-arm identity intersection.
+Source baseline is the direct competence comparison; source refinement is included for context."""),
+    code(r'''from pnp.config import PI05_REPO_ID
+from pnp.experiments import PRO_EXPANDED_EXPERIMENT
+
+source_runs = pd.DataFrame(store.fetch_all(
+    "experiment_runs", "run_id,model_repo_id,model_revision",
+    configure=lambda query: query.eq("experiment", PRO_EXPANDED_EXPERIMENT),
+    order_by=("run_id",)))
+display(source_runs[["model_repo_id", "model_revision"]].drop_duplicates())
+assert set(source_runs.model_repo_id.dropna()) == {PI05_REPO_ID}
+
+source_rows = pd.DataFrame(store.fetch_all(
+    "rollouts", "rollout_id,suite,task_idx,episode_idx,init_state_hash,method,status,success,"
+    "pnp_k,pnp_step_indices,refine_average",
+    configure=lambda query: query.eq("experiment", PRO_EXPANDED_EXPERIMENT),
+    order_by=("rollout_id",)))
+source_rows = source_rows[
+    source_rows.status.eq("completed") & source_rows.pnp_k.eq(5) &
+    source_rows.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4))]
+source_observed = source_rows[source_rows.method.eq(Method.UNCERTAINTY)][
+    DIVERSITY_PAIR_KEYS + ["success"]].rename(columns={"success": "source_baseline_success"})
+source_refined = source_rows[
+    source_rows.method.eq(Method.REFINEMENT) &
+    ~source_rows.refine_average.fillna(False).astype(bool)][
+    DIVERSITY_PAIR_KEYS + ["success"]].rename(columns={"success": "source_refinement_success"})
+assert not source_observed.duplicated(DIVERSITY_PAIR_KEYS).any()
+assert not source_refined.duplicated(DIVERSITY_PAIR_KEYS).any()
+
+paired = tables["selective_refinement_paired_episodes"]
+comparison = paired[DIVERSITY_PAIR_KEYS + ["success_observed_m0", "success_observed_m1"]].merge(
+    source_observed, on=DIVERSITY_PAIR_KEYS, validate="one_to_one")
+assert len(comparison), "No exact source-checkpoint episode matches were found"
+comparison = comparison.merge(
+    source_refined, on=DIVERSITY_PAIR_KEYS, how="left", validate="one_to_one")
+print(f"Source checkpoint matched {len(comparison)}/{len(paired)} current identities exactly")
+for column in ["success_observed_m0", "success_observed_m1", "source_baseline_success"]:
+    comparison[column] = comparison[column].astype(bool)
+comparison["source_refinement_success"] = comparison.source_refinement_success.astype("boolean")
+source_overall = pd.DataFrame([{
+    "n": len(comparison),
+    "source_baseline_sr": comparison.source_baseline_success.mean(),
+    "source_refinement_n": comparison.source_refinement_success.notna().sum(),
+    "source_refinement_sr": comparison.source_refinement_success.mean(),
+    "model0_baseline_sr": comparison.success_observed_m0.mean(),
+    "model1_baseline_sr": comparison.success_observed_m1.mean(),
+    "model0_delta_vs_source_pp": 100 * (
+        comparison.success_observed_m0.mean() - comparison.source_baseline_success.mean()),
+    "model1_delta_vs_source_pp": 100 * (
+        comparison.success_observed_m1.mean() - comparison.source_baseline_success.mean()),
+}])
+source_by_suite = pd.DataFrame([{
+    "suite": suite, "n": len(group),
+    "source_baseline_sr": group.source_baseline_success.mean(),
+    "source_refinement_n": group.source_refinement_success.notna().sum(),
+    "source_refinement_sr": group.source_refinement_success.mean(),
+    "model0_baseline_sr": group.success_observed_m0.mean(),
+    "model1_baseline_sr": group.success_observed_m1.mean(),
+} for suite, group in comparison.groupby("suite", sort=True)])
+tables["source_checkpoint_matched_episodes"] = comparison
+tables["source_checkpoint_overall"] = source_overall
+tables["source_checkpoint_by_suite"] = source_by_suite
+print("Matched shared-source checkpoint comparison")
+display(source_overall)
+display(source_by_suite)'''),
+    md("## 5. Two-model lower-uncertainty aggregation"),
+    code(r'''overall = tables["selective_refinement_overall"]
 columns = ["score_name", "interpretation", "n_pairs", "best_fixed_member_sr",
-           "lower_u_baseline_sr", "lower_u_refine_all_sr",
+           "lower_u_baseline_sr", "lower_u_delta_vs_best_fixed_pp",
+           "n_model_discordant", "lower_u_selector_accuracy_discordant",
+           "lower_u_selector_win_auc", "lower_u_refine_all_sr",
            "n_refined_fixed", "fixed_threshold_sr",
            "fixed_delta_vs_lower_u_pp", "fixed_delta_ci_low_pp",
            "fixed_delta_ci_high_pp", "fixed_F_to_S", "fixed_S_to_F"]
-print("Primary 0.03 gate and uncertainty-horizon results")
+print("Lower-U selection plus primary 0.03 refinement gate")
 display(overall[overall.score_name.isin(horizons)][columns])
-
 print("Individual chunks (chunk 0 is deployable; later chunks are post-hoc here)")
 display(overall[overall.signal_kind == "individual_chunk"][columns])'''),
-    md("""## 4. Exploratory windows and cross-validated estimate
+    md("""## 6. Aggregated exploratory windows and cross-validated estimate
 
-The top-window table is selected and evaluated on the same data, so it is an optimistic discovery
-tool. LOSO chooses a window on 12 suites and applies it once to the held-out suite; its pooled
-delta is the more defensible estimate of whether a learned window transfers."""),
+The top-window table is selected and evaluated on the same data, so it is optimistic. LOSO
+chooses a window on 12 suites and applies it once to the held-out suite."""),
     code(r'''top = tables["selective_refinement_top_windows"]
-print("Top in-sample windows")
+print("Top aggregated in-sample windows")
 display(top[(top.score_name.isin(horizons)) & (top["rank"] <= 5)][
     ["score_name", "rank", "lower", "upper", "n_refined", "selective_sr",
      "delta_pp", "selected_F_to_S", "selected_S_to_F"]])
-
-print("Leave-one-suite-out window selection")
+print("Leave-one-suite-out aggregated window selection")
 display(tables["selective_refinement_loso_summary"])
-
 print("Primary first-chunk fixed-threshold result by suite")
 by_suite = tables["selective_refinement_fixed_by_suite"]
 display(by_suite[by_suite.score_name == "first_chunk"][[
     "suite", "n_pairs", "lower_u_baseline_sr", "n_refined_fixed",
     "fixed_threshold_sr", "fixed_delta_vs_lower_u_pp", "fixed_F_to_S", "fixed_S_to_F"]])'''),
-    md("## 5. Save tables and figures"),
+    md("## 7. Save tables and figures"),
     code(r'''for name, frame in tables.items():
     frame.to_csv(OUTPUT / f"{name}.csv", index=False)
 paths = diversity_selective_refinement_figures(tables, OUTPUT / "figures")
 for path in paths:
     print(path.name)
     display(Image(filename=str(path)))'''),
-    md("## 6. Concise readout"),
+    md("## 8. Concise readout"),
     code(r'''overall = tables["selective_refinement_overall"].set_index("score_name")
 loso = tables["selective_refinement_loso_summary"].set_index("score_name")
 for score_name in ("first_chunk", "full_episode"):

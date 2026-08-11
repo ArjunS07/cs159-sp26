@@ -561,12 +561,34 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
     assert first.fixed_S_to_F == 0
     assert set(["first_chunk", "prefix_2_chunks", "prefix_4_chunks",
                 "prefix_8_chunks", "full_episode"]) <= set(overall.index)
+    member_overall = tables["member_refinement_overall"]
+    assert set(member_overall.member_index) == {0, 1}
+    assert {"baseline_sr", "refinement_sr", "delta_pp", "failure_auc"} <= set(
+        member_overall.columns)
+    assert set(tables["member_refinement_top_windows"].member_index) == {0, 1}
     assert len(tables["selective_refinement_loso_folds"].held_out_suite.unique()) == 2
+    tables["source_checkpoint_by_suite"] = pd.DataFrame([
+        {"suite": suite, "source_baseline_sr": .25,
+         "model0_baseline_sr": .5, "model1_baseline_sr": .5}
+        for suite in ("libero_goal_swap", "libero_object_swap")])
     figures = diversity_selective_refinement_figures(tables, tmp_path)
-    assert {path.name for path in figures} == {
+    expected = {
+        "member_0_refinement_delta_by_suite.png",
+        "member_0_delta_and_failure_auc.png",
+        "member_0_refinement_by_uncertainty.png",
+        "member_0_window_first_chunk.png",
+        "member_0_window_full_episode.png",
+        "member_1_refinement_delta_by_suite.png",
+        "member_1_delta_and_failure_auc.png",
+        "member_1_refinement_by_uncertainty.png",
+        "member_1_window_first_chunk.png",
+        "member_1_window_full_episode.png",
+        "aggregate_selector_delta_and_auc.png",
+        "members_vs_source_checkpoint_by_suite.png",
         "selective_refinement_by_horizon.png",
         "selective_refinement_by_chunk.png",
         "selective_refinement_first_chunk_by_suite.png",
         "selective_refinement_window_first_chunk.png",
         "selective_refinement_window_full_episode.png",
     }
+    assert expected == {path.name for path in figures}

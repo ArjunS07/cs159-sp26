@@ -768,19 +768,129 @@ def build_selective_refinement_pairs(rollouts: pd.DataFrame, steps: pd.DataFrame
     return paired, pd.concat(policy_frames, ignore_index=True)
 
 
+def build_member_refinement_pairs(paired: pd.DataFrame) -> pd.DataFrame:
+    """Long-form per-member baseline/refinement outcomes for each U horizon."""
+    frames = []
+    for member_index in (0, 1):
+        for order, spec in enumerate(_selective_score_specs()):
+            score_column = f"{spec['column']}_m{member_index}"
+            valid = paired[score_column].notna()
+            frame = paired.loc[valid, DIVERSITY_PAIR_KEYS].copy()
+            frame["member_index"] = member_index
+            frame["score_name"] = spec["score_name"]
+            frame["score_order"] = order
+            frame["signal_kind"] = spec["signal_kind"]
+            frame["interpretation"] = spec["interpretation"]
+            frame["u"] = paired.loc[valid, score_column].to_numpy(float)
+            frame["baseline_success"] = paired.loc[
+                valid, f"success_observed_m{member_index}"].to_numpy(bool)
+            frame["refined_success"] = paired.loc[
+                valid, f"success_refined_m{member_index}"].to_numpy(bool)
+            frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
+
+
+def _member_refinement_summary(group: pd.DataFrame) -> dict:
+    baseline = group.baseline_success.to_numpy(bool)
+    refined = group.refined_success.to_numpy(bool)
+    lo, hi = _paired_delta_ci(baseline, refined)
+    return {
+        "n_pairs": len(group), "baseline_sr": float(baseline.mean()),
+        "refinement_sr": float(refined.mean()),
+        "delta_pp": float(100 * (refined.mean() - baseline.mean())),
+        "delta_ci_low_pp": float(100 * lo), "delta_ci_high_pp": float(100 * hi),
+        "F_to_S": int((~baseline & refined).sum()),
+        "S_to_F": int((baseline & ~refined).sum()),
+        "failure_auc": _rank_auc(~baseline, group.u.to_numpy(float)),
+        "mean_u": float(group.u.mean()),
+    }
+
+
+def analyze_member_refinement(paired: pd.DataFrame, *, grid_size: int = 25,
+                              min_window: int = 10) -> dict[str, pd.DataFrame]:
+    member_pairs = build_member_refinement_pairs(paired)
+    overall = pd.DataFrame([
+        {"member_index": member, "score_name": score_name,
+         "score_order": int(group.score_order.iloc[0]),
+         "signal_kind": group.signal_kind.iloc[0],
+         "interpretation": group.interpretation.iloc[0],
+         **_member_refinement_summary(group)}
+        for (member, score_name), group in member_pairs.groupby(
+            ["member_index", "score_name"], sort=False)
+    ]).sort_values(["member_index", "score_order"])
+    by_suite = pd.DataFrame([
+        {"member_index": member, "score_name": score_name, "suite": suite,
+         "score_order": int(group.score_order.iloc[0]),
+         **_member_refinement_summary(group)}
+        for (member, score_name, suite), group in member_pairs.groupby(
+            ["member_index", "score_name", "suite"], sort=False)
+    ]).sort_values(["member_index", "score_order", "suite"])
+
+    bin_rows = []
+    for (member, score_name), group in member_pairs.groupby(
+            ["member_index", "score_name"], sort=False):
+        group = group.copy()
+        n_bins = min(10, len(group))
+        group["uncertainty_bin"] = pd.qcut(
+            group.u.rank(method="first"), n_bins, labels=False) + 1
+        for uncertainty_bin, selected in group.groupby("uncertainty_bin", sort=True):
+            bin_rows.append({
+                "member_index": member, "score_name": score_name,
+                "score_order": int(group.score_order.iloc[0]),
+                "uncertainty_bin": int(uncertainty_bin),
+                **_member_refinement_summary(selected),
+            })
+    bins = pd.DataFrame(bin_rows)
+
+    sweep_rows = []
+    for (member, score_name), group in member_pairs.groupby(
+            ["member_index", "score_name"], sort=False):
+        window_group = group.rename(columns={"u": "selected_u"})
+        sweep_rows.extend({
+            "member_index": member, "score_name": score_name,
+            "score_order": int(group.score_order.iloc[0]),
+            "analysis_type": "exploratory_in_sample", **row}
+            for row in _window_rows(
+                window_group, grid_size=grid_size, min_window=min_window))
+    sweep = pd.DataFrame(sweep_rows)
+    eligible = sweep[sweep.eligible & sweep.delta_pp.notna()].sort_values(
+        ["member_index", "score_order", "delta_pp", "n_refined", "lower", "upper"],
+        ascending=[True, True, False, False, True, True])
+    top = eligible.groupby(["member_index", "score_name"], sort=False).head(10).copy()
+    top["rank"] = top.groupby(["member_index", "score_name"], sort=False).cumcount() + 1
+    return {
+        "member_refinement_pairs": member_pairs,
+        "member_refinement_overall": overall,
+        "member_refinement_by_suite": by_suite,
+        "member_refinement_by_uncertainty_bin": bins,
+        "member_refinement_window_sweep": sweep,
+        "member_refinement_top_windows": top,
+    }
+
+
 def _selective_policy_summary(group: pd.DataFrame, threshold: float) -> dict:
     baseline = group.baseline_success.to_numpy(bool)
     refined = group.refined_success.to_numpy(bool)
+    model0 = group.model0_baseline_success.to_numpy(bool)
+    model1 = group.model1_baseline_success.to_numpy(bool)
+    discordant = model0 != model1
     selected = group.selected_u.to_numpy(float) >= threshold
     policy = np.where(selected, refined, baseline)
     lo, hi = _paired_delta_ci(baseline, policy)
+    selector_accuracy = float(baseline[discordant].mean()) if discordant.any() else math.nan
+    selector_score = group.u_m1.to_numpy(float) - group.u_m0.to_numpy(float)
     return {
         "n_pairs": len(group),
-        "model0_sr": float(group.model0_baseline_success.mean()),
-        "model1_sr": float(group.model1_baseline_success.mean()),
-        "best_fixed_member_sr": float(max(group.model0_baseline_success.mean(),
-                                           group.model1_baseline_success.mean())),
+        "model0_sr": float(model0.mean()),
+        "model1_sr": float(model1.mean()),
+        "best_fixed_member_sr": float(max(model0.mean(), model1.mean())),
         "lower_u_baseline_sr": float(baseline.mean()),
+        "lower_u_delta_vs_best_fixed_pp": float(
+            100 * (baseline.mean() - max(model0.mean(), model1.mean()))),
+        "n_model_discordant": int(discordant.sum()),
+        "lower_u_selector_accuracy_discordant": selector_accuracy,
+        "lower_u_selector_win_auc": _rank_auc(
+            model0[discordant], selector_score[discordant]),
         "lower_u_refine_all_sr": float(refined.mean()),
         "fixed_threshold": float(threshold),
         "n_refined_fixed": int(selected.sum()),
@@ -922,6 +1032,8 @@ def analyze_diversity_selective_refinement(
     folds, loso = selective_refinement_loso(
         policy_pairs, grid_size=grid_size, min_window=min_window)
     return {
+        **analyze_member_refinement(
+            paired, grid_size=grid_size, min_window=min_window),
         "selective_refinement_paired_episodes": paired,
         "selective_refinement_policy_pairs": policy_pairs,
         "selective_refinement_overall": overall,
@@ -1038,10 +1150,96 @@ def diversity_selective_refinement_figures(
 
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
     written = []
-    overall = tables["selective_refinement_overall"]
-    loso = tables["selective_refinement_loso_summary"]
+    member_overall = tables["member_refinement_overall"]
+    member_suite = tables["member_refinement_by_suite"]
+    member_bins = tables["member_refinement_by_uncertainty_bin"]
+    member_sweep = tables["member_refinement_window_sweep"]
     horizon_names = ["first_chunk", "prefix_2_chunks", "prefix_4_chunks",
                      "prefix_8_chunks", "full_episode"]
+    for member_index in (0, 1):
+        suite = member_suite[(member_suite.member_index == member_index) &
+                             (member_suite.score_name == "full_episode")].sort_values("suite")
+        labels = suite.suite.str.replace("libero_", "", regex=False)
+        x, width = np.arange(len(suite)), .38
+        fig, ax = plt.subplots(figsize=(15, 5.5))
+        ax.bar(x - width / 2, 100 * suite.baseline_sr, width,
+               label="uncertainty-only baseline", color="#4C78A8")
+        ax.bar(x + width / 2, 100 * suite.refinement_sr, width,
+               label="PnP refinement", color="#F58518")
+        for index, delta in enumerate(suite.delta_pp):
+            ax.text(index + width / 2, 100 * suite.refinement_sr.iloc[index] + 1,
+                    f"{delta:+.1f}", ha="center", fontsize=7)
+        ax.set_xticks(x, labels, rotation=35, ha="right")
+        ax.set(ylabel="Success rate (%)", ylim=(0, 105),
+               title=f"Model {member_index}: matched refinement effect by suite")
+        ax.legend(fontsize=8); fig.tight_layout()
+        path = output / f"member_{member_index}_refinement_delta_by_suite.png"
+        fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+        horizons = member_overall[(member_overall.member_index == member_index) &
+                                  member_overall.score_name.isin(horizon_names)].copy()
+        horizons["score_name"] = pd.Categorical(
+            horizons.score_name, categories=horizon_names, ordered=True)
+        horizons = horizons.sort_values("score_name")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        axes[0].axhline(0, color="black", lw=1)
+        axes[0].plot(np.arange(len(horizons)), horizons.delta_pp, marker="o", color="#F58518")
+        axes[0].fill_between(np.arange(len(horizons)), horizons.delta_ci_low_pp,
+                             horizons.delta_ci_high_pp, alpha=.18, color="#F58518")
+        axes[0].set(ylabel="Refinement delta SR (pp)", title="Matched SR change")
+        axes[1].axhline(.5, color="black", ls="--", lw=1, label="chance")
+        axes[1].plot(np.arange(len(horizons)), horizons.failure_auc,
+                     marker="o", color="#4C78A8")
+        axes[1].set(ylim=(0, 1), ylabel="ROC AUC for baseline failure",
+                    title="Does uncertainty detect failure?")
+        tick_labels = [str(value).replace("_", " ") for value in horizons.score_name]
+        for axis in axes:
+            axis.set_xticks(np.arange(len(horizons)), tick_labels, rotation=25, ha="right")
+        fig.suptitle(f"Model {member_index}: uncertainty horizon diagnostics")
+        fig.tight_layout()
+        path = output / f"member_{member_index}_delta_and_failure_auc.png"
+        fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+        bins = member_bins[(member_bins.member_index == member_index) &
+                           member_bins.score_name.isin(["first_chunk", "full_episode"])]
+        fig, ax = plt.subplots(figsize=(7.5, 4.5))
+        ax.axhline(0, color="black", lw=1)
+        for score_name, group in bins.groupby("score_name", sort=False):
+            ax.plot(group.uncertainty_bin, group.delta_pp, marker="o",
+                    label=score_name.replace("_", " "))
+        ax.set(xlabel="Within-model uncertainty decile (low to high)",
+               ylabel="Refinement delta SR (pp)",
+               title=f"Model {member_index}: where does refinement help?")
+        ax.legend(fontsize=8); fig.tight_layout()
+        path = output / f"member_{member_index}_refinement_by_uncertainty.png"
+        fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+        for score_name in ("first_chunk", "full_episode"):
+            group = member_sweep[(member_sweep.member_index == member_index) &
+                                 (member_sweep.score_name == score_name)]
+            delta = group.pivot(index="lower", columns="upper", values="delta_pp").sort_index()
+            count = group.pivot(index="lower", columns="upper", values="n_refined").reindex_like(delta)
+            extent = [float(delta.columns.min()), float(delta.columns.max()),
+                      float(delta.index.min()), float(delta.index.max())]
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            image = axes[0].imshow(delta.to_numpy(), origin="lower", aspect="auto",
+                                   cmap="RdYlGn", extent=extent)
+            sample = axes[1].imshow(count.to_numpy(), origin="lower", aspect="auto",
+                                    cmap="Blues", extent=extent)
+            fig.colorbar(image, ax=axes[0], label="In-sample delta SR (pp)")
+            fig.colorbar(sample, ax=axes[1], label="Episodes refined")
+            for axis in axes:
+                axis.set(xlabel="Upper uncertainty", ylabel="Lower uncertainty")
+            axes[0].set_title("Exploratory selective-refinement effect")
+            axes[1].set_title("Window sample size")
+            fig.suptitle(
+                f"Model {member_index}: {score_name.replace('_', ' ')} uncertainty window")
+            fig.tight_layout()
+            path = output / f"member_{member_index}_window_{score_name}.png"
+            fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+    overall = tables["selective_refinement_overall"]
+    loso = tables["selective_refinement_loso_summary"]
     horizon = overall[overall.score_name.isin(horizon_names)].merge(
         loso[["score_name", "loso_selective_sr"]], on="score_name", validate="one_to_one")
     horizon["score_name"] = pd.Categorical(
@@ -1059,6 +1257,25 @@ def diversity_selective_refinement_figures(
     ax.set(ylabel="Success rate (%)", title="Model selection plus selective refinement by U horizon")
     ax.legend(fontsize=8); fig.tight_layout()
     path = output / "selective_refinement_by_horizon.png"
+    fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes[0].axhline(0, color="black", lw=1)
+    axes[0].plot(np.arange(len(horizon)), horizon.lower_u_delta_vs_best_fixed_pp,
+                 marker="o", color="#54A24B")
+    axes[0].set(ylabel="Lower-U selector delta vs best fixed model (pp)",
+                title="Aggregation SR gain")
+    axes[1].axhline(.5, color="black", ls="--", lw=1)
+    axes[1].plot(np.arange(len(horizon)), horizon.lower_u_selector_win_auc,
+                 marker="o", color="#4C78A8")
+    axes[1].set(ylim=(0, 1), ylabel="Win-selection ROC AUC",
+                title="Can relative uncertainty select the winner?")
+    tick_labels = [str(value).replace("_", " ") for value in horizon.score_name]
+    for axis in axes:
+        axis.set_xticks(np.arange(len(horizon)), tick_labels, rotation=25, ha="right")
+    fig.suptitle("Two-model lower-uncertainty aggregation by horizon")
+    fig.tight_layout()
+    path = output / "aggregate_selector_delta_and_auc.png"
     fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
 
     chunks = overall[overall.signal_kind == "individual_chunk"].sort_values("score_order")
@@ -1115,5 +1332,22 @@ def diversity_selective_refinement_figures(
         fig.suptitle(f"Selective-refinement window sweep: {score_name.replace('_', ' ')}")
         fig.tight_layout()
         path = output / f"selective_refinement_window_{score_name}.png"
+        fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+    if "source_checkpoint_by_suite" in tables:
+        source = tables["source_checkpoint_by_suite"].sort_values("suite")
+        labels = source.suite.str.replace("libero_", "", regex=False)
+        x, width = np.arange(len(source)), .24
+        fig, ax = plt.subplots(figsize=(15, 5.5))
+        ax.bar(x - width, 100 * source.source_baseline_sr, width,
+               label="shared source checkpoint", color="#9D9D9D")
+        ax.bar(x, 100 * source.model0_baseline_sr, width,
+               label="model 0", color="#4C78A8")
+        ax.bar(x + width, 100 * source.model1_baseline_sr, width,
+               label="model 1", color="#F58518")
+        ax.set_xticks(x, labels, rotation=35, ha="right")
+        ax.set(ylabel="Unrefined success rate (%)", ylim=(0, 105),
+               title="Bootstrapped members versus their shared source checkpoint")
+        ax.legend(fontsize=8); fig.tight_layout()
+        path = output / "members_vs_source_checkpoint_by_suite.png"
         fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
     return written
