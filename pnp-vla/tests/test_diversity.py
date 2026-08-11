@@ -558,6 +558,7 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
     assert first.n_pairs == 4
     assert np.isclose(first.lower_u_baseline_sr, .75)
     assert np.isclose(first.fixed_threshold_sr, 1.)
+    assert np.isclose(first.fixed_delta_vs_best_fixed_pp, 50.)
     assert first.n_refined_fixed == 1
     assert first.fixed_F_to_S == 1
     assert first.fixed_S_to_F == 0
@@ -569,6 +570,8 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         member_overall.columns)
     assert set(tables["member_refinement_top_windows"].member_index) == {0, 1}
     assert len(tables["selective_refinement_loso_folds"].held_out_suite.unique()) == 2
+    assert "delta_vs_best_fixed_pp" in tables["selective_refinement_best_windows"]
+    assert "delta_vs_best_fixed_pp" in tables["selective_refinement_loso_summary"]
     source_analysis = analyze_checkpoint_refinement(
         rollout_frame[rollout_frame.member_index == 0].drop(columns="member_index"),
         step_frame[step_frame.member_index == 0].drop(columns="member_index"),
@@ -583,6 +586,18 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         {"suite": suite, "source_baseline_sr": .25,
          "model0_baseline_sr": .5, "model1_baseline_sr": .5}
         for suite in ("libero_goal_swap", "libero_object_swap")])
+    horizons = ["first_chunk", "prefix_2_chunks", "prefix_4_chunks",
+                "prefix_8_chunks", "full_episode"]
+    aggregate_best = tables["selective_refinement_best_windows"].set_index("score_name")
+    source_best = source_analysis["member_refinement_top_windows"]
+    source_best = source_best[source_best["rank"] == 1].set_index("score_name")
+    tables["source_vs_aggregate_best_windows"] = pd.DataFrame([
+        {"score_name": score_name,
+         "source_window_delta_pp": source_best.loc[score_name].delta_pp,
+         "aggregate_window_delta_pp": aggregate_best.loc[score_name].delta_pp,
+         "source_window_sr": source_best.loc[score_name].selective_sr,
+         "aggregate_window_sr": aggregate_best.loc[score_name].selective_sr}
+        for score_name in horizons])
     figures = diversity_selective_refinement_figures(tables, tmp_path)
     expected = {
         "member_0_refinement_delta_by_suite.png",
@@ -596,15 +611,17 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         "member_1_window_first_chunk.png",
         "member_1_window_full_episode.png",
         "aggregate_selector_delta_and_auc.png",
+        "aggregate_window_delta_vs_best_by_horizon.png",
         "members_vs_source_checkpoint_by_suite.png",
-        "source_checkpoint_window_first_chunk.png",
-        "source_checkpoint_window_full_episode.png",
+        "source_vs_aggregate_best_windows.png",
         "selective_refinement_by_horizon.png",
         "selective_refinement_by_chunk.png",
         "selective_refinement_first_chunk_by_suite.png",
-        "selective_refinement_window_first_chunk.png",
-        "selective_refinement_window_full_episode.png",
     }
+    expected |= {f"source_checkpoint_window_{score_name}.png" for score_name in horizons}
+    expected |= {f"selective_refinement_window_{score_name}.png" for score_name in horizons}
+    expected |= {
+        f"source_vs_aggregate_window_sweep_{score_name}.png" for score_name in horizons}
     assert expected == {path.name for path in figures}
 
 

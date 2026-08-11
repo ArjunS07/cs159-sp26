@@ -658,9 +658,18 @@ print("Matched shared-source checkpoint comparison")
 display(source_overall)
 display(source_by_suite)
 
-# Run the same horizon/AUC/window analysis on the source checkpoint, using only exact
-# current/source identities and only source episodes with both baseline and refinement arms.
-matched_keys = comparison[DIVERSITY_PAIR_KEYS]
+# Run both window sweeps on the exact identities that have source baseline + refinement and all
+# four current member/method arms. If any source refinement is missing, restrict the aggregation
+# analysis too, so the source-versus-aggregation graph always uses identical episodes.
+matched_keys = comparison[comparison.source_refinement_success.notna()][DIVERSITY_PAIR_KEYS]
+assert len(matched_keys), "No exact episodes contain both source baseline and source refinement"
+if len(matched_keys) != len(paired):
+    matched_rollouts = rollouts.merge(matched_keys, on=DIVERSITY_PAIR_KEYS, validate="many_to_one")
+    matched_steps = steps[steps.rollout_id.isin(matched_rollouts.rollout_id)].copy()
+    tables = analyze_diversity_selective_refinement(
+        matched_rollouts, matched_steps, fixed_threshold=FIXED_THRESHOLD)
+    paired = tables["selective_refinement_paired_episodes"]
+    print(f"Restricted aggregation window analysis to {len(paired)} exact source matches")
 source_analysis_rollouts = pd.concat(
     [source_observed_rows, source_refined_rows], ignore_index=True).merge(
         matched_keys, on=DIVERSITY_PAIR_KEYS, validate="many_to_one")
@@ -688,59 +697,99 @@ print("Shared source checkpoint: top exploratory uncertainty windows")
 source_top = source_analysis["member_refinement_top_windows"]
 display(source_top[source_top.score_name.isin(horizons) & (source_top["rank"] <= 5)][[
     "score_name", "rank", "lower", "upper", "n_refined", "selective_sr",
-    "delta_pp", "selected_F_to_S", "selected_S_to_F"]])'''),
-    md("## 5. Two-model lower-uncertainty aggregation"),
-    code(r'''overall = tables["selective_refinement_overall"]
-columns = ["score_name", "interpretation", "n_pairs", "best_fixed_member_sr",
-           "lower_u_baseline_sr", "lower_u_delta_vs_best_fixed_pp",
-           "n_model_discordant", "lower_u_selector_accuracy_discordant",
-           "lower_u_selector_win_auc", "lower_u_refine_all_sr",
-           "n_refined_fixed", "fixed_threshold_sr",
-           "fixed_delta_vs_lower_u_pp", "fixed_delta_ci_low_pp",
-           "fixed_delta_ci_high_pp", "fixed_F_to_S", "fixed_S_to_F"]
-print("Lower-U selection plus primary 0.03 refinement gate")
-display(overall[overall.score_name.isin(horizons)][columns])
-print("Individual chunks (chunk 0 is deployable; later chunks are post-hoc here)")
-display(overall[overall.signal_kind == "individual_chunk"][columns])'''),
-    md("""## 6. Aggregated exploratory windows and cross-validated estimate
+    "delta_pp", "selected_F_to_S", "selected_S_to_F"]])
 
-The top-window table is selected and evaluated on the same data, so it is optimistic. LOSO
-chooses a window on 12 suites and applies it once to the held-out suite."""),
+# Main comparison: independently optimize a window for the source checkpoint and for the
+# two-model lower-U aggregation, then compare whole-cohort SR gains on the same identities.
+aggregate_best = tables["selective_refinement_best_windows"]
+aggregate_overall = tables["selective_refinement_overall"]
+source_best = source_analysis["member_refinement_top_windows"]
+source_overall_windows = source_analysis["member_refinement_overall"]
+window_comparison = (
+    source_best[(source_best["rank"] == 1) & source_best.score_name.isin(horizons)][[
+        "score_name", "lower", "upper", "n_refined", "selective_sr", "delta_pp"]]
+    .rename(columns={
+        "lower": "source_lower", "upper": "source_upper",
+        "n_refined": "source_n_refined", "selective_sr": "source_window_sr",
+        "delta_pp": "source_window_delta_pp"})
+    .merge(source_overall_windows[source_overall_windows.score_name.isin(horizons)][[
+        "score_name", "baseline_sr"]].rename(columns={"baseline_sr": "source_baseline_sr"}),
+        on="score_name", validate="one_to_one")
+    .merge(aggregate_best[aggregate_best.score_name.isin(horizons)][[
+        "score_name", "lower", "upper", "n_refined", "selective_sr", "delta_pp",
+        "delta_vs_best_fixed_pp"]].rename(columns={
+            "lower": "aggregate_lower", "upper": "aggregate_upper",
+            "n_refined": "aggregate_n_refined", "selective_sr": "aggregate_window_sr",
+            "delta_pp": "aggregate_window_delta_pp",
+            "delta_vs_best_fixed_pp": "aggregate_window_vs_best_member_pp"}),
+        on="score_name", validate="one_to_one")
+    .merge(aggregate_overall[aggregate_overall.score_name.isin(horizons)][[
+        "score_name", "lower_u_baseline_sr", "best_fixed_member_sr"]],
+        on="score_name", validate="one_to_one"))
+window_comparison["aggregate_delta_advantage_pp"] = (
+    window_comparison.aggregate_window_delta_pp - window_comparison.source_window_delta_pp)
+window_comparison["aggregate_window_vs_source_window_pp"] = 100 * (
+    window_comparison.aggregate_window_sr - window_comparison.source_window_sr)
+window_comparison["score_name"] = pd.Categorical(
+    window_comparison.score_name, categories=horizons, ordered=True)
+window_comparison = window_comparison.sort_values("score_name")
+tables["source_vs_aggregate_best_windows"] = window_comparison'''),
+    md("""## 5. Main result: source model versus two-model aggregation
+
+For each uncertainty horizon, both systems receive their own best lower/upper uncertainty window.
+Every SR and delta uses the same matched episode cohort. `aggregate_delta_advantage_pp` is the key
+column: positive means the two-model aggregation gains more SR from its window than the shared
+source checkpoint gains from its own window."""),
+    code(r'''main_columns = [
+    "score_name",
+    "source_baseline_sr", "source_lower", "source_upper", "source_n_refined",
+    "source_window_sr", "source_window_delta_pp",
+    "lower_u_baseline_sr", "aggregate_lower", "aggregate_upper", "aggregate_n_refined",
+    "aggregate_window_sr", "aggregate_window_delta_pp",
+    "aggregate_delta_advantage_pp", "best_fixed_member_sr",
+    "aggregate_window_vs_best_member_pp"]
+display(window_comparison[main_columns].rename(columns={
+    "score_name": "uncertainty_horizon",
+    "lower_u_baseline_sr": "aggregate_no_refinement_sr"}))'''),
+    md("""## 6. Supporting aggregation details
+
+The table below retains the five best windows per horizon so nearby alternatives can be inspected.
+The fixed `0.03` gate is shown only as a secondary predeclared comparison; it is not the main
+window-sweep result."""),
     code(r'''top = tables["selective_refinement_top_windows"]
-print("Top aggregated in-sample windows")
-display(top[(top.score_name.isin(horizons)) & (top["rank"] <= 5)][
-    ["score_name", "rank", "lower", "upper", "n_refined", "selective_sr",
-     "delta_pp", "selected_F_to_S", "selected_S_to_F"]])
-print("Leave-one-suite-out aggregated window selection")
-display(tables["selective_refinement_loso_summary"])
-print("Primary first-chunk fixed-threshold result by suite")
-by_suite = tables["selective_refinement_fixed_by_suite"]
-display(by_suite[by_suite.score_name == "first_chunk"][[
-    "suite", "n_pairs", "lower_u_baseline_sr", "n_refined_fixed",
-    "fixed_threshold_sr", "fixed_delta_vs_lower_u_pp", "fixed_F_to_S", "fixed_S_to_F"]])'''),
+display(top[top.score_name.isin(horizons) & (top["rank"] <= 5)][[
+    "score_name", "rank", "lower", "upper", "n_refined", "selective_sr",
+    "delta_pp", "delta_vs_best_fixed_pp", "selected_F_to_S", "selected_S_to_F"]])
+
+overall = tables["selective_refinement_overall"]
+print("Secondary comparison: fixed U >= 0.03 gate")
+display(overall[overall.score_name.isin(horizons)][[
+    "score_name", "best_fixed_member_sr", "lower_u_baseline_sr",
+    "fixed_threshold_sr", "fixed_delta_vs_lower_u_pp",
+    "fixed_delta_vs_best_fixed_pp", "fixed_vs_best_ci_low_pp",
+    "fixed_vs_best_ci_high_pp", "n_refined_fixed", "fixed_F_to_S", "fixed_S_to_F"]])'''),
     md("## 7. Save tables and figures"),
     code(r'''for name, frame in tables.items():
     frame.to_csv(OUTPUT / f"{name}.csv", index=False)
 paths = diversity_selective_refinement_figures(tables, OUTPUT / "figures")
+primary_names = {"source_vs_aggregate_best_windows.png"} | {
+    f"source_vs_aggregate_window_sweep_{name}.png" for name in horizons}
+print("Primary source-versus-aggregation figures")
 for path in paths:
-    print(path.name)
-    display(Image(filename=str(path)))'''),
+    if path.name in primary_names:
+        print(path.name)
+        display(Image(filename=str(path)))
+print(f"Saved {len(paths) - len(primary_names)} additional diagnostic figures without displaying them.")'''),
     md("## 8. Concise readout"),
-    code(r'''overall = tables["selective_refinement_overall"].set_index("score_name")
-loso = tables["selective_refinement_loso_summary"].set_index("score_name")
-for score_name in ("first_chunk", "full_episode"):
-    row, cv = overall.loc[score_name], loso.loc[score_name]
-    print(score_name.replace("_", " "))
-    print("  lower-U baseline: %.1f%%" % (100 * row.lower_u_baseline_sr))
-    print("  fixed U >= %.2f: %.1f%% (%+.1f pp; F->S=%d, S->F=%d)" %
-          (row.fixed_threshold, 100 * row.fixed_threshold_sr,
-           row.fixed_delta_vs_lower_u_pp, row.fixed_F_to_S, row.fixed_S_to_F))
-    print("  refine selected model always: %.1f%% (%+.1f pp)" %
-          (100 * row.lower_u_refine_all_sr, row.refine_all_delta_vs_lower_u_pp))
-    print("  LOSO window: %.1f%% (%+.1f pp, CI [%+.1f, %+.1f])" %
-          (100 * cv.loso_selective_sr, cv.delta_pp,
-           cv.delta_ci_low_pp, cv.delta_ci_high_pp))
-print("\nInterpretation: first chunk is deployable; full episode and later chunks are post-hoc.")'''),
+    code(r'''for _, row in window_comparison.iterrows():
+    print(str(row.score_name).replace("_", " "))
+    print("  source window:    %5.1f%% SR (%+.2f pp over source baseline)" %
+          (100 * row.source_window_sr, row.source_window_delta_pp))
+    print("  aggregate window: %5.1f%% SR (%+.2f pp over lower-U baseline)" %
+          (100 * row.aggregate_window_sr, row.aggregate_window_delta_pp))
+    print("  aggregate delta advantage over source: %+.2f pp" %
+          row.aggregate_delta_advantage_pp)
+print("\nFirst chunk is deployable at the initial observation; later horizons are post-hoc here.")'''),
 ], "21_analyze_diversity_selective_refinement_v2.ipynb")
 
 

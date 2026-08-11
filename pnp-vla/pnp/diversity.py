@@ -955,10 +955,12 @@ def _selective_policy_summary(group: pd.DataFrame, threshold: float) -> dict:
     refined = group.refined_success.to_numpy(bool)
     model0 = group.model0_baseline_success.to_numpy(bool)
     model1 = group.model1_baseline_success.to_numpy(bool)
+    best_fixed = model0 if model0.mean() >= model1.mean() else model1
     discordant = model0 != model1
     selected = group.selected_u.to_numpy(float) >= threshold
     policy = np.where(selected, refined, baseline)
     lo, hi = _paired_delta_ci(baseline, policy)
+    best_lo, best_hi = _paired_delta_ci(best_fixed, policy)
     selector_accuracy = float(baseline[discordant].mean()) if discordant.any() else math.nan
     selector_score = group.u_m1.to_numpy(float) - group.u_m0.to_numpy(float)
     return {
@@ -981,6 +983,10 @@ def _selective_policy_summary(group: pd.DataFrame, threshold: float) -> dict:
         "fixed_delta_vs_lower_u_pp": float(100 * (policy.mean() - baseline.mean())),
         "fixed_delta_ci_low_pp": float(100 * lo),
         "fixed_delta_ci_high_pp": float(100 * hi),
+        "fixed_delta_vs_best_fixed_pp": float(
+            100 * (policy.mean() - best_fixed.mean())),
+        "fixed_vs_best_ci_low_pp": float(100 * best_lo),
+        "fixed_vs_best_ci_high_pp": float(100 * best_hi),
         "fixed_F_to_S": int((selected & ~baseline & refined).sum()),
         "fixed_S_to_F": int((selected & baseline & ~refined).sum()),
         "refine_all_delta_vs_lower_u_pp": float(100 * (refined.mean() - baseline.mean())),
@@ -993,6 +999,10 @@ def _window_rows(group: pd.DataFrame, *, grid_size: int, min_window: int) -> lis
     score = group.selected_u.to_numpy(float)
     baseline = group.baseline_success.to_numpy(bool)
     refined = group.refined_success.to_numpy(bool)
+    best_fixed_sr = math.nan
+    if {"model0_baseline_success", "model1_baseline_success"} <= set(group.columns):
+        best_fixed_sr = float(max(group.model0_baseline_success.mean(),
+                                  group.model1_baseline_success.mean()))
     rows = []
     for lower_index, lower in enumerate(np.linspace(0., .06, grid_size)):
         for upper_index, upper in enumerate(np.linspace(.01, .08, grid_size)):
@@ -1001,7 +1011,7 @@ def _window_rows(group: pd.DataFrame, *, grid_size: int, min_window: int) -> lis
             selected = (score >= lower) & (score <= upper)
             policy = np.where(selected, refined, baseline)
             eligible = int(selected.sum()) >= min_window
-            rows.append({
+            row = {
                 "lower": float(lower), "upper": float(upper),
                 "lower_grid_index": lower_index, "upper_grid_index": upper_index,
                 "n_refined": int(selected.sum()), "coverage_refined": float(selected.mean()),
@@ -1010,7 +1020,13 @@ def _window_rows(group: pd.DataFrame, *, grid_size: int, min_window: int) -> lis
                 "delta_pp": float(100 * (policy.mean() - baseline.mean())) if eligible else math.nan,
                 "selected_F_to_S": int((selected & ~baseline & refined).sum()),
                 "selected_S_to_F": int((selected & baseline & ~refined).sum()),
-            })
+            }
+            if np.isfinite(best_fixed_sr):
+                row["best_fixed_member_sr"] = best_fixed_sr
+                row["lower_u_baseline_sr"] = float(baseline.mean())
+                row["delta_vs_best_fixed_pp"] = (
+                    float(100 * (policy.mean() - best_fixed_sr)) if eligible else math.nan)
+            rows.append(row)
     return rows
 
 
@@ -1032,6 +1048,8 @@ def selective_refinement_loso(policy_pairs: pd.DataFrame, *, grid_size: int = 25
     """Choose a window on 12 suites and apply it once to the held-out suite."""
     folds, predictions = [], []
     for score_name, group in policy_pairs.groupby("score_name", sort=False):
+        global_best_member = 0 if group.model0_baseline_success.mean() >= (
+            group.model1_baseline_success.mean()) else 1
         for suite in sorted(group.suite.unique()):
             train, test = group[group.suite != suite], group[group.suite == suite].copy()
             sweep = pd.DataFrame(_window_rows(
@@ -1062,6 +1080,8 @@ def selective_refinement_loso(policy_pairs: pd.DataFrame, *, grid_size: int = 25
             prediction["baseline_success"] = baseline
             prediction["refined_success"] = refined
             prediction["policy_success"] = policy
+            prediction["best_fixed_success"] = test[
+                f"model{global_best_member}_baseline_success"].to_numpy(bool)
             predictions.append(prediction)
     prediction_frame = pd.concat(predictions, ignore_index=True)
     summaries = []
@@ -1070,7 +1090,9 @@ def selective_refinement_loso(policy_pairs: pd.DataFrame, *, grid_size: int = 25
         policy = group.policy_success.to_numpy(bool)
         selected = group.selected.to_numpy(bool)
         refined = group.refined_success.to_numpy(bool)
+        best_fixed = group.best_fixed_success.to_numpy(bool)
         lo, hi = _paired_delta_ci(baseline, policy)
+        best_lo, best_hi = _paired_delta_ci(best_fixed, policy)
         summaries.append({
             "score_name": score_name, "score_order": int(group.score_order.iloc[0]),
             "interpretation": group.interpretation.iloc[0], "n_pairs": len(group),
@@ -1078,6 +1100,10 @@ def selective_refinement_loso(policy_pairs: pd.DataFrame, *, grid_size: int = 25
             "baseline_sr": float(baseline.mean()), "loso_selective_sr": float(policy.mean()),
             "delta_pp": float(100 * (policy.mean() - baseline.mean())),
             "delta_ci_low_pp": float(100 * lo), "delta_ci_high_pp": float(100 * hi),
+            "best_fixed_member_sr": float(best_fixed.mean()),
+            "delta_vs_best_fixed_pp": float(100 * (policy.mean() - best_fixed.mean())),
+            "delta_vs_best_ci_low_pp": float(100 * best_lo),
+            "delta_vs_best_ci_high_pp": float(100 * best_hi),
             "F_to_S": int((selected & ~baseline & refined).sum()),
             "S_to_F": int((selected & baseline & ~refined).sum()),
         })
@@ -1111,6 +1137,7 @@ def analyze_diversity_selective_refinement(
         ascending=[True, False, False, True, True])
     top_windows = eligible.groupby("score_name", sort=False).head(10).copy()
     top_windows["rank"] = top_windows.groupby("score_name", sort=False).cumcount() + 1
+    best_windows = top_windows[top_windows["rank"] == 1].copy()
     folds, loso = selective_refinement_loso(
         policy_pairs, grid_size=grid_size, min_window=min_window)
     return {
@@ -1122,6 +1149,7 @@ def analyze_diversity_selective_refinement(
         "selective_refinement_fixed_by_suite": by_suite,
         "selective_refinement_window_sweep": sweep,
         "selective_refinement_top_windows": top_windows,
+        "selective_refinement_best_windows": best_windows,
         "selective_refinement_loso_folds": folds,
         "selective_refinement_loso_summary": loso,
     }
@@ -1322,23 +1350,47 @@ def diversity_selective_refinement_figures(
 
     overall = tables["selective_refinement_overall"]
     loso = tables["selective_refinement_loso_summary"]
+    best_windows = tables["selective_refinement_best_windows"]
     horizon = overall[overall.score_name.isin(horizon_names)].merge(
-        loso[["score_name", "loso_selective_sr"]], on="score_name", validate="one_to_one")
+        loso[["score_name", "loso_selective_sr", "delta_vs_best_fixed_pp"]].rename(
+            columns={"delta_vs_best_fixed_pp": "loso_delta_vs_best_fixed_pp"}),
+        on="score_name", validate="one_to_one").merge(
+            best_windows[["score_name", "selective_sr", "delta_vs_best_fixed_pp"]].rename(
+                columns={"selective_sr": "best_window_sr",
+                         "delta_vs_best_fixed_pp": "best_window_delta_vs_best_fixed_pp"}),
+            on="score_name", validate="one_to_one")
     horizon["score_name"] = pd.Categorical(
         horizon.score_name, categories=horizon_names, ordered=True)
     horizon = horizon.sort_values("score_name")
-    x, width = np.arange(len(horizon)), .2
+    x, width = np.arange(len(horizon)), .16
     fig, ax = plt.subplots(figsize=(10, 5))
     for offset, column, label, color in [
-        (-1.5, "lower_u_baseline_sr", "lower-U baseline", "#4C78A8"),
-        (-.5, "lower_u_refine_all_sr", "refine selected model always", "#F58518"),
-        (.5, "fixed_threshold_sr", "refine when U >= 0.03", "#54A24B"),
-        (1.5, "loso_selective_sr", "LOSO-selected window", "#B279A2")]:
+        (-2, "best_fixed_member_sr", "best single model", "#9D9D9D"),
+        (-1, "lower_u_baseline_sr", "lower-U, no refinement", "#4C78A8"),
+        (0, "fixed_threshold_sr", "fixed gate U >= 0.03", "#54A24B"),
+        (1, "best_window_sr", "best in-sample window", "#F58518"),
+        (2, "loso_selective_sr", "LOSO window", "#B279A2")]:
         ax.bar(x + offset * width, 100 * horizon[column], width, label=label, color=color)
     ax.set_xticks(x, [str(value).replace("_", " ") for value in horizon.score_name])
     ax.set(ylabel="Success rate (%)", title="Model selection plus selective refinement by U horizon")
     ax.legend(fontsize=8); fig.tight_layout()
     path = output / "selective_refinement_by_horizon.png"
+    fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.axhline(0, color="black", lw=1)
+    ax.plot(np.arange(len(horizon)), horizon.fixed_delta_vs_best_fixed_pp,
+            marker="o", label="fixed U >= 0.03")
+    ax.plot(np.arange(len(horizon)), horizon.best_window_delta_vs_best_fixed_pp,
+            marker="o", label="best in-sample window")
+    ax.plot(np.arange(len(horizon)), horizon.loso_delta_vs_best_fixed_pp,
+            marker="o", label="LOSO window")
+    ax.set_xticks(np.arange(len(horizon)),
+                  [str(value).replace("_", " ") for value in horizon.score_name])
+    ax.set(ylabel="Policy SR minus best single-model SR (pp)",
+           title="Aggregation window performance by uncertainty horizon")
+    ax.legend(fontsize=8); fig.tight_layout()
+    path = output / "aggregate_window_delta_vs_best_by_horizon.png"
     fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -1394,7 +1446,7 @@ def diversity_selective_refinement_figures(
     fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
 
     sweep = tables["selective_refinement_window_sweep"]
-    for score_name in ("first_chunk", "full_episode"):
+    for score_name in horizon_names:
         group = sweep[sweep.score_name == score_name]
         delta = group.pivot(index="lower", columns="upper", values="delta_pp").sort_index()
         count = group.pivot(index="lower", columns="upper", values="n_refined").reindex_like(delta)
@@ -1434,7 +1486,7 @@ def diversity_selective_refinement_figures(
         fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
     if "source_checkpoint_refinement_window_sweep" in tables:
         source_sweep = tables["source_checkpoint_refinement_window_sweep"]
-        for score_name in ("first_chunk", "full_episode"):
+        for score_name in horizon_names:
             group = source_sweep[source_sweep.score_name == score_name]
             delta = group.pivot(
                 index="lower", columns="upper", values="delta_pp").sort_index()
@@ -1458,5 +1510,61 @@ def diversity_selective_refinement_figures(
                 " uncertainty window")
             fig.tight_layout()
             path = output / f"source_checkpoint_window_{score_name}.png"
+            fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+    if "source_vs_aggregate_best_windows" in tables:
+        comparison = tables["source_vs_aggregate_best_windows"].copy()
+        comparison["score_name"] = pd.Categorical(
+            comparison.score_name, categories=horizon_names, ordered=True)
+        comparison = comparison.sort_values("score_name")
+        x, width = np.arange(len(comparison)), .36
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        axes[0].axhline(0, color="black", lw=1)
+        axes[0].bar(x - width / 2, comparison.source_window_delta_pp, width,
+                    label="source checkpoint", color="#9D9D9D")
+        axes[0].bar(x + width / 2, comparison.aggregate_window_delta_pp, width,
+                    label="two-model aggregation", color="#54A24B")
+        axes[0].set(ylabel="Best-window whole-cohort delta SR (pp)",
+                    title="How much does each best window improve its baseline?")
+        axes[1].bar(x - width / 2, 100 * comparison.source_window_sr, width,
+                    label="source checkpoint", color="#9D9D9D")
+        axes[1].bar(x + width / 2, 100 * comparison.aggregate_window_sr, width,
+                    label="two-model aggregation", color="#54A24B")
+        axes[1].set(ylabel="Success rate after best window (%)",
+                    title="Absolute SR after selective refinement")
+        tick_labels = [str(value).replace("_", " ") for value in comparison.score_name]
+        for axis in axes:
+            axis.set_xticks(x, tick_labels, rotation=25, ha="right")
+            axis.legend(fontsize=8)
+        fig.suptitle("Source checkpoint versus two-model uncertainty aggregation")
+        fig.tight_layout()
+        path = output / "source_vs_aggregate_best_windows.png"
+        fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+
+        aggregate_sweep = tables["selective_refinement_window_sweep"]
+        source_sweep = tables["source_checkpoint_refinement_window_sweep"]
+        for score_name in horizon_names:
+            source_delta = source_sweep[source_sweep.score_name == score_name].pivot(
+                index="lower", columns="upper", values="delta_pp").sort_index()
+            aggregate_delta = aggregate_sweep[
+                aggregate_sweep.score_name == score_name].pivot(
+                    index="lower", columns="upper", values="delta_pp").sort_index()
+            aggregate_delta = aggregate_delta.reindex_like(source_delta)
+            finite = np.concatenate([
+                source_delta.to_numpy().ravel(), aggregate_delta.to_numpy().ravel()])
+            finite = finite[np.isfinite(finite)]
+            limit = max(.1, float(np.abs(finite).max()))
+            extent = [float(source_delta.columns.min()), float(source_delta.columns.max()),
+                      float(source_delta.index.min()), float(source_delta.index.max())]
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            for axis, values, title in [
+                    (axes[0], source_delta, "Source checkpoint"),
+                    (axes[1], aggregate_delta, "Two-model lower-U aggregation")]:
+                image = axis.imshow(values.to_numpy(), origin="lower", aspect="auto",
+                                    cmap="RdYlGn", vmin=-limit, vmax=limit, extent=extent)
+                axis.set(xlabel="Upper uncertainty", ylabel="Lower uncertainty", title=title)
+            fig.colorbar(image, ax=axes, label="Whole-cohort delta SR (pp)", shrink=.82)
+            fig.suptitle("Window sweep comparison: " + score_name.replace("_", " "))
+            fig.subplots_adjust(top=.84, bottom=.14, wspace=.28)
+            path = output / f"source_vs_aggregate_window_sweep_{score_name}.png"
             fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
     return written
