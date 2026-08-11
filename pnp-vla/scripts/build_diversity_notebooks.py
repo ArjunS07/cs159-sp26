@@ -591,6 +591,7 @@ K=5 `(3,4)` expanded-PRO rollouts and restricts them to the exact four-arm ident
 Source baseline is the direct competence comparison; source refinement is included for context."""),
     code(r'''from pnp.config import PI05_REPO_ID
 from pnp.experiments import PRO_EXPANDED_EXPERIMENT
+from pnp.diversity import analyze_checkpoint_refinement
 
 source_runs = pd.DataFrame(store.fetch_all(
     "experiment_runs", "run_id,model_repo_id,model_revision",
@@ -601,17 +602,19 @@ assert set(source_runs.model_repo_id.dropna()) == {PI05_REPO_ID}
 
 source_rows = pd.DataFrame(store.fetch_all(
     "rollouts", "rollout_id,suite,task_idx,episode_idx,init_state_hash,method,status,success,"
-    "pnp_k,pnp_step_indices,refine_average",
+    "u_mean_episode,pnp_k,pnp_step_indices,refine_average",
     configure=lambda query: query.eq("experiment", PRO_EXPANDED_EXPERIMENT),
     order_by=("rollout_id",)))
 source_rows = source_rows[
     source_rows.status.eq("completed") & source_rows.pnp_k.eq(5) &
     source_rows.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4))]
-source_observed = source_rows[source_rows.method.eq(Method.UNCERTAINTY)][
-    DIVERSITY_PAIR_KEYS + ["success"]].rename(columns={"success": "source_baseline_success"})
-source_refined = source_rows[
+source_observed_rows = source_rows[source_rows.method.eq(Method.UNCERTAINTY)].copy()
+source_refined_rows = source_rows[
     source_rows.method.eq(Method.REFINEMENT) &
-    ~source_rows.refine_average.fillna(False).astype(bool)][
+    ~source_rows.refine_average.fillna(False).astype(bool)].copy()
+source_observed = source_observed_rows[
+    DIVERSITY_PAIR_KEYS + ["success"]].rename(columns={"success": "source_baseline_success"})
+source_refined = source_refined_rows[
     DIVERSITY_PAIR_KEYS + ["success"]].rename(columns={"success": "source_refinement_success"})
 assert not source_observed.duplicated(DIVERSITY_PAIR_KEYS).any()
 assert not source_refined.duplicated(DIVERSITY_PAIR_KEYS).any()
@@ -651,7 +654,39 @@ tables["source_checkpoint_overall"] = source_overall
 tables["source_checkpoint_by_suite"] = source_by_suite
 print("Matched shared-source checkpoint comparison")
 display(source_overall)
-display(source_by_suite)'''),
+display(source_by_suite)
+
+# Run the same horizon/AUC/window analysis on the source checkpoint, using only exact
+# current/source identities and only source episodes with both baseline and refinement arms.
+matched_keys = comparison[DIVERSITY_PAIR_KEYS]
+source_analysis_rollouts = pd.concat(
+    [source_observed_rows, source_refined_rows], ignore_index=True).merge(
+        matched_keys, on=DIVERSITY_PAIR_KEYS, validate="many_to_one")
+source_observed_ids = source_analysis_rollouts[
+    source_analysis_rollouts.method.eq(Method.UNCERTAINTY)].rollout_id.astype(str).tolist()
+source_step_rows = []
+for start in range(0, len(source_observed_ids), 100):
+    batch = source_observed_ids[start:start + 100]
+    source_step_rows.extend(store.fetch_all(
+        "pnp_euler_steps", "rollout_id,chunk_idx,euler_step,u_mean",
+        configure=lambda query, ids=batch: query.in_("rollout_id", ids),
+        order_by=("rollout_id",)))
+source_steps = pd.DataFrame(source_step_rows)
+source_analysis = analyze_checkpoint_refinement(
+    source_analysis_rollouts, source_steps, checkpoint_name="source_checkpoint")
+for name, frame in source_analysis.items():
+    tables[name.replace("member_refinement", "source_checkpoint_refinement")] = frame
+
+source_horizons = source_analysis["member_refinement_overall"]
+print("Shared source checkpoint: matched refinement delta and failure AUC")
+display(source_horizons[source_horizons.score_name.isin(horizons)][[
+    "score_name", "n_pairs", "baseline_sr", "refinement_sr", "delta_pp",
+    "delta_ci_low_pp", "delta_ci_high_pp", "F_to_S", "S_to_F", "failure_auc"]])
+print("Shared source checkpoint: top exploratory uncertainty windows")
+source_top = source_analysis["member_refinement_top_windows"]
+display(source_top[source_top.score_name.isin(horizons) & (source_top["rank"] <= 5)][[
+    "score_name", "rank", "lower", "upper", "n_refined", "selective_sr",
+    "delta_pp", "selected_F_to_S", "selected_S_to_F"]])'''),
     md("## 5. Two-model lower-uncertainty aggregation"),
     code(r'''overall = tables["selective_refinement_overall"]
 columns = ["score_name", "interpretation", "n_pairs", "best_fixed_member_sr",

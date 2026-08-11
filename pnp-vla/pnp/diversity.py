@@ -790,6 +790,75 @@ def build_member_refinement_pairs(paired: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def build_checkpoint_refinement_pairs(
+        rollouts: pd.DataFrame, steps: pd.DataFrame, *,
+        checkpoint_name: str = "source_checkpoint") -> pd.DataFrame:
+    """Long-form uncertainty/refinement pairs for one checkpoint and matched identities."""
+    from .config import Method
+
+    required_methods = {Method.UNCERTAINTY, Method.REFINEMENT}
+    if set(rollouts.method.unique()) != required_methods:
+        raise ValueError(
+            f"checkpoint refinement requires exactly {sorted(required_methods)}; "
+            f"found {sorted(rollouts.method.unique())}")
+    if rollouts.status.ne("completed").any():
+        raise ValueError("checkpoint refinement requires completed rollout rows")
+    observed = rollouts[rollouts.method == Method.UNCERTAINTY].copy()
+    refined = rollouts[rollouts.method == Method.REFINEMENT].copy()
+    for label, frame in (("observed", observed), ("refined", refined)):
+        if frame.duplicated(DIVERSITY_PAIR_KEYS).any():
+            raise ValueError(f"checkpoint contains duplicate {label} identities")
+    paired = observed[DIVERSITY_PAIR_KEYS + [
+        "rollout_id", "success", "u_mean_episode"]].merge(
+            refined[DIVERSITY_PAIR_KEYS + ["rollout_id", "success"]],
+            on=DIVERSITY_PAIR_KEYS, suffixes=("_observed", "_refined"),
+            validate="one_to_one")
+    if paired.empty:
+        raise ValueError("checkpoint has no matched baseline/refinement identities")
+
+    observed_ids = set(paired.rollout_id_observed.astype(str))
+    if steps.empty or "rollout_id" not in steps:
+        raise ValueError("checkpoint has no saved PnP Euler-step uncertainty rows")
+    observed_steps = steps[steps.rollout_id.astype(str).isin(observed_ids)].copy()
+    if observed_steps.empty:
+        raise ValueError("checkpoint has no Euler-step rows for its matched baseline rollouts")
+    chunk_scores = (observed_steps.groupby(["rollout_id", "chunk_idx"])
+                    .u_mean.mean().unstack("chunk_idx"))
+    score_rows = chunk_scores.index.to_frame(index=False)
+    for index in range(8):
+        score_rows[f"u_chunk_{index}"] = (
+            chunk_scores[index].to_numpy() if index in chunk_scores else math.nan)
+    for count in DIVERSITY_PREFIX_CHUNKS:
+        columns = [index for index in range(count) if index in chunk_scores]
+        if len(columns) != count:
+            score_rows[f"u_prefix_{count}"] = math.nan
+            continue
+        values = chunk_scores[columns]
+        score_rows[f"u_prefix_{count}"] = values.mean(axis=1).where(
+            values.notna().all(axis=1)).to_numpy()
+    score_rows = score_rows.merge(
+        observed[["rollout_id", "u_mean_episode"]], on="rollout_id",
+        validate="one_to_one").rename(columns={"u_mean_episode": "u_full_episode"})
+    paired = paired.merge(
+        score_rows, left_on="rollout_id_observed", right_on="rollout_id",
+        validate="one_to_one")
+
+    frames = []
+    for order, spec in enumerate(_selective_score_specs()):
+        valid = paired[spec["column"]].notna()
+        frame = paired.loc[valid, DIVERSITY_PAIR_KEYS].copy()
+        frame["member_index"] = checkpoint_name
+        frame["score_name"] = spec["score_name"]
+        frame["score_order"] = order
+        frame["signal_kind"] = spec["signal_kind"]
+        frame["interpretation"] = spec["interpretation"]
+        frame["u"] = paired.loc[valid, spec["column"]].to_numpy(float)
+        frame["baseline_success"] = paired.loc[valid, "success_observed"].to_numpy(bool)
+        frame["refined_success"] = paired.loc[valid, "success_refined"].to_numpy(bool)
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
+
+
 def _member_refinement_summary(group: pd.DataFrame) -> dict:
     baseline = group.baseline_success.to_numpy(bool)
     refined = group.refined_success.to_numpy(bool)
@@ -806,9 +875,8 @@ def _member_refinement_summary(group: pd.DataFrame) -> dict:
     }
 
 
-def analyze_member_refinement(paired: pd.DataFrame, *, grid_size: int = 25,
-                              min_window: int = 10) -> dict[str, pd.DataFrame]:
-    member_pairs = build_member_refinement_pairs(paired)
+def _analyze_refinement_pairs(member_pairs: pd.DataFrame, *, grid_size: int,
+                              min_window: int) -> dict[str, pd.DataFrame]:
     overall = pd.DataFrame([
         {"member_index": member, "score_name": score_name,
          "score_order": int(group.score_order.iloc[0]),
@@ -866,6 +934,24 @@ def analyze_member_refinement(paired: pd.DataFrame, *, grid_size: int = 25,
         "member_refinement_window_sweep": sweep,
         "member_refinement_top_windows": top,
     }
+
+
+def analyze_member_refinement(paired: pd.DataFrame, *, grid_size: int = 25,
+                              min_window: int = 10) -> dict[str, pd.DataFrame]:
+    return _analyze_refinement_pairs(
+        build_member_refinement_pairs(paired), grid_size=grid_size,
+        min_window=min_window)
+
+
+def analyze_checkpoint_refinement(
+        rollouts: pd.DataFrame, steps: pd.DataFrame, *,
+        checkpoint_name: str = "source_checkpoint", grid_size: int = 25,
+        min_window: int = 10) -> dict[str, pd.DataFrame]:
+    """Apply the per-model AUC/window analysis to one matched checkpoint."""
+    pairs = build_checkpoint_refinement_pairs(
+        rollouts, steps, checkpoint_name=checkpoint_name)
+    return _analyze_refinement_pairs(
+        pairs, grid_size=grid_size, min_window=min_window)
 
 
 def _selective_policy_summary(group: pd.DataFrame, threshold: float) -> dict:
@@ -1350,4 +1436,31 @@ def diversity_selective_refinement_figures(
         ax.legend(fontsize=8); fig.tight_layout()
         path = output / "members_vs_source_checkpoint_by_suite.png"
         fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+    if "source_checkpoint_refinement_window_sweep" in tables:
+        source_sweep = tables["source_checkpoint_refinement_window_sweep"]
+        for score_name in ("first_chunk", "full_episode"):
+            group = source_sweep[source_sweep.score_name == score_name]
+            delta = group.pivot(
+                index="lower", columns="upper", values="delta_pp").sort_index()
+            count = group.pivot(
+                index="lower", columns="upper", values="n_refined").reindex_like(delta)
+            extent = [float(delta.columns.min()), float(delta.columns.max()),
+                      float(delta.index.min()), float(delta.index.max())]
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            image = axes[0].imshow(delta.to_numpy(), origin="lower", aspect="auto",
+                                   cmap="RdYlGn", extent=extent)
+            sample = axes[1].imshow(count.to_numpy(), origin="lower", aspect="auto",
+                                    cmap="Blues", extent=extent)
+            fig.colorbar(image, ax=axes[0], label="In-sample delta SR (pp)")
+            fig.colorbar(sample, ax=axes[1], label="Episodes refined")
+            for axis in axes:
+                axis.set(xlabel="Upper uncertainty", ylabel="Lower uncertainty")
+            axes[0].set_title("Exploratory selective-refinement effect")
+            axes[1].set_title("Window sample size")
+            fig.suptitle(
+                "Shared source checkpoint: " + score_name.replace("_", " ") +
+                " uncertainty window")
+            fig.tight_layout()
+            path = output / f"source_checkpoint_window_{score_name}.png"
+            fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
     return written

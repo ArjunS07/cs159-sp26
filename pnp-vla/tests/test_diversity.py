@@ -9,6 +9,7 @@ import pandas as pd
 
 from pnp.config import RolloutConfig
 from pnp.diversity import (DIVERSITY_EXPERIMENT_PREFIX, DIVERSITY_V2_EXPERIMENT_PREFIX,
+                           analyze_checkpoint_refinement,
                            analyze_diversity_selective_refinement, analyze_diversity_signal,
                            bootstrap_manifest_summary,
                            bootstrap_sampler_class, build_bootstrap_manifest,
@@ -549,8 +550,9 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
                             "chunk_idx": chunk_idx, "euler_step": euler_step,
                             "u_mean": uncertainty[member][index] + .001 * chunk_idx,
                         })
+    rollout_frame, step_frame = pd.DataFrame(rows), pd.DataFrame(steps)
     tables = analyze_diversity_selective_refinement(
-        pd.DataFrame(rows), pd.DataFrame(steps), grid_size=5, min_window=1)
+        rollout_frame, step_frame, grid_size=5, min_window=1)
     overall = tables["selective_refinement_overall"].set_index("score_name")
     first = overall.loc["first_chunk"]
     assert first.n_pairs == 4
@@ -567,6 +569,16 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         member_overall.columns)
     assert set(tables["member_refinement_top_windows"].member_index) == {0, 1}
     assert len(tables["selective_refinement_loso_folds"].held_out_suite.unique()) == 2
+    source_analysis = analyze_checkpoint_refinement(
+        rollout_frame[rollout_frame.member_index == 0].drop(columns="member_index"),
+        step_frame[step_frame.member_index == 0].drop(columns="member_index"),
+        grid_size=5, min_window=1)
+    assert set(source_analysis["member_refinement_overall"].member_index) == {
+        "source_checkpoint"}
+    assert not source_analysis["member_refinement_window_sweep"].empty
+    for name, frame in source_analysis.items():
+        tables[name.replace(
+            "member_refinement", "source_checkpoint_refinement")] = frame
     tables["source_checkpoint_by_suite"] = pd.DataFrame([
         {"suite": suite, "source_baseline_sr": .25,
          "model0_baseline_sr": .5, "model1_baseline_sr": .5}
@@ -585,6 +597,8 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         "member_1_window_full_episode.png",
         "aggregate_selector_delta_and_auc.png",
         "members_vs_source_checkpoint_by_suite.png",
+        "source_checkpoint_window_first_chunk.png",
+        "source_checkpoint_window_full_episode.png",
         "selective_refinement_by_horizon.png",
         "selective_refinement_by_chunk.png",
         "selective_refinement_first_chunk_by_suite.png",
