@@ -523,8 +523,7 @@ is directly deployable from these independently simulated trajectories. Later sc
 post-hoc evidence about predictiveness and headroom, but they are not presented as an online
 policy. For `prefix_N`, trajectories with fewer than N chunks use their whole-episode uncertainty,
 so every prefix sweep retains the entire matched cohort in its SR denominator. The best in-sample
-window is exploratory; leave-one-suite-out (LOSO) window selection is reported separately to
-reduce threshold-selection optimism."""),
+window is exploratory and is evaluated on the same matched cohort used to choose it."""),
     md("## 1. Setup"), code(bootstrap(extras="analysis", setup_env=False)),
     md("## 2. Fetch and validate the exact four-arm cohort"),
     code(r'''from pathlib import Path
@@ -793,7 +792,99 @@ print("Best two-model gating signal at each horizon")
 display(signal_winners[[
     "score_name", "gate_signal", "lower", "upper", "n_refined", "selective_sr",
     "delta_pp", "source_window_delta_pp", "delta_advantage_vs_source_pp"]])'''),
-    md("""## 7. Supporting aggregation details
+    md("""## 7. Oracle ceilings and source-plus-member ensembles
+
+The oracle rows are impossible selectors that know each rollout's outcome in advance. They answer
+whether the recorded arms contain enough complementary successes for a real selector to exploit.
+The four-arm member oracle succeeds if any of model 0/1 baseline/refinement succeeds; the six-arm
+oracle also includes source baseline/refinement.
+
+The source-plus-member experiments are implementable selection rules on the recorded trajectories:
+choose the lower-uncertainty policy from `{source, model 0}` or `{source, model 1}`, then refine that
+chosen policy only when its uncertainty falls inside the swept window. Positive
+`delta_advantage_vs_source_pp` means the pair's window gain exceeds the source checkpoint's own
+best window gain at that horizon."""),
+    code(r'''from pnp.diversity import analyze_source_member_ensembles
+
+# Exact episode-level oracle ceilings. These are diagnostics, not deployable policies.
+oracle_episodes = paired[DIVERSITY_PAIR_KEYS + [
+    "success_observed_m0", "success_refined_m0",
+    "success_observed_m1", "success_refined_m1"]].merge(
+        comparison[DIVERSITY_PAIR_KEYS + [
+            "source_baseline_success", "source_refinement_success"]],
+        on=DIVERSITY_PAIR_KEYS, validate="one_to_one")
+outcome_columns = [
+    "source_baseline_success", "source_refinement_success",
+    "success_observed_m0", "success_refined_m0",
+    "success_observed_m1", "success_refined_m1"]
+for column in outcome_columns:
+    oracle_episodes[column] = oracle_episodes[column].astype(bool)
+
+oracle_policies = {
+    "source baseline": ["source_baseline_success"],
+    "source refinement": ["source_refinement_success"],
+    "model 0 baseline": ["success_observed_m0"],
+    "model 1 baseline": ["success_observed_m1"],
+    "2-member baseline oracle": ["success_observed_m0", "success_observed_m1"],
+    "4-arm member oracle": ["success_observed_m0", "success_refined_m0",
+                            "success_observed_m1", "success_refined_m1"],
+    "source + members baseline oracle": ["source_baseline_success",
+                                          "success_observed_m0", "success_observed_m1"],
+    "all 6-arm oracle": outcome_columns,
+}
+source_baseline_sr = oracle_episodes.source_baseline_success.mean()
+best_source_window_sr = window_comparison.source_window_sr.max()
+oracle_summary = pd.DataFrame([{
+    "policy": name, "n": len(oracle_episodes),
+    "n_success": int(oracle_episodes[columns].any(axis=1).sum()),
+    "success_rate": oracle_episodes[columns].any(axis=1).mean(),
+    "delta_vs_source_baseline_pp": 100 * (
+        oracle_episodes[columns].any(axis=1).mean() - source_baseline_sr),
+    "delta_vs_best_source_window_pp": 100 * (
+        oracle_episodes[columns].any(axis=1).mean() - best_source_window_sr),
+} for name, columns in oracle_policies.items()])
+tables["oracle_opportunity_episodes"] = oracle_episodes
+tables["oracle_opportunity_summary"] = oracle_summary
+print("Oracle opportunity (upper bounds; outcome knowledge is not deployable)")
+display(oracle_summary)
+
+# Source+m0 and source+m1: lower-U policy selection followed by a windowed refinement gate.
+source_member = analyze_source_member_ensembles(
+    tables["member_refinement_pairs"],
+    source_analysis["member_refinement_pairs"],
+    fixed_threshold=FIXED_THRESHOLD)
+for name, frame in source_member.items():
+    tables[name] = frame
+
+source_member_best = source_member["source_member_best_windows"]
+source_member_overall = source_member["source_member_overall"]
+source_member_comparison = (
+    source_member_best[source_member_best.score_name.isin(horizons)][[
+        "ensemble", "member_index", "score_name", "lower", "upper", "n_refined",
+        "selective_sr", "delta_pp", "delta_vs_best_fixed_pp"]]
+    .merge(source_member_overall[source_member_overall.score_name.isin(horizons)][[
+        "ensemble", "score_name", "lower_u_baseline_sr", "best_fixed_member_sr"]],
+        on=["ensemble", "score_name"], validate="one_to_one")
+    .merge(source_reference, on="score_name", validate="many_to_one"))
+source_member_comparison["delta_advantage_vs_source_pp"] = (
+    source_member_comparison.delta_pp - source_member_comparison.source_window_delta_pp)
+source_member_comparison["window_sr_vs_source_window_pp"] = 100 * (
+    source_member_comparison.selective_sr - source_member_comparison.source_window_sr)
+source_member_comparison["score_name"] = pd.Categorical(
+    source_member_comparison.score_name, categories=horizons, ordered=True)
+source_member_comparison = source_member_comparison.sort_values(
+    ["member_index", "score_name"])
+tables["source_member_best_window_comparison"] = source_member_comparison
+display(source_member_comparison[[
+    "ensemble", "score_name", "lower_u_baseline_sr", "best_fixed_member_sr",
+    "lower", "upper", "n_refined", "selective_sr", "delta_pp",
+    "source_window_delta_pp", "delta_advantage_vs_source_pp",
+    "source_window_sr", "window_sr_vs_source_window_pp"]].rename(columns={
+        "score_name": "uncertainty_horizon",
+        "best_fixed_member_sr": "best_fixed_pair_sr",
+        "selective_sr": "source_member_window_sr",
+        "delta_pp": "source_member_window_delta_pp"}))'''),
+    md("""## 8. Supporting aggregation details
 
 The table below retains the five best windows per horizon so nearby alternatives can be inspected.
 The fixed `0.03` gate is shown only as a secondary predeclared comparison; it is not the main
@@ -810,12 +901,14 @@ display(overall[overall.score_name.isin(horizons)][[
     "fixed_threshold_sr", "fixed_delta_vs_lower_u_pp",
     "fixed_delta_vs_best_fixed_pp", "fixed_vs_best_ci_low_pp",
     "fixed_vs_best_ci_high_pp", "n_refined_fixed", "fixed_F_to_S", "fixed_S_to_F"]])'''),
-    md("## 8. Save tables and figures"),
+    md("## 9. Save tables and figures"),
     code(r'''for name, frame in tables.items():
     frame.to_csv(OUTPUT / f"{name}.csv", index=False)
 paths = diversity_selective_refinement_figures(tables, OUTPUT / "figures")
 primary_names = {"source_vs_aggregate_best_windows.png",
-                 "alternative_aggregate_gate_signals.png"} | {
+                 "alternative_aggregate_gate_signals.png",
+                 "oracle_opportunity.png",
+                 "source_member_best_windows.png"} | {
     f"source_vs_aggregate_window_sweep_{name}.png" for name in horizons}
 print("Primary source-versus-aggregation figures")
 for path in paths:
@@ -823,7 +916,7 @@ for path in paths:
         print(path.name)
         display(Image(filename=str(path)))
 print(f"Saved {len(paths) - len(primary_names)} additional diagnostic figures without displaying them.")'''),
-    md("## 9. Concise readout"),
+    md("## 10. Concise readout"),
     code(r'''for _, row in window_comparison.iterrows():
     print(str(row.score_name).replace("_", " "))
     print("  source window:    %5.1f%% SR (%+.2f pp over source baseline)" %
@@ -832,6 +925,19 @@ print(f"Saved {len(paths) - len(primary_names)} additional diagnostic figures wi
           (100 * row.aggregate_window_sr, row.aggregate_window_delta_pp))
     print("  aggregate delta advantage over source: %+.2f pp" %
           row.aggregate_delta_advantage_pp)
+four_arm = oracle_summary[oracle_summary.policy.eq("4-arm member oracle")].iloc[0]
+six_arm = oracle_summary[oracle_summary.policy.eq("all 6-arm oracle")].iloc[0]
+print("\nOracle ceilings (not deployable)")
+print("  four member arms: %.1f%% SR (%+.2f pp versus best source window)" %
+      (100 * four_arm.success_rate, four_arm.delta_vs_best_source_window_pp))
+print("  source + all member arms: %.1f%% SR (%+.2f pp versus best source window)" %
+      (100 * six_arm.success_rate, six_arm.delta_vs_best_source_window_pp))
+best_pair = source_member_comparison.sort_values(
+    "window_sr_vs_source_window_pp", ascending=False).iloc[0]
+print("Best source+member result")
+print("  %s, %s: %.1f%% SR (%+.2f pp versus source's window at that horizon)" %
+      (best_pair.ensemble, str(best_pair.score_name).replace("_", " "),
+       100 * best_pair.selective_sr, best_pair.window_sr_vs_source_window_pp))
 print("\nFirst chunk is deployable at the initial observation; later horizons are post-hoc here.")'''),
 ], "21_analyze_diversity_selective_refinement_v2.ipynb")
 

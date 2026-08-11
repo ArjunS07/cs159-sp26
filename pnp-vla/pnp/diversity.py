@@ -1077,6 +1077,81 @@ def aggregation_gate_signal_window_sweep(
     return sweep, best
 
 
+def analyze_source_member_ensembles(
+        member_pairs: pd.DataFrame, source_pairs: pd.DataFrame, *,
+        fixed_threshold: float = DIVERSITY_FIXED_REFINEMENT_THRESHOLD,
+        grid_size: int = 25, min_window: int = 10) -> dict[str, pd.DataFrame]:
+    """Evaluate source+member lower-U selection and selective-refinement windows."""
+    source = source_pairs[DIVERSITY_PAIR_KEYS + [
+        "score_name", "u", "baseline_success", "refined_success"]].rename(columns={
+            "u": "u_source", "baseline_success": "source_baseline_success",
+            "refined_success": "source_refined_success"})
+    if source.duplicated(DIVERSITY_PAIR_KEYS + ["score_name"]).any():
+        raise ValueError("source checkpoint contains duplicate score identities")
+    frames = []
+    for member_index in (0, 1):
+        member = member_pairs[member_pairs.member_index == member_index][
+            DIVERSITY_PAIR_KEYS + ["score_name", "score_order", "signal_kind",
+                                   "interpretation", "u", "baseline_success",
+                                   "refined_success"]].rename(columns={
+                "u": "u_member", "baseline_success": "member_baseline_success",
+                "refined_success": "member_refined_success"})
+        frame = source.merge(
+            member, on=DIVERSITY_PAIR_KEYS + ["score_name"], validate="one_to_one")
+        choose_source = frame.u_source.to_numpy(float) <= frame.u_member.to_numpy(float)
+        source_baseline = frame.source_baseline_success.to_numpy(bool)
+        member_baseline = frame.member_baseline_success.to_numpy(bool)
+        source_refined = frame.source_refined_success.to_numpy(bool)
+        member_refined = frame.member_refined_success.to_numpy(bool)
+        frame["ensemble"] = f"source_plus_m{member_index}"
+        frame["member_index"] = member_index
+        frame["selected_policy"] = np.where(choose_source, "source", f"model_{member_index}")
+        frame["selected_u"] = np.where(
+            choose_source, frame.u_source.to_numpy(float), frame.u_member.to_numpy(float))
+        frame["baseline_success"] = np.where(
+            choose_source, source_baseline, member_baseline)
+        frame["refined_success"] = np.where(
+            choose_source, source_refined, member_refined)
+        frame["model0_baseline_success"] = source_baseline
+        frame["model1_baseline_success"] = member_baseline
+        frame["u_m0"] = frame.u_source.to_numpy(float)
+        frame["u_m1"] = frame.u_member.to_numpy(float)
+        frames.append(frame)
+    policy_pairs = pd.concat(frames, ignore_index=True)
+
+    overall = pd.DataFrame([
+        {"ensemble": ensemble, "member_index": int(group.member_index.iloc[0]),
+         "score_name": score_name, "score_order": int(group.score_order.iloc[0]),
+         "interpretation": group.interpretation.iloc[0],
+         **_selective_policy_summary(group, fixed_threshold)}
+        for (ensemble, score_name), group in policy_pairs.groupby(
+            ["ensemble", "score_name"], sort=False)
+    ]).sort_values(["member_index", "score_order"])
+
+    rows = []
+    for (ensemble, score_name), group in policy_pairs.groupby(
+            ["ensemble", "score_name"], sort=False):
+        metadata = group.iloc[0]
+        rows.extend({
+            "ensemble": ensemble, "member_index": int(metadata.member_index),
+            "score_name": score_name, "score_order": int(metadata.score_order),
+            "interpretation": metadata.interpretation,
+            "analysis_type": "exploratory_in_sample", **row,
+        } for row in _window_rows(
+            group, grid_size=grid_size, min_window=min_window))
+    sweep = pd.DataFrame(rows)
+    eligible = sweep[sweep.eligible & sweep.delta_pp.notna()].sort_values(
+        ["member_index", "score_order", "delta_pp", "n_refined", "lower", "upper"],
+        ascending=[True, True, False, False, True, True])
+    best = eligible.groupby(["ensemble", "score_name"], sort=False).head(1).copy()
+    return {
+        "source_member_policy_pairs": policy_pairs,
+        "source_member_overall": overall,
+        "source_member_window_sweep": sweep,
+        "source_member_best_windows": best,
+    }
+
+
 def selective_refinement_loso(policy_pairs: pd.DataFrame, *, grid_size: int = 25,
                               min_window: int = 10) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Choose a window on 12 suites and apply it once to the held-out suite."""
@@ -1635,5 +1710,61 @@ def diversity_selective_refinement_figures(
         fig.suptitle("Alternative uncertainty signals for two-model refinement gating")
         fig.tight_layout()
         path = output / "alternative_aggregate_gate_signals.png"
+        fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+    if "oracle_opportunity_summary" in tables:
+        oracle = tables["oracle_opportunity_summary"].copy()
+        colors = ["#9D9D9D", "#BAB0AC", "#4C78A8", "#F58518",
+                  "#72B7B2", "#54A24B", "#B279A2", "#E45756"]
+        fig, ax = plt.subplots(figsize=(13, 5.5))
+        x = np.arange(len(oracle))
+        ax.bar(x, 100 * oracle.success_rate, color=colors[:len(oracle)])
+        if "source_vs_aggregate_best_windows" in tables:
+            best_source = 100 * tables[
+                "source_vs_aggregate_best_windows"].source_window_sr.max()
+            ax.axhline(best_source, color="black", ls="--", lw=1.5,
+                       label=f"best source uncertainty window ({best_source:.1f}%)")
+            ax.legend(fontsize=8)
+        for index, value in enumerate(100 * oracle.success_rate):
+            ax.text(index, value + .7, f"{value:.1f}%", ha="center", fontsize=8)
+        ax.set_xticks(x, oracle.policy, rotation=28, ha="right")
+        ax.set(ylabel="Success rate (%)", ylim=(0, 105),
+               title="Recorded-outcome oracle ceilings (not deployable)")
+        fig.tight_layout()
+        path = output / "oracle_opportunity.png"
+        fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
+    if "source_member_best_window_comparison" in tables:
+        comparison = tables["source_member_best_window_comparison"].copy()
+        comparison["score_name"] = pd.Categorical(
+            comparison.score_name, categories=horizon_names, ordered=True)
+        source = comparison.drop_duplicates("score_name").set_index(
+            "score_name").reindex(horizon_names)
+        x = np.arange(len(horizon_names))
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        axes[0].plot(x, source.source_window_delta_pp, marker="o", lw=2.5,
+                     label="source alone", color="#222222")
+        axes[1].plot(x, 100 * source.source_window_sr, marker="o", lw=2.5,
+                     label="source alone", color="#222222")
+        pair_colors = {"source_plus_m0": "#4C78A8", "source_plus_m1": "#F58518"}
+        for ensemble in comparison["ensemble"].drop_duplicates():
+            group = comparison[comparison["ensemble"].eq(ensemble)].copy()
+            group["score_name"] = group.score_name.astype(str)
+            group = group.drop_duplicates("score_name").set_index(
+                "score_name").reindex(horizon_names)
+            label = str(ensemble).replace("source_plus_m", "source + model ")
+            color = pair_colors.get(str(ensemble))
+            axes[0].plot(x, group.delta_pp, marker="o", label=label, color=color)
+            axes[1].plot(x, 100 * group.selective_sr, marker="o", label=label, color=color)
+        axes[0].axhline(0, color="black", lw=1)
+        axes[0].set(ylabel="Best-window whole-cohort delta SR (pp)",
+                    title="Gain over each policy's unrefined selection")
+        axes[1].set(ylabel="Success rate after best window (%)",
+                    title="Absolute SR after selective refinement")
+        tick_labels = [name.replace("_", " ") for name in horizon_names]
+        for axis in axes:
+            axis.set_xticks(x, tick_labels, rotation=25, ha="right")
+            axis.legend(fontsize=8)
+        fig.suptitle("Source checkpoint paired with each fine-tuned member")
+        fig.tight_layout()
+        path = output / "source_member_best_windows.png"
         fig.savefig(path, dpi=180); plt.close(fig); written.append(path)
     return written

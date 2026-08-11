@@ -12,6 +12,7 @@ from pnp.diversity import (DIVERSITY_EXPERIMENT_PREFIX, DIVERSITY_V2_EXPERIMENT_
                            aggregation_gate_signal_window_sweep,
                            analyze_checkpoint_refinement,
                            analyze_diversity_selective_refinement, analyze_diversity_signal,
+                           analyze_source_member_ensembles,
                            bootstrap_manifest_summary,
                            bootstrap_sampler_class, build_bootstrap_manifest,
                            diversity_baseline_cohort, diversity_experiment,
@@ -614,6 +615,28 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         alternative_best.delta_pp - alternative_best.source_window_delta_pp)
     tables["alternative_aggregate_gate_signal_sweep"] = gate_sweep
     tables["alternative_aggregate_gate_signal_best_windows"] = alternative_best
+    source_member = analyze_source_member_ensembles(
+        tables["member_refinement_pairs"],
+        source_analysis["member_refinement_pairs"], grid_size=5, min_window=1)
+    assert set(source_member["source_member_best_windows"].ensemble) == {
+        "source_plus_m0", "source_plus_m1"}
+    assert len(source_member["source_member_best_windows"]) == 2 * len(set(
+        tables["member_refinement_pairs"].score_name))
+    tables.update(source_member)
+    source_member_comparison = source_member["source_member_best_windows"].merge(
+        pd.concat([source_delta, source_sr], axis=1),
+        left_on="score_name", right_index=True, validate="many_to_one")
+    source_member_comparison["delta_advantage_vs_source_pp"] = (
+        source_member_comparison.delta_pp -
+        source_member_comparison.source_window_delta_pp)
+    tables["source_member_best_window_comparison"] = source_member_comparison
+    tables["oracle_opportunity_summary"] = pd.DataFrame([
+        {"policy": policy, "success_rate": success_rate}
+        for policy, success_rate in [
+            ("source baseline", .5), ("source refinement", .75),
+            ("model 0 baseline", .5), ("model 1 baseline", .5),
+            ("2-member baseline oracle", .75), ("4-arm member oracle", 1.),
+            ("source + members baseline oracle", .75), ("all 6-arm oracle", 1.)]])
     figures = diversity_selective_refinement_figures(tables, tmp_path)
     expected = {
         "member_0_refinement_delta_by_suite.png",
@@ -629,6 +652,8 @@ def test_selective_refinement_uses_lower_u_member_and_fixed_threshold(tmp_path):
         "aggregate_selector_delta_and_auc.png",
         "aggregate_window_delta_vs_best_by_horizon.png",
         "alternative_aggregate_gate_signals.png",
+        "oracle_opportunity.png",
+        "source_member_best_windows.png",
         "members_vs_source_checkpoint_by_suite.png",
         "source_vs_aggregate_best_windows.png",
         "selective_refinement_by_horizon.png",
