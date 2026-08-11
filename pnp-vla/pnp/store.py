@@ -408,6 +408,8 @@ class SupabaseStore:
             row.update(correction_lambda=config.correction_lambda, q_gate=config.q_gate,
                        correction_steps=list(config.pnp_steps),
                        q_ckpt_id=config.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
+        if config.refine_threshold is not None:
+            row.update(result.get("refinement_gate_telemetry") or {})
         if result.get("ms_selections"):
             sels = result["ms_selections"]
             row["ms_chosen_idx"] = sels[0]["chosen"]

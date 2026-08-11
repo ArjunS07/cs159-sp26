@@ -137,11 +137,17 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
     # Non-invasive strategies (uncertainty / collect) execute vanilla actions; the custom
     # loop below only measures. Compute the returned action from the saved original sampler
     # on a clone of the SAME noise so it is exactly a vanilla rollout.
-    measure_only = None
-    if not strat.invasive:
-        measure_only = self._orig_sample_actions(
+    baseline_action = None
+    needs_baseline_fallback = bool(
+        getattr(strat, "needs_baseline_fallback", False))
+    if not strat.invasive or needs_baseline_fallback:
+        baseline_action = self._orig_sample_actions(
             images, img_masks, tokens, masks, noise=noise.clone(), num_steps=num_steps, **kwargs
         ).clone()
+
+    begin_chunk = getattr(strat, "begin_chunk", None)
+    if begin_chunk is not None:
+        begin_chunk()
 
     # ---- prefix / KV cache: replicated verbatim from the original sample_actions ----
     # (opt-in) reuse the prefix encoding across paired methods at the same obs — skips embed_prefix.
@@ -185,7 +191,11 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
         x_t = x_t + dt * vfield(x_t)
 
     strat.finish(ctx)
-    return measure_only if measure_only is not None else x_t
+    if not strat.invasive:
+        return baseline_action
+    if needs_baseline_fallback and not bool(getattr(strat, "chunk_intervened", False)):
+        return baseline_action
+    return x_t
 
 
 def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3):

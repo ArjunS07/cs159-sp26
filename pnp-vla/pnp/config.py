@@ -6,6 +6,7 @@ is safe to import locally without a GPU stack.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -80,6 +81,7 @@ class Method:
     EXTRA_STEPS = "extra_steps"
     UNCERTAINTY = "pnp_uncertainty_only"    # probe set, no action (RNG-isolated no-op)
     REFINEMENT = "pnp_refinement"           # refine; last vs avg = refine_average column
+    THRESHOLD_REFINEMENT = "pnp_threshold_refinement"  # refine selected steps iff U >= threshold
     MULTI_SAMPLE = "multi_sample_select"
     CHUNK_SOURCE_SOURCE = "chunk_select_source_source"
     CHUNK_SOURCE_M1 = "chunk_select_source_m1"
@@ -89,6 +91,7 @@ class Method:
 
 
 ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.REFINEMENT,
+               Method.THRESHOLD_REFINEMENT,
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_M1,
                Method.PNP_ONLY, Method.PCP)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
@@ -123,6 +126,7 @@ class RolloutConfig:
     # ── (A) action — at most one of refine / correction_lambda / num_samples ──
     refine: bool = False                        # re-noise from the probe's clean estimate
     refine_average: bool = False                # refine from mean of K a_hats (True) vs last (False)
+    refine_threshold: Optional[float] = None    # refine selected Euler step iff u_mean >= this
     correction_lambda: Optional[float] = None   # set => PCP correction action (0.0 == P&P, no grad)
     q_gate: float = 0.5                         # only correct chunks with predicted P(success) < gate
     q_ckpt_id: Optional[str] = None
@@ -165,6 +169,11 @@ class RolloutConfig:
             raise ValueError("num_samples carries ms_probe_steps; leave pnp_steps/pnp_time_min unset")
         if self.refine_average and not self.refine:
             raise ValueError("refine_average=True requires refine=True")
+        if self.refine_threshold is not None:
+            if not self.refine:
+                raise ValueError("refine_threshold requires refine=True")
+            if not math.isfinite(float(self.refine_threshold)) or self.refine_threshold < 0:
+                raise ValueError("refine_threshold must be finite and non-negative")
         # Probe-derived sinks need a probe.
         for sink in ("save_pcp_features", "save_ahats"):
             if getattr(self, sink) and not self.has_probe:
@@ -203,12 +212,15 @@ class RolloutConfig:
         # bound in their IDs.
         if logical.get("candidate_set_id") is None:
             logical.pop("candidate_set_id")
+        if logical.get("refine_threshold") is None:
+            logical.pop("refine_threshold")
         return logical
 
 
 # Behavior-defining fields of RolloutConfig (see RolloutConfig.logical_dict).
 LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
-                  "refine", "refine_average", "correction_lambda", "q_gate", "q_ckpt_id",
+                  "refine", "refine_average", "refine_threshold",
+                  "correction_lambda", "q_gate", "q_ckpt_id",
                   "num_samples", "ms_probe_steps", "candidate_set_id", "num_inference_steps")
 
 

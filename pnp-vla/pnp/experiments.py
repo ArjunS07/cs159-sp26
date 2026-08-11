@@ -194,18 +194,20 @@ HISTORICAL_PRO_BASELINE_SR = {
 }
 
 _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
+                  Method.THRESHOLD_REFINEMENT: "U-gated refine",
                   Method.EXTRA_STEPS: "control",
                   Method.CHUNK_SOURCE_SOURCE: "source x2",
                   Method.CHUNK_SOURCE_M1: "source + m1"}
 
 
-def format_progress_table(tally, method_names) -> str:
+def format_progress_table(tally, method_names, historical_sr=None) -> str:
     """Running success rate per (suite, method), against the historical baseline.
 
     `tally` maps (suite, method) -> [n_rollouts, n_successes]. Only the observed/no-op arm is
     comparable to the historical column: it is an RNG-isolated no-op, so its SR *is* the vanilla
     baseline, while the refine arm is the intervention.
     """
+    historical_sr = HISTORICAL_PRO_BASELINE_SR if historical_sr is None else historical_sr
     labels = [(name, _METHOD_LABELS.get(name, name)) for name in method_names]
     lines = ["n = rollouts done in THIS shard, summed over the suite's tasks "
              "(not episodes per task)",
@@ -216,7 +218,7 @@ def format_progress_table(tally, method_names) -> str:
         for name, _ in labels:
             n, wins = tally.get((suite, name), (0, 0))
             cells += f"{'-':>16}" if not n else f"{f'{wins / n:.0%} ({wins}/{n})':>16}"
-        reference = HISTORICAL_PRO_BASELINE_SR.get(suite)
+        reference = historical_sr.get(suite)
         lines.append(f"{suite:<32}{cells}"
                      + (f"{'-':>12}" if reference is None else f"{reference:>11.0%} "))
     return "\n".join(lines)
@@ -290,7 +292,7 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                     methods, cohort, shard_count, shard_index,
                     benchmark="libero", driver="hybrid_schedules", run_metadata=None,
                     report_every=50, provenance=None, initial_tally=None,
-                    candidate_bundles_by_method=None):
+                    candidate_bundles_by_method=None, historical_sr=None):
     from tqdm.auto import tqdm
     from .rollout import iter_task_envs, run_episode
 
@@ -303,7 +305,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     print(f"{cohort}: {len(episodes)} identities x {len(methods)} configs; "
           f"{pending}/{expected} pending")
     refinement_schedules = [
-        config.pnp_steps for name, config in methods if name == Method.REFINEMENT
+        config.pnp_steps for name, config in methods
+        if name in (Method.REFINEMENT, Method.THRESHOLD_REFINEMENT)
     ]
     run_config = {"cohort": cohort, "schedules": refinement_schedules, "pnp_k": K,
                   "n_configs": len(methods), "shard_count": shard_count,
@@ -342,14 +345,15 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                     if report_every and completed % report_every == 0:
                         tqdm.write(f"\n--- {cohort}[{shard_index}] after {completed} rollouts "
                                    f"({completed}/{pending}) ---")
-                        tqdm.write(format_progress_table(tally, method_names))
+                        tqdm.write(format_progress_table(
+                            tally, method_names, historical_sr=historical_sr))
     except BaseException:
         store.finish_run(status="failed", n_rollouts=completed)
         raise
     store.finish_run(n_rollouts=completed)
     print(f"{cohort}: logged {completed} new rollouts")
     if tally:
-        print(format_progress_table(tally, method_names))
+        print(format_progress_table(tally, method_names, historical_sr=historical_sr))
 
 
 def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,

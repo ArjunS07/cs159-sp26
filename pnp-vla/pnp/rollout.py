@@ -367,6 +367,8 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
             result["pcp_chunks"] = tap.pcp_chunks
         if tap.pcp_telemetry is not None:
             result["pcp_telemetry"] = tap.pcp_telemetry
+        if tap.refinement_gate_telemetry is not None:
+            result["refinement_gate_telemetry"] = tap.refinement_gate_telemetry
     if ms_selections is not None:
         result["ms_selections"] = ms_selections
     return result

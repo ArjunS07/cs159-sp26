@@ -1089,6 +1089,58 @@ run_diversity_chunk_selector_worker(
     ], f"22_diversity_chunk_selector_worker_{shard_index}.ipynb")
 
 
+def source_threshold_refinement_worker_notebook(shard_index: int):
+    return notebook([
+        md(f"""# 24 - Source online threshold-refinement worker {shard_index}
+
+This is shard {shard_index} of 4 for the source-only causal online gate. At every decision chunk,
+the source checkpoint runs the same K=5 probe at Euler steps `(3,4)` as before. At each selected
+Euler step, the established **last refinement** is applied iff that step's `u_mean >= 0.03`.
+
+Only the gated intervention is collected: 1,300 identities total (10 episodes per task), or about
+325 rollouts per worker. The progress table compares its running SR with the historical **unrefined
+source baseline** from `pro-16suite-k5-steps34-v1`; that column is not the old offline-thresholded
+policy. Worker 0 may first use `EPISODE_LIMIT=1`; restore it to `None` for collection, and the smoke
+row will be reused."""),
+        md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
+        md("## 2. Configuration and resumable collection"),
+        code(f'''from pathlib import Path
+from google.colab import drive
+from pnp.config import PI05_REPO_ID
+from pnp.diversity import (DIVERSITY_FIXED_REFINEMENT_THRESHOLD,
+    SOURCE_THRESHOLD_REFINEMENT_EXPERIMENT, load_bootstrap_manifest,
+    run_source_threshold_refinement_worker)
+
+drive.mount("/content/drive")
+
+EPISODES_PER_TASK = 10
+SHARD_COUNT = 4
+SHARD_INDEX = {shard_index}
+EPISODE_LIMIT = None  # worker-0 smoke: set 1 once, then restore None
+THRESHOLD = DIVERSITY_FIXED_REFINEMENT_THRESHOLD  # 0.03, predeclared
+EXPERIMENT = SOURCE_THRESHOLD_REFINEMENT_EXPERIMENT
+MANIFEST_PATH = Path(
+    "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
+manifest = load_bootstrap_manifest(MANIFEST_PATH)
+assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+SOURCE_MODEL_REVISION = manifest["source_model_revision"]
+assert SOURCE_MODEL_REVISION, "v2 manifest is missing source_model_revision"
+
+print({{"experiment": EXPERIMENT, "threshold": THRESHOLD,
+       "threshold_signal": "per-step u_mean at Euler steps 3 and 4",
+       "episodes_per_task": EPISODES_PER_TASK,
+       "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+       "episode_limit": EPISODE_LIMIT,
+       "manifest_hash": manifest["manifest_hash"],
+       "source_model_revision": SOURCE_MODEL_REVISION}})
+run_source_threshold_refinement_worker(
+    episodes_per_task=EPISODES_PER_TASK, episode_limit=EPISODE_LIMIT,
+    threshold=THRESHOLD, shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+    manifest_hash=manifest["manifest_hash"],
+    source_model_revision=SOURCE_MODEL_REVISION, experiment=EXPERIMENT)'''),
+    ], f"24_source_threshold_refinement_worker_{shard_index}.ipynb")
+
+
 ANALYZE_CHUNK_SELECTOR = notebook([
     md("""# 23 - Analyze online per-chunk source+m1 aggregation
 
@@ -1237,6 +1289,128 @@ print("Source+m1 / source-requery normalized action-diversity ratio: %.2fx" %
 ], "23_analyze_diversity_chunk_selector.ipynb")
 
 
+ANALYZE_SOURCE_THRESHOLD_REFINEMENT = notebook([
+    md("""# 25 - Analyze source online threshold refinement
+
+This compares the causal online `U >= 0.03` source rollout with the exact historical unrefined
+source identity. Every success rate uses the whole matched episode set. Historical always-refine
+is shown only as context. The online gate is evaluated independently at Euler steps 3 and 4; this
+is not the old post-hoc whole-episode threshold policy."""),
+    md("## 1. Setup"), code(bootstrap(extras="analysis", setup_env=False)),
+    md("## 2. Fetch exact matched identities"),
+    code(r'''from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display
+from pnp.config import Method
+from pnp.diversity import (DIVERSITY_FIXED_REFINEMENT_THRESHOLD, DIVERSITY_PAIR_KEYS,
+    SOURCE_THRESHOLD_REFINEMENT_EXPERIMENT)
+from pnp.experiments import PRO_EXPANDED_EXPERIMENT
+from pnp.store import SupabaseStore
+
+THRESHOLD = DIVERSITY_FIXED_REFINEMENT_THRESHOLD
+OUTPUT = Path("source_threshold_refinement_outputs")
+OUTPUT.mkdir(exist_ok=True)
+store = SupabaseStore()
+
+online = pd.DataFrame(store.fetch_all(
+    "rollouts", "*", configure=lambda query: query.eq(
+        "experiment", SOURCE_THRESHOLD_REFINEMENT_EXPERIMENT).eq(
+            "method", Method.THRESHOLD_REFINEMENT), order_by=("rollout_id",)))
+source = pd.DataFrame(store.fetch_all(
+    "rollouts", "*", configure=lambda query: query.eq(
+        "experiment", PRO_EXPANDED_EXPERIMENT), order_by=("rollout_id",)))
+assert len(online), "No online threshold-refinement rollouts found"
+online = online[online.status.eq("completed")].copy()
+source = source[
+    source.status.eq("completed") & source.pnp_k.eq(5) &
+    source.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4))].copy()
+baseline = source[source.method.eq(Method.UNCERTAINTY)].copy()
+always = source[
+    source.method.eq(Method.REFINEMENT) & ~source.refine_average.fillna(False).astype(bool)].copy()
+for name, frame in (("online", online), ("baseline", baseline), ("always", always)):
+    assert not frame.duplicated(DIVERSITY_PAIR_KEYS).any(), f"duplicate {name} identities"
+
+paired = (online[DIVERSITY_PAIR_KEYS + ["rollout_id", "success", "n_pnp_activations",
+                                        "n_corrections_applied", "gate_fire_rate"]]
+          .rename(columns={"rollout_id": "online_rollout_id",
+                           "success": "online_success"})
+          .merge(baseline[DIVERSITY_PAIR_KEYS + ["success"]].rename(
+              columns={"success": "baseline_success"}),
+              on=DIVERSITY_PAIR_KEYS, validate="one_to_one")
+          .merge(always[DIVERSITY_PAIR_KEYS + ["success"]].rename(
+              columns={"success": "always_refine_success"}),
+              on=DIVERSITY_PAIR_KEYS, how="left", validate="one_to_one"))
+assert len(paired) == len(online), (
+    f"Only {len(paired)}/{len(online)} online rows match the historical baseline")
+for column in ("online_success", "baseline_success"):
+    paired[column] = paired[column].astype(bool)
+print({"completed_online_rollouts": len(online), "matched_identities": len(paired),
+       "suites": paired.suite.nunique(), "threshold": THRESHOLD})'''),
+    md("## 3. Whole-cohort result and gate usage"),
+    code(r'''def summarize(group):
+    baseline_values = group.baseline_success.to_numpy(bool)
+    online_values = group.online_success.to_numpy(bool)
+    considered = int(group.n_pnp_activations.fillna(0).sum())
+    applied = int(group.n_corrections_applied.fillna(0).sum())
+    return pd.Series({
+        "episodes": len(group),
+        "unrefined_baseline_sr_pct": 100 * baseline_values.mean(),
+        "online_threshold_sr_pct": 100 * online_values.mean(),
+        "online_minus_baseline_pp": 100 * (online_values.mean() - baseline_values.mean()),
+        "failure_to_success": int((~baseline_values & online_values).sum()),
+        "success_to_failure": int((baseline_values & ~online_values).sum()),
+        "probe_steps_considered": considered,
+        "refinement_steps_applied": applied,
+        "gate_fire_rate_pct": 100 * applied / max(considered, 1),
+        "historical_always_refine_sr_pct": 100 * group.always_refine_success.mean(),
+    })
+
+overall = summarize(paired).to_frame().T
+by_suite = pd.DataFrame([
+    {"suite": suite, **summarize(group).to_dict()}
+    for suite, group in paired.groupby("suite", sort=True)])
+print("Primary result: all matched episodes remain in the SR denominator")
+display(overall)
+display(by_suite[["suite", "episodes", "unrefined_baseline_sr_pct",
+                  "online_threshold_sr_pct", "online_minus_baseline_pp",
+                  "gate_fire_rate_pct"]])
+paired.to_csv(OUTPUT / "matched_episodes.csv", index=False)
+overall.to_csv(OUTPUT / "overall.csv", index=False)
+by_suite.to_csv(OUTPUT / "by_suite.csv", index=False)'''),
+    md("## 4. Success-rate change and gate diagnostics"),
+    code(r'''fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+x = np.arange(len(by_suite)); width = .38
+axes[0].bar(x - width/2, by_suite.unrefined_baseline_sr_pct, width,
+            label="unrefined source", color="#4C78A8")
+axes[0].bar(x + width/2, by_suite.online_threshold_sr_pct, width,
+            label="online U-gated refinement", color="#F58518")
+axes[0].set_xticks(x, by_suite.suite.str.removeprefix("libero_"), rotation=40, ha="right")
+axes[0].set(ylabel="Success rate (%)", ylim=(0, 105),
+            title="Online threshold refinement vs matched source baseline")
+axes[0].legend()
+
+colors = np.where(by_suite.online_minus_baseline_pp >= 0, "#54A24B", "#E45756")
+axes[1].bar(x, by_suite.online_minus_baseline_pp, color=colors)
+axes[1].axhline(0, color="black", linewidth=1)
+axes[1].set_xticks(x, by_suite.suite.str.removeprefix("libero_"), rotation=40, ha="right")
+axes[1].set(ylabel="SR change (percentage points)",
+            title="Whole-cohort SR change by suite")
+fig.tight_layout()
+fig.savefig(OUTPUT / "source_online_threshold_refinement.png", dpi=180, bbox_inches="tight")
+plt.show()
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.hist(100 * paired.gate_fire_rate.dropna(), bins=15, color="#72B7B2", edgecolor="white")
+ax.set(xlabel="Episode gate-fire rate (% of probed Euler steps)", ylabel="Episodes",
+       title="How often did U >= 0.03 trigger refinement?")
+fig.tight_layout()
+fig.savefig(OUTPUT / "source_online_threshold_gate_rate.png", dpi=180, bbox_inches="tight")
+plt.show()'''),
+], "25_analyze_source_threshold_refinement.ipynb")
+
+
 def main():
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05.ipynb", TRAIN)
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05_v2.ipynb", TRAIN_V2)
@@ -1259,8 +1433,13 @@ def main():
         write_notebook(ROOT / "notebooks" / "workers" /
                        f"22_diversity_chunk_selector_worker_{shard_index}.ipynb",
                        chunk_selector_worker_notebook(shard_index))
+        write_notebook(ROOT / "notebooks" / "workers" /
+                       f"24_source_threshold_refinement_worker_{shard_index}.ipynb",
+                       source_threshold_refinement_worker_notebook(shard_index))
     write_notebook(ROOT / "notebooks" / "23_analyze_diversity_chunk_selector.ipynb",
                    ANALYZE_CHUNK_SELECTOR)
+    write_notebook(ROOT / "notebooks" / "25_analyze_source_threshold_refinement.ipynb",
+                   ANALYZE_SOURCE_THRESHOLD_REFINEMENT)
 
 
 if __name__ == "__main__":

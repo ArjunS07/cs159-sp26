@@ -32,6 +32,9 @@ class RolloutTap:
         self.save_ahats = config.save_ahats
         self.save_pcp = config.save_pcp_features
         self._correcting = config.correction_lambda is not None
+        self._refine_considered = 0
+        self._refine_applied = 0
+        self._chunk_refine_applied = 0
         # correction telemetry (only when the action is a PCP correction)
         self._corr = CorrectTelemetry() if self._correcting else None
         # pcp-features accumulation (only when save_pcp_features)
@@ -43,6 +46,18 @@ class RolloutTap:
     def invasive(self) -> bool:
         """Whether the action changes inference (drives the sampler's measure-only path)."""
         return self.config.refine or self._correcting
+
+    @property
+    def needs_baseline_fallback(self) -> bool:
+        """Whether a no-fire chunk must return the exact stock sampler output."""
+        return self.config.refine and self.config.refine_threshold is not None
+
+    def begin_chunk(self) -> None:
+        self._chunk_refine_applied = 0
+
+    @property
+    def chunk_intervened(self) -> bool:
+        return self._chunk_refine_applied > 0
 
     def selected(self, step: int, s: float) -> bool:
         return self.config.has_probe and self.config.probe_selected(step, s)
@@ -69,6 +84,12 @@ class RolloutTap:
 
         # action: at most one feedback path (measure-only when no action is set)
         if cfg.refine:
+            self._refine_considered += 1
+            if (cfg.refine_threshold is not None
+                    and float(pr.rec["u_mean"]) < float(cfg.refine_threshold)):
+                return x_t
+            self._refine_applied += 1
+            self._chunk_refine_applied += 1
             return apply_refine(pr, cfg.refine_average)
         if self._correcting:
             return apply_correct(pr, ctx, cfg.correction_lambda, cfg.q_gate,
@@ -95,3 +116,12 @@ class RolloutTap:
     @property
     def pcp_telemetry(self):
         return self._corr.telemetry() if self._corr is not None else None
+
+    @property
+    def refinement_gate_telemetry(self):
+        if not self.config.refine or self.config.refine_threshold is None:
+            return None
+        return {
+            "n_corrections_applied": self._refine_applied,
+            "gate_fire_rate": self._refine_applied / max(self._refine_considered, 1),
+        }
