@@ -197,6 +197,7 @@ _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
                   Method.THRESHOLD_REFINEMENT: "U-gated refine",
                   Method.EXTRA_STEPS: "control",
                   Method.CHUNK_SOURCE_SOURCE: "source x2",
+                  Method.CHUNK_SOURCE_MULTI_QUERY: "source multi-query",
                   Method.CHUNK_SOURCE_M1: "source + m1"}
 
 

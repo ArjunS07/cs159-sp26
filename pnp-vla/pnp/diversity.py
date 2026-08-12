@@ -28,6 +28,7 @@ DIVERSITY_EXPERIMENT_PREFIX = "pi05-diversity-signal-v1"
 DIVERSITY_V2_EXPERIMENT_PREFIX = "pi05-diversity-signal-v2"
 DIVERSITY_CHUNK_SELECTOR_EXPERIMENT = "pi05-diversity-chunk-selector-v1"
 SOURCE_THRESHOLD_REFINEMENT_EXPERIMENT = "pi05-source-threshold-refinement-v1"
+SOURCE_MULTI_QUERY_EXPERIMENT = "pi05-source-multi-query-v1"
 DIVERSITY_PAIR_KEYS = ["suite", "task_idx", "episode_idx", "init_state_hash"]
 DIVERSITY_PREFIX_CHUNKS = (1, 2, 4, 8)
 DIVERSITY_FIXED_REFINEMENT_THRESHOLD = 0.03
@@ -630,6 +631,119 @@ def run_source_threshold_refinement_worker(
         provenance=gather_provenance(
             model_repo_id=source_repo, model_revision=source_revision),
         report_every=50, initial_tally=initial_tally, historical_sr=historical_sr)
+
+
+def run_source_multi_query_worker(
+        *, shard_count: int = 4, shard_index: int = 0,
+        episodes_per_task: int = 10, episode_limit: int | None = None,
+        num_queries: int = 2,
+        manifest_hash: str = "", source_model_revision: str = "",
+        experiment: str = SOURCE_MULTI_QUERY_EXPERIMENT):
+    """Select the lowest-U clean chunk among independent source queries.
+
+    Each candidate starts from independent diffusion noise, then receives the same K=5
+    uncertainty measurement at Euler steps (3,4). The lowest-U clean candidate is executed.
+    There is no refinement or other feedback within any candidate sampler.
+    """
+    from . import models
+    from .config import Method, RolloutConfig
+    from .experiments import (PRO_EXPANDED_EXPERIMENT,
+                              _prepare_libero_pro_expanded_episodes, _run_collection,
+                              identity_shard)
+    from .store import SupabaseStore, gather_provenance
+
+    if not manifest_hash:
+        raise ValueError("manifest_hash is required; load the shared v2 Drive manifest")
+    if not source_model_revision:
+        raise ValueError(
+            "source_model_revision is required; pass it from the shared v2 Drive manifest")
+    num_queries = int(num_queries)
+    if num_queries < 2:
+        raise ValueError("num_queries must be at least 2")
+    store = SupabaseStore()
+    source_repo, source_revision = source_checkpoint_model_source(
+        store, expected_revision=source_model_revision)
+    manifest = _prepare_libero_pro_expanded_episodes(episodes_per_task)
+    expected_identities = 13 * 10 * int(episodes_per_task)
+    if len(manifest) != expected_identities:
+        raise ValueError(
+            f"expected {expected_identities} identities for 13 suites x 10 tasks x "
+            f"{episodes_per_task} episodes, found {len(manifest)}")
+    episodes = identity_shard(manifest, shard_count, shard_index)
+    if episode_limit is not None:
+        if int(episode_limit) < 1:
+            raise ValueError("episode_limit must be positive or None")
+        episodes = episodes[:int(episode_limit)]
+
+    historical_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,status,success,method,pnp_k,pnp_step_indices",
+        configure=lambda query: query.eq(
+            "experiment", PRO_EXPANDED_EXPERIMENT).eq("method", Method.UNCERTAINTY),
+        order_by=("rollout_id",)))
+    if historical_rows.empty:
+        raise ValueError(
+            f"no unrefined source baseline rows found in {PRO_EXPANDED_EXPERIMENT}")
+    historical_rows = historical_rows[
+        historical_rows.status.eq("completed")
+        & historical_rows.pnp_k.eq(5)
+        & historical_rows.pnp_step_indices.apply(
+            lambda value: tuple(value or []) == (3, 4))].copy()
+    if historical_rows.empty:
+        raise ValueError("no completed historical source baseline uses K=5 steps (3,4)")
+    historical_sr = historical_rows.groupby("suite").success.mean().astype(float).to_dict()
+
+    source_id = f"{source_repo}@{source_revision}"
+    config = RolloutConfig(
+        num_samples=num_queries, pnp_k=5, ms_probe_steps=(3, 4),
+        candidate_set_id="|".join([source_id] * num_queries),
+        save_trajectory=True, save_generated_chunks=True,
+        skip_unused_renders=True, render_lead=2)
+    methods = [(Method.CHUNK_SOURCE_MULTI_QUERY, config)]
+    shard_identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in episodes}
+    existing_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", experiment).eq(
+            "method", Method.CHUNK_SOURCE_MULTI_QUERY), order_by=("rollout_id",)))
+    if not existing_rows.empty:
+        expected_hash = store.config_hash(store._logical_key(
+            Method.CHUNK_SOURCE_MULTI_QUERY, config))
+        existing_rows = existing_rows[
+            existing_rows.config_hash.eq(expected_hash)
+            & existing_rows.status.eq("completed")
+            & existing_rows[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(shard_identities)]
+    initial_tally = {} if existing_rows.empty else {
+        (suite, Method.CHUNK_SOURCE_MULTI_QUERY): [
+            len(group), int(group.success.astype(bool).sum())]
+        for suite, group in existing_rows.groupby("suite", sort=True)}
+
+    print({"source": source_id, "queries": num_queries, "refinement": False,
+           "candidate_noise": "independent per query",
+           "uncertainty": "K=5 at Euler steps 3 and 4 for every query",
+           "target_cohort_size": len(manifest), "episodes_in_shard": len(episodes),
+           "historical_comparator": f"{PRO_EXPANDED_EXPERIMENT}/{Method.UNCERTAINTY}"})
+    policy, preprocess, postprocess = models.load_pi05(
+        repo_id=source_repo, revision=source_revision)
+    candidates = [
+        (f"source_query_{index}", policy, preprocess, postprocess)
+        for index in range(num_queries)]
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=methods, cohort=f"source_{num_queries}_query_selection",
+        shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="pi05_source_multi_query_x3",
+        run_metadata={
+            "source_model_repo_id": source_repo, "source_model_revision": source_revision,
+            "bootstrap_manifest_hash": manifest_hash, "num_queries": num_queries,
+            "pnp_k": 5, "pnp_steps": [3, 4], "refinement": False,
+            "episodes_per_task": episodes_per_task, "episode_limit": episode_limit,
+            "requested_methods": [Method.CHUNK_SOURCE_MULTI_QUERY]},
+        provenance=gather_provenance(
+            model_repo_id=source_repo, model_revision=source_revision),
+        report_every=50, initial_tally=initial_tally, historical_sr=historical_sr,
+        candidate_bundles_by_method={Method.CHUNK_SOURCE_MULTI_QUERY: candidates})
 
 
 def run_diversity_chunk_selector_worker(*, shard_count: int = 4, shard_index: int = 0,

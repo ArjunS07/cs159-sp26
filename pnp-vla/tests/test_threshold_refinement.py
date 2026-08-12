@@ -75,3 +75,18 @@ def test_source_threshold_workers_are_four_fixed_shards_and_one_arm():
         assert "THRESHOLD = DIVERSITY_FIXED_REFINEMENT_THRESHOLD" in source
         assert "SOURCE_MODEL_REVISION = manifest[\"source_model_revision\"]" in source
         assert "run_diversity_chunk_selector_worker" not in source
+
+
+def test_source_multi_query_workers_default_to_two_and_keep_count_explicit():
+    for shard_index in range(4):
+        path = ROOT / "notebooks" / "workers" / (
+            f"26_source_multi_query_worker_{shard_index}.ipynb")
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"])
+        assert "run_source_multi_query_worker(" in source
+        assert "N_QUERIES = 2" in source
+        assert "num_queries=N_QUERIES" in source
+        assert "SHARD_COUNT = 4" in source
+        assert f"SHARD_INDEX = {shard_index}" in source
+        assert "run_diversity_chunk_selector_worker" not in source

@@ -1141,6 +1141,58 @@ run_source_threshold_refinement_worker(
     ], f"24_source_threshold_refinement_worker_{shard_index}.ipynb")
 
 
+def source_multi_query_worker_notebook(shard_index: int):
+    return notebook([
+        md(f"""# 26 - Source multi-query selection worker {shard_index}
+
+This is the source-only multi-query experiment, intentionally run before model aggregation.
+At each live decision observation, independent source-checkpoint queries produce clean action
+chunks. Each candidate receives K=5 uncertainty measurement at Euler steps `(3,4)`, and the
+lowest-uncertainty clean chunk is executed. **No refinement is applied.** `N_QUERIES` defaults to
+2; later values such as 3 or 4 produce separate resumable rollout IDs in the same experiment.
+
+This is shard {shard_index} of 4. All workers together collect 1,300 identities (10 episodes per
+task), one rollout per identity. The progress table's historical column is the exact old
+uncertainty-only source baseline, not an offline threshold policy. Worker 0 may first set
+`EPISODE_LIMIT=1`; restore it to `None` afterward and the smoke row will be reused."""),
+        md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
+        md("## 2. Configuration and resumable collection"),
+        code(f'''from pathlib import Path
+from google.colab import drive
+from pnp.config import PI05_REPO_ID
+from pnp.diversity import (SOURCE_MULTI_QUERY_EXPERIMENT,
+    load_bootstrap_manifest, run_source_multi_query_worker)
+
+drive.mount("/content/drive")
+
+EPISODES_PER_TASK = 10
+SHARD_COUNT = 4
+SHARD_INDEX = {shard_index}
+EPISODE_LIMIT = None  # worker-0 smoke: set 1 once, then restore None
+N_QUERIES = 2
+EXPERIMENT = SOURCE_MULTI_QUERY_EXPERIMENT
+MANIFEST_PATH = Path(
+    "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
+manifest = load_bootstrap_manifest(MANIFEST_PATH)
+assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+SOURCE_MODEL_REVISION = manifest["source_model_revision"]
+assert SOURCE_MODEL_REVISION, "v2 manifest is missing source_model_revision"
+
+print({{"experiment": EXPERIMENT, "queries": N_QUERIES, "refinement": False,
+       "episodes_per_task": EPISODES_PER_TASK,
+       "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+       "episode_limit": EPISODE_LIMIT,
+       "manifest_hash": manifest["manifest_hash"],
+       "source_model_revision": SOURCE_MODEL_REVISION}})
+run_source_multi_query_worker(
+    episodes_per_task=EPISODES_PER_TASK, episode_limit=EPISODE_LIMIT,
+    num_queries=N_QUERIES,
+    shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+    manifest_hash=manifest["manifest_hash"],
+    source_model_revision=SOURCE_MODEL_REVISION, experiment=EXPERIMENT)'''),
+    ], f"26_source_multi_query_worker_{shard_index}.ipynb")
+
+
 ANALYZE_CHUNK_SELECTOR = notebook([
     md("""# 23 - Analyze online per-chunk source+m1 aggregation
 
@@ -1411,6 +1463,147 @@ plt.show()'''),
 ], "25_analyze_source_threshold_refinement.ipynb")
 
 
+ANALYZE_SOURCE_MULTI_QUERY = notebook([
+    md("""# 27 - Analyze source-only multi-query selection
+
+This exact-matches online source multi-query rollouts against the historical one-query,
+uncertainty-only source baseline. `N_QUERIES=2` is the first planned arm. If the same workers are
+later rerun with 3 or 4, change this one value to analyze that separate resumable arm. There is no
+refinement in any multi-query rollout."""),
+    md("## 1. Setup"), code(bootstrap(extras="analysis", setup_env=False)),
+    md("## 2. Fetch and exact-match the selected query count"),
+    code(r'''import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display
+from analysis.statistics import paired_bootstrap_ci, discordant_test
+from pnp.config import Method
+from pnp.diversity import (DIVERSITY_PAIR_KEYS, SOURCE_MULTI_QUERY_EXPERIMENT)
+from pnp.experiments import PRO_EXPANDED_EXPERIMENT
+from pnp.store import SupabaseStore
+
+N_QUERIES = 2
+REQUIRE_FULL_COHORT = True
+store = SupabaseStore()
+
+multi = pd.DataFrame(store.fetch_all(
+    "rollouts", "*", configure=lambda query: query.eq(
+        "experiment", SOURCE_MULTI_QUERY_EXPERIMENT).eq(
+            "method", Method.CHUNK_SOURCE_MULTI_QUERY).eq("num_samples", N_QUERIES),
+    order_by=("rollout_id",)))
+baseline = pd.DataFrame(store.fetch_all(
+    "rollouts", "rollout_id,suite,task_idx,episode_idx,init_state_hash,status,success,"
+    "pnp_k,pnp_step_indices", configure=lambda query: query.eq(
+        "experiment", PRO_EXPANDED_EXPERIMENT).eq("method", Method.UNCERTAINTY),
+    order_by=("rollout_id",)))
+assert len(multi), f"No completed N_QUERIES={N_QUERIES} rows found"
+multi = multi[multi.status.eq("completed")].copy()
+baseline = baseline[
+    baseline.status.eq("completed") & baseline.pnp_k.eq(5) &
+    baseline.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4))].copy()
+assert not multi.duplicated(DIVERSITY_PAIR_KEYS).any()
+assert not baseline.duplicated(DIVERSITY_PAIR_KEYS).any()
+
+paired = (baseline[DIVERSITY_PAIR_KEYS + ["success"]]
+          .rename(columns={"success": "one_query_success"})
+          .merge(multi[DIVERSITY_PAIR_KEYS + ["rollout_id", "success", "ms_candidate_u"]]
+                 .rename(columns={"success": "multi_query_success"}),
+                 on=DIVERSITY_PAIR_KEYS, validate="one_to_one"))
+assert len(paired) == len(multi), (
+    f"Only {len(paired)}/{len(multi)} multi-query rows match the source baseline")
+if REQUIRE_FULL_COHORT:
+    assert len(paired) == 1300, f"Expected 1,300 matched episodes, found {len(paired)}"
+paired["one_query_success"] = paired.one_query_success.astype(bool)
+paired["multi_query_success"] = paired.multi_query_success.astype(bool)
+print({"queries": N_QUERIES, "matched_episodes": len(paired),
+       "suites": paired.suite.nunique(), "refinement": False})'''),
+    md("## 3. Overall and per-suite SR change"),
+    code(r'''def summarize(group):
+    baseline_values = group.one_query_success.to_numpy(bool)
+    treatment_values = group.multi_query_success.to_numpy(bool)
+    lo, hi = paired_bootstrap_ci(baseline_values, treatment_values, n_boot=5000)
+    f_to_s = int((~baseline_values & treatment_values).sum())
+    s_to_f = int((baseline_values & ~treatment_values).sum())
+    return pd.Series({
+        "episodes": len(group),
+        "one_query_sr_pct": 100 * baseline_values.mean(),
+        "multi_query_sr_pct": 100 * treatment_values.mean(),
+        "delta_pp": 100 * (treatment_values.mean() - baseline_values.mean()),
+        "ci_low_pp": 100 * lo, "ci_high_pp": 100 * hi,
+        "F_to_S": f_to_s, "S_to_F": s_to_f,
+        "discordant_p": discordant_test(f_to_s, s_to_f),
+    })
+
+overall = summarize(paired).to_frame().T
+by_suite = pd.DataFrame([
+    {"suite": suite, **summarize(group).to_dict()}
+    for suite, group in paired.groupby("suite", sort=True)])
+print(f"Source x{N_QUERIES} versus one-query uncertainty-only baseline")
+display(overall)
+display(by_suite[["suite", "episodes", "one_query_sr_pct", "multi_query_sr_pct",
+                  "delta_pp", "ci_low_pp", "ci_high_pp", "F_to_S", "S_to_F"]])'''),
+    md("## 4. Candidate choices, uncertainty spread, and action diversity"),
+    code(r'''chunk_rows = []
+for row in multi.itertuples(index=False):
+    trace = row.ms_candidate_u or {}
+    choices = trace.get("chosen", [])
+    uncertainties = trace.get("u", [])
+    disagreements = trace.get("action_disagreement", [])
+    for chunk_idx, (choice, values) in enumerate(zip(choices, uncertainties)):
+        assert len(values) == N_QUERIES, (row.rollout_id, chunk_idx, values)
+        disagreement = disagreements[chunk_idx] if chunk_idx < len(disagreements) else {}
+        chunk_rows.append({
+            "rollout_id": row.rollout_id, "suite": row.suite,
+            "chunk_idx": chunk_idx, "chosen_query": int(choice),
+            "chosen_u": float(values[int(choice)]),
+            "mean_candidate_u": float(np.mean(values)),
+            "candidate_u_spread": float(np.max(values) - np.min(values)),
+            **{f"diversity_{key}": value for key, value in disagreement.items()},
+        })
+chunks = pd.DataFrame(chunk_rows)
+choice_summary = (chunks.chosen_query.value_counts(normalize=True).sort_index()
+                  .mul(100).rename("chosen_pct").reset_index())
+diversity_columns = [column for column in chunks if column.startswith("diversity_")]
+display(choice_summary)
+display(chunks[["chosen_u", "mean_candidate_u", "candidate_u_spread"]
+               + diversity_columns].mean().to_frame("mean").T)'''),
+    md("## 5. Matched plots"),
+    code(r'''labels = by_suite.suite.str.removeprefix("libero_")
+x = np.arange(len(by_suite)); width = .38
+fig, axes = plt.subplots(2, 1, figsize=(16, 10), height_ratios=[1.15, 1])
+axes[0].bar(x - width/2, by_suite.one_query_sr_pct, width,
+            label="one query", color="#4C78A8")
+axes[0].bar(x + width/2, by_suite.multi_query_sr_pct, width,
+            label=f"{N_QUERIES} queries, choose lowest U", color="#F58518")
+axes[0].set(ylabel="Success rate (%)", ylim=(0, 105),
+            title=f"Source x{N_QUERIES} selection vs matched one-query baseline")
+axes[0].legend(); axes[0].grid(axis="y", alpha=.2)
+
+lower = by_suite.delta_pp - by_suite.ci_low_pp
+upper = by_suite.ci_high_pp - by_suite.delta_pp
+colors = np.where(by_suite.delta_pp >= 0, "#54A24B", "#E45756")
+axes[1].bar(x, by_suite.delta_pp, color=colors)
+axes[1].errorbar(x, by_suite.delta_pp, yerr=np.vstack([lower, upper]),
+                 fmt="none", ecolor="black", capsize=3)
+axes[1].axhline(0, color="black", linewidth=1)
+axes[1].axhline(overall.delta_pp.iloc[0], color="#9467BD", linestyle="--",
+                label=f"overall: {overall.delta_pp.iloc[0]:+.2f} pp")
+axes[1].set(ylabel="Multi-query minus one-query SR (percentage points)",
+            title="Whole-cohort paired SR change by suite")
+axes[1].legend(); axes[1].grid(axis="y", alpha=.2)
+for ax in axes:
+    ax.set_xticks(x, labels, rotation=40, ha="right")
+fig.tight_layout(); plt.show()
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.bar(choice_summary.chosen_query.astype(str), choice_summary.chosen_pct,
+       color="#72B7B2")
+ax.set(xlabel="Candidate query index", ylabel="Chosen chunks (%)",
+       title="Which independent source query was selected?")
+fig.tight_layout(); plt.show()'''),
+], "27_analyze_source_multi_query.ipynb")
+
+
 def main():
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05.ipynb", TRAIN)
     write_notebook(ROOT / "notebooks" / "17_train_diverse_pi05_v2.ipynb", TRAIN_V2)
@@ -1436,10 +1629,15 @@ def main():
         write_notebook(ROOT / "notebooks" / "workers" /
                        f"24_source_threshold_refinement_worker_{shard_index}.ipynb",
                        source_threshold_refinement_worker_notebook(shard_index))
+        write_notebook(ROOT / "notebooks" / "workers" /
+                       f"26_source_multi_query_worker_{shard_index}.ipynb",
+                       source_multi_query_worker_notebook(shard_index))
     write_notebook(ROOT / "notebooks" / "23_analyze_diversity_chunk_selector.ipynb",
                    ANALYZE_CHUNK_SELECTOR)
     write_notebook(ROOT / "notebooks" / "25_analyze_source_threshold_refinement.ipynb",
                    ANALYZE_SOURCE_THRESHOLD_REFINEMENT)
+    write_notebook(ROOT / "notebooks" / "27_analyze_source_multi_query.ipynb",
+                   ANALYZE_SOURCE_MULTI_QUERY)
 
 
 if __name__ == "__main__":

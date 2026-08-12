@@ -103,32 +103,56 @@ def compute_instability(executed_actions, chunk_boundary_actions=None, gripper_d
 
 def candidate_action_disagreement(actions, action_dim: int = ADIM,
                                   gripper_dim: int = 6) -> dict:
-    """Compact diversity metrics for two clean, non-perturbed candidate action chunks."""
-    if len(actions) != 2:
-        raise ValueError("candidate disagreement currently requires exactly two actions")
+    """Pairwise diversity metrics for clean, non-perturbed candidate action chunks.
+
+    Two-candidate outputs preserve the original definitions exactly. With three or more
+    candidates, scalar metrics average over every unordered candidate pair; maxima cover all
+    pairs. Raw candidate chunks are stored separately when that sink is enabled.
+    """
+    if len(actions) < 2:
+        raise ValueError("candidate disagreement requires at least two actions")
     arrays = [action.squeeze(0).detach().float().cpu().numpy() for action in actions]
     horizon = min(len(array) for array in arrays)
-    a0 = arrays[0][:horizon, :action_dim]
-    a1 = arrays[1][:horizon, :action_dim]
-    delta = a0 - a1
-    per_action_l2 = np.linalg.norm(delta, axis=1)
-    scale = np.mean((np.linalg.norm(a0, axis=1) + np.linalg.norm(a1, axis=1)) / 2)
-    flat0, flat1 = a0.reshape(-1), a1.reshape(-1)
-    cosine_denominator = np.linalg.norm(flat0) * np.linalg.norm(flat1)
-    cosine = (float(np.dot(flat0, flat1) / cosine_denominator)
-              if cosine_denominator > 0 else None)
-    gripper_disagreement = None
-    if gripper_dim < action_dim:
-        gripper_disagreement = float(np.mean(
-            (a0[:, gripper_dim] > 0) != (a1[:, gripper_dim] > 0)))
+    arrays = [array[:horizon, :action_dim] for array in arrays]
+    pair_metrics = []
+    for left in range(len(arrays)):
+        for right in range(left + 1, len(arrays)):
+            a0, a1 = arrays[left], arrays[right]
+            delta = a0 - a1
+            per_action_l2 = np.linalg.norm(delta, axis=1)
+            scale = np.mean((np.linalg.norm(a0, axis=1) + np.linalg.norm(a1, axis=1)) / 2)
+            flat0, flat1 = a0.reshape(-1), a1.reshape(-1)
+            cosine_denominator = np.linalg.norm(flat0) * np.linalg.norm(flat1)
+            cosine = (float(np.dot(flat0, flat1) / cosine_denominator)
+                      if cosine_denominator > 0 else None)
+            gripper_disagreement = None
+            if gripper_dim < action_dim:
+                gripper_disagreement = float(np.mean(
+                    (a0[:, gripper_dim] > 0) != (a1[:, gripper_dim] > 0)))
+            pair_metrics.append({
+                "action_l2_mean": float(per_action_l2.mean()),
+                "action_l2_max": float(per_action_l2.max()),
+                "first_action_l2": float(per_action_l2[0]),
+                "action_abs_mean": float(np.abs(delta).mean()),
+                "action_l2_normalized": float(per_action_l2.mean() / max(scale, 1e-12)),
+                "action_cosine": cosine,
+                "gripper_sign_disagreement": gripper_disagreement,
+            })
+
+    def _mean(name):
+        values = [item[name] for item in pair_metrics if item[name] is not None]
+        return float(np.mean(values)) if values else None
+
     return {
-        "action_l2_mean": float(per_action_l2.mean()),
-        "action_l2_max": float(per_action_l2.max()),
-        "first_action_l2": float(per_action_l2[0]),
-        "action_abs_mean": float(np.abs(delta).mean()),
-        "action_l2_normalized": float(per_action_l2.mean() / max(scale, 1e-12)),
-        "action_cosine": cosine,
-        "gripper_sign_disagreement": gripper_disagreement,
+        "n_candidates": len(arrays),
+        "n_candidate_pairs": len(pair_metrics),
+        "action_l2_mean": _mean("action_l2_mean"),
+        "action_l2_max": float(max(item["action_l2_max"] for item in pair_metrics)),
+        "first_action_l2": _mean("first_action_l2"),
+        "action_abs_mean": _mean("action_abs_mean"),
+        "action_l2_normalized": _mean("action_l2_normalized"),
+        "action_cosine": _mean("action_cosine"),
+        "gripper_sign_disagreement": _mean("gripper_sign_disagreement"),
     }
 
 

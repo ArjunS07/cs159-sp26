@@ -84,6 +84,7 @@ class Method:
     THRESHOLD_REFINEMENT = "pnp_threshold_refinement"  # refine selected steps iff U >= threshold
     MULTI_SAMPLE = "multi_sample_select"
     CHUNK_SOURCE_SOURCE = "chunk_select_source_source"
+    CHUNK_SOURCE_MULTI_QUERY = "chunk_select_source_multi_query"
     CHUNK_SOURCE_M1 = "chunk_select_source_m1"
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
@@ -92,7 +93,8 @@ class Method:
 
 ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.REFINEMENT,
                Method.THRESHOLD_REFINEMENT,
-               Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_M1,
+               Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
+               Method.CHUNK_SOURCE_M1,
                Method.PNP_ONLY, Method.PCP)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 

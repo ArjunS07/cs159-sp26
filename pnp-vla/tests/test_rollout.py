@@ -128,3 +128,12 @@ def test_candidate_action_disagreement_is_zero_for_identical_chunks():
     assert metrics["action_l2_mean"] == 0.0
     assert metrics["action_l2_normalized"] == 0.0
     assert np.isclose(metrics["action_cosine"], 1.0)
+
+
+def test_candidate_action_disagreement_supports_three_pairwise_candidates():
+    actions = [torch.full((1, 2, 7), value) for value in (0.0, 1.0, 3.0)]
+    metrics = candidate_action_disagreement(actions)
+    assert metrics["n_candidates"] == 3
+    assert metrics["n_candidate_pairs"] == 3
+    assert metrics["action_l2_mean"] > 0
+    assert np.isclose(metrics["action_l2_max"], np.sqrt(7) * 3)
