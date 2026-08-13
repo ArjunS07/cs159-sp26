@@ -29,6 +29,7 @@ DIVERSITY_V2_EXPERIMENT_PREFIX = "pi05-diversity-signal-v2"
 DIVERSITY_CHUNK_SELECTOR_EXPERIMENT = "pi05-diversity-chunk-selector-v1"
 SOURCE_THRESHOLD_REFINEMENT_EXPERIMENT = "pi05-source-threshold-refinement-v1"
 SOURCE_DELAYED_REFINEMENT_EXPERIMENT = "pi05-source-delayed-refinement-k5-v1"
+SOURCE_ACTION_HORIZON_EXPERIMENT = "pi05-source-action-horizon-20-v1"
 SOURCE_MULTI_QUERY_EXPERIMENT = "pi05-source-multi-query-v1"
 DIVERSITY_PAIR_KEYS = ["suite", "task_idx", "episode_idx", "init_state_hash"]
 DIVERSITY_PREFIX_CHUNKS = (1, 2, 4, 8)
@@ -747,6 +748,131 @@ def run_source_delayed_refinement_worker(
         provenance=gather_provenance(
             model_repo_id=source_repo, model_revision=source_revision),
         report_every=50, initial_tally=initial_tally, historical_sr=historical_sr)
+
+
+def run_source_action_horizon_worker(
+        *, arm: str = "refinement", n_action_steps: int = 20,
+        shard_count: int = 2, shard_index: int = 0,
+        episodes_per_task: int = 1, episode_limit: int | None = None,
+        manifest_hash: str = "", source_model_revision: str = "",
+        experiment: str = SOURCE_ACTION_HORIZON_EXPERIMENT):
+    """Collect a matched source-policy execution-horizon pilot.
+
+    The default arm uses always-on K=5, steps (3,4), refine-last while executing the first 20
+    actions from each generated 50-action chunk. ``arm='baseline'`` keeps the same probe and
+    execution horizon without feedback. The two arms have distinct method/config rollout IDs.
+    """
+    from . import models
+    from .config import Method, RolloutConfig
+    from .experiments import (PRO_EXPANDED_EXPERIMENT,
+                              _prepare_libero_pro_expanded_episodes, _run_collection,
+                              identity_shard)
+    from .store import SupabaseStore, gather_provenance
+
+    arm = str(arm).strip().lower()
+    if arm not in {"refinement", "baseline"}:
+        raise ValueError("arm must be 'refinement' or 'baseline'")
+    if (isinstance(n_action_steps, bool)
+            or int(n_action_steps) != n_action_steps or n_action_steps < 1):
+        raise ValueError("n_action_steps must be a positive integer")
+    n_action_steps = int(n_action_steps)
+    if not manifest_hash:
+        raise ValueError("manifest_hash is required; load the shared v2 Drive manifest")
+    if not source_model_revision:
+        raise ValueError(
+            "source_model_revision is required; pass it from the shared v2 Drive manifest")
+
+    store = SupabaseStore()
+    source_repo, source_revision = source_checkpoint_model_source(
+        store, expected_revision=source_model_revision)
+    manifest = _prepare_libero_pro_expanded_episodes(episodes_per_task)
+    expected_identities = 13 * 10 * int(episodes_per_task)
+    if len(manifest) != expected_identities:
+        raise ValueError(
+            f"expected {expected_identities} identities for 13 suites x 10 tasks x "
+            f"{episodes_per_task} episodes, found {len(manifest)}")
+    manifest_identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in manifest}
+    episodes = identity_shard(manifest, shard_count, shard_index)
+    if episode_limit is not None:
+        if int(episode_limit) < 1:
+            raise ValueError("episode_limit must be positive or None")
+        episodes = episodes[:int(episode_limit)]
+
+    historical_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,"
+        "pnp_k,pnp_step_indices",
+        configure=lambda query: query.eq(
+            "experiment", PRO_EXPANDED_EXPERIMENT).eq("method", Method.UNCERTAINTY),
+        order_by=("rollout_id",)))
+    if historical_rows.empty:
+        raise ValueError(
+            f"no unrefined source baseline rows found in {PRO_EXPANDED_EXPERIMENT}")
+    historical_rows = historical_rows[
+        historical_rows.status.eq("completed")
+        & historical_rows.pnp_k.eq(5)
+        & historical_rows.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4))
+        & historical_rows[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(manifest_identities)
+    ].copy()
+    if len(historical_rows) != expected_identities:
+        raise ValueError(
+            f"expected {expected_identities} exact historical 10-action baseline identities, "
+            f"found {len(historical_rows)}")
+    historical_sr = historical_rows.groupby("suite").success.mean().astype(float).to_dict()
+
+    refinement = arm == "refinement"
+    method = Method.REFINEMENT if refinement else Method.UNCERTAINTY
+    config = RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, refine=refinement, refine_average=False,
+        n_action_steps=n_action_steps,
+        save_trajectory=True, save_generated_chunks=True,
+        skip_unused_renders=True, render_lead=2)
+    methods = [(method, config)]
+    shard_identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in episodes}
+    existing_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", experiment).eq("method", method),
+        order_by=("rollout_id",)))
+    if not existing_rows.empty:
+        expected_hash = store.config_hash(store._logical_key(method, config))
+        existing_rows = existing_rows[
+            existing_rows.config_hash.eq(expected_hash)
+            & existing_rows.status.eq("completed")
+            & existing_rows[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(shard_identities)]
+    initial_tally = {} if existing_rows.empty else {
+        (suite, method): [len(group), int(group.success.astype(bool).sum())]
+        for suite, group in existing_rows.groupby("suite", sort=True)}
+
+    print({"source": f"{source_repo}@{source_revision}", "arm": arm,
+           "n_action_steps": n_action_steps, "generated_chunk_size": 50,
+           "target_cohort_size": len(manifest), "episodes_in_shard": len(episodes),
+           "historical_comparator": (
+               f"exact matched {PRO_EXPANDED_EXPERIMENT}/{Method.UNCERTAINTY}, "
+               "10 executed actions")})
+    policy, preprocess, postprocess = models.load_pi05(
+        repo_id=source_repo, revision=source_revision)
+    if n_action_steps > int(policy.config.chunk_size):
+        raise ValueError(
+            f"n_action_steps={n_action_steps} exceeds policy chunk_size={policy.config.chunk_size}")
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=methods, cohort=f"source_action_horizon_{arm}",
+        shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="pi05_source_action_horizon",
+        run_metadata={
+            "source_model_repo_id": source_repo, "source_model_revision": source_revision,
+            "bootstrap_manifest_hash": manifest_hash, "pnp_k": 5,
+            "pnp_steps": [3, 4], "refine_average": False,
+            "n_action_steps": n_action_steps, "arm": arm,
+            "episodes_per_task": episodes_per_task, "episode_limit": episode_limit,
+            "requested_methods": [method]},
+        provenance=gather_provenance(
+            model_repo_id=source_repo, model_revision=source_revision),
+        report_every=25, initial_tally=initial_tally, historical_sr=historical_sr)
 
 
 def run_source_multi_query_worker(

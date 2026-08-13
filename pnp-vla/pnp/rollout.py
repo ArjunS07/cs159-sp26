@@ -197,6 +197,17 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     runtime_policies = ([bundle[1] for bundle in candidate_bundles]
                         if candidate_bundles is not None else [policy])
     unique_policies = list({id(item): item for item in runtime_policies}.values())
+    original_n_action_steps = {
+        id(runtime_policy): (
+            hasattr(runtime_policy.config, "n_action_steps"),
+            getattr(runtime_policy.config, "n_action_steps", None))
+        for runtime_policy in unique_policies}
+    if config.n_action_steps is not None:
+        if config.n_action_steps > chunk_size:
+            raise ValueError(
+                f"n_action_steps={config.n_action_steps} exceeds chunk_size={chunk_size}")
+        for runtime_policy in unique_policies:
+            runtime_policy.config.n_action_steps = int(config.n_action_steps)
     for runtime_policy in unique_policies:
         runtime_policy.model._pnp.num_steps = config.num_inference_steps
 
@@ -304,9 +315,16 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                     with torch.no_grad():
                         chunk = policy.predict_action_chunk(batch, noise=noise)
                     queue_postprocess = postprocess
-                arr = chunk.squeeze(0).detach().cpu().numpy()
+                full_arr = chunk.squeeze(0).detach().cpu().numpy()
                 if generated_chunks is not None:
-                    generated_chunks.append(arr.copy())
+                    generated_chunks.append(full_arr.copy())
+                execution_horizon = config.n_action_steps
+                arr = (full_arr if execution_horizon is None
+                       else full_arr[:int(execution_horizon)])
+                if execution_horizon is not None and len(arr) != execution_horizon:
+                    raise ValueError(
+                        f"policy returned only {len(full_arr)} actions, cannot execute "
+                        f"n_action_steps={execution_horizon}")
                 inference_ms_total += (time.perf_counter() - inference_t0) * 1000.0
                 queue = [arr[i].copy() for i in range(arr.shape[0])]
                 chunk_boundary_actions.append(np.asarray(queue[0]).flatten()[:ADIM].copy())
@@ -347,6 +365,12 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
         # Leave the env as we found it; iter_task_envs reuses one env across rollouts.
         if skipping:
             set_camera_observables(env, True)
+        for runtime_policy in unique_policies:
+            existed, original = original_n_action_steps[id(runtime_policy)]
+            if existed:
+                runtime_policy.config.n_action_steps = original
+            elif hasattr(runtime_policy.config, "n_action_steps"):
+                delattr(runtime_policy.config, "n_action_steps")
 
     elapsed = time.time() - t0
     finished_at = dt.datetime.now(dt.timezone.utc).isoformat()

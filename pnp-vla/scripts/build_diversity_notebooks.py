@@ -1247,6 +1247,60 @@ run_source_delayed_refinement_worker(
     ], f"29_source_delayed_refinement_worker_{shard_index}.ipynb")
 
 
+def source_action_horizon_worker_notebook(shard_index: int):
+    return notebook([
+        md(f"""# 31 - Source 20-action execution-horizon worker {shard_index}
+
+This is shard {shard_index} of 2 for the 130-episode action-horizon pilot: 13 LIBERO-PRO suites
+x 10 tasks x the first episode initialization. The model still generates a 50-action chunk, but
+the rollout executes its first **20 actions** before observing and replanning.
+
+Run `ARM="refinement"` first. It uses the established always-on K=5, Euler-steps `(3,4)`,
+last-refinement policy. Each worker collects 65 rollouts and prints its current per-suite SR every
+25 rollouts beside the exact matched historical 10-action unrefined source baseline. If this arm
+is promising, change `ARM` to `"baseline"` in both workers to collect the matched 20-action
+uncertainty-only control. The two arms have distinct resumable IDs; changing `ARM` cannot overwrite
+the refinement rows. Worker 0 may use `EPISODE_LIMIT=1` for a smoke test and then restore `None`."""),
+        md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
+        md("## 2. Configuration and resumable collection"),
+        code(f'''from pathlib import Path
+from google.colab import drive
+from pnp.config import PI05_REPO_ID
+from pnp.diversity import (SOURCE_ACTION_HORIZON_EXPERIMENT,
+    load_bootstrap_manifest, run_source_action_horizon_worker)
+
+drive.mount("/content/drive")
+
+ARM = "refinement"  # run first; later change to "baseline" only if this arm is promising
+N_ACTION_STEPS = 20
+EPISODES_PER_TASK = 1  # 13 suites x 10 tasks x 1 initialization = 130 episodes
+SHARD_COUNT = 2
+SHARD_INDEX = {shard_index}
+EPISODE_LIMIT = None  # worker-0 smoke: set 1 once, then restore None
+EXPERIMENT = SOURCE_ACTION_HORIZON_EXPERIMENT
+MANIFEST_PATH = Path(
+    "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
+manifest = load_bootstrap_manifest(MANIFEST_PATH)
+assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+SOURCE_MODEL_REVISION = manifest["source_model_revision"]
+assert SOURCE_MODEL_REVISION, "v2 manifest is missing source_model_revision"
+
+print({{"experiment": EXPERIMENT, "arm": ARM,
+       "n_action_steps": N_ACTION_STEPS, "generated_chunk_size": 50,
+       "episodes_per_task": EPISODES_PER_TASK,
+       "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+       "episode_limit": EPISODE_LIMIT,
+       "manifest_hash": manifest["manifest_hash"],
+       "source_model_revision": SOURCE_MODEL_REVISION}})
+run_source_action_horizon_worker(
+    arm=ARM, n_action_steps=N_ACTION_STEPS,
+    episodes_per_task=EPISODES_PER_TASK, episode_limit=EPISODE_LIMIT,
+    shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+    manifest_hash=manifest["manifest_hash"],
+    source_model_revision=SOURCE_MODEL_REVISION, experiment=EXPERIMENT)'''),
+    ], f"31_source_action_horizon_worker_{shard_index}.ipynb")
+
+
 ANALYZE_CHUNK_SELECTOR = notebook([
     md("""# 23 - Analyze online per-chunk source+m1 aggregation
 
@@ -1517,6 +1571,157 @@ plt.show()'''),
 ], "25_analyze_source_threshold_refinement.ipynb")
 
 
+ANALYZE_SOURCE_DELAYED_REFINEMENT = notebook([
+    md("""# 30 - Analyze source delayed refinement
+
+This is the causal evaluation of **five unrefined prediction chunks, then refinement always on**.
+It exact-matches every completed delayed-refinement rollout against the original K=5, Euler-steps
+`(3,4)` uncertainty-only source rollout for the same suite, task, episode initialization, and
+state hash. Every reported SR and SR delta uses the entire matched set—not only episodes that
+survived until the sixth prediction chunk.
+
+`REQUIRE_FULL_COHORT=False` permits an interim look while workers are running. Set it to `True`
+for the final 1,300-episode result."""),
+    md("## 1. Setup"), code(bootstrap(extras="analysis", setup_env=False)),
+    md("## 2. Fetch and exact-match delayed refinement with the source baseline"),
+    code(r'''import json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display
+from analysis.statistics import paired_bootstrap_ci, discordant_test
+from pnp.config import Method
+from pnp.diversity import (DIVERSITY_PAIR_KEYS,
+    SOURCE_DELAYED_REFINEMENT_EXPERIMENT)
+from pnp.experiments import PRO_EXPANDED_EXPERIMENT
+from pnp.store import SupabaseStore
+
+REFINE_START_CHUNK = 5
+EXPECTED_EPISODES = 1300
+REQUIRE_FULL_COHORT = False  # set True after workers 0,1,2,3 are complete
+OUTPUT = Path("source_delayed_refinement_outputs")
+OUTPUT.mkdir(exist_ok=True)
+store = SupabaseStore()
+
+delayed = pd.DataFrame(store.fetch_all(
+    "rollouts", "*", configure=lambda query: query.eq(
+        "experiment", SOURCE_DELAYED_REFINEMENT_EXPERIMENT).eq(
+            "method", Method.DELAYED_REFINEMENT), order_by=("rollout_id",)))
+source = pd.DataFrame(store.fetch_all(
+    "rollouts", "*", configure=lambda query: query.eq(
+        "experiment", PRO_EXPANDED_EXPERIMENT).eq(
+            "method", Method.UNCERTAINTY), order_by=("rollout_id",)))
+assert len(delayed), "No delayed-refinement rollouts found"
+
+def start_chunk(value):
+    if isinstance(value, str):
+        value = json.loads(value)
+    return (value or {}).get("refine_start_chunk")
+
+delayed = delayed[delayed.status.eq("completed")].copy()
+delayed["refine_start_chunk"] = delayed.config_json.apply(start_chunk)
+delayed = delayed[
+    delayed.refine_start_chunk.eq(REFINE_START_CHUNK)
+    & delayed.pnp_k.eq(5)
+    & delayed.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4))].copy()
+baseline = source[
+    source.status.eq("completed") & source.pnp_k.eq(5)
+    & source.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4))].copy()
+for name, frame in (("delayed", delayed), ("baseline", baseline)):
+    assert not frame.duplicated(DIVERSITY_PAIR_KEYS).any(), f"duplicate {name} identities"
+
+paired = (delayed[DIVERSITY_PAIR_KEYS + ["rollout_id", "success", "n_steps", "n_chunks"]]
+          .rename(columns={"rollout_id": "delayed_rollout_id",
+                           "success": "delayed_success",
+                           "n_steps": "delayed_n_steps",
+                           "n_chunks": "delayed_n_chunks"})
+          .merge(baseline[DIVERSITY_PAIR_KEYS + ["rollout_id", "success", "n_steps", "n_chunks"]]
+                 .rename(columns={"rollout_id": "baseline_rollout_id",
+                                  "success": "baseline_success",
+                                  "n_steps": "baseline_n_steps",
+                                  "n_chunks": "baseline_n_chunks"}),
+                 on=DIVERSITY_PAIR_KEYS, validate="one_to_one"))
+assert len(paired) == len(delayed), (
+    f"Only {len(paired)}/{len(delayed)} delayed rows match the historical baseline")
+for column in ("delayed_success", "baseline_success"):
+    paired[column] = paired[column].astype(bool)
+if REQUIRE_FULL_COHORT:
+    assert len(paired) == EXPECTED_EPISODES, (
+        f"Expected {EXPECTED_EPISODES} matched episodes, found {len(paired)}")
+print({"matched_episodes": len(paired), "expected": EXPECTED_EPISODES,
+       "coverage_pct": 100 * len(paired) / EXPECTED_EPISODES,
+       "suites": paired.suite.nunique(),
+       "policy": "chunks 0..4 unrefined; refine-last from chunk 5"})'''),
+    md("## 3. Whole-cohort and per-suite paired results"),
+    code(r'''def summarize(group):
+    baseline_values = group.baseline_success.to_numpy(bool)
+    delayed_values = group.delayed_success.to_numpy(bool)
+    lo, hi = paired_bootstrap_ci(baseline_values, delayed_values, n_boot=5000)
+    f_to_s = int((~baseline_values & delayed_values).sum())
+    s_to_f = int((baseline_values & ~delayed_values).sum())
+    return pd.Series({
+        "episodes": len(group),
+        "unrefined_source_sr_pct": 100 * baseline_values.mean(),
+        "delayed_refinement_sr_pct": 100 * delayed_values.mean(),
+        "delayed_minus_source_pp": 100 * (delayed_values.mean() - baseline_values.mean()),
+        "delta_ci_low_pp": 100 * lo,
+        "delta_ci_high_pp": 100 * hi,
+        "failure_to_success": f_to_s,
+        "success_to_failure": s_to_f,
+        "paired_p_value": discordant_test(f_to_s, s_to_f),
+    })
+
+overall = summarize(paired).to_frame().T
+by_suite = pd.DataFrame([
+    {"suite": suite, **summarize(group).to_dict()}
+    for suite, group in paired.groupby("suite", sort=True)])
+print("Primary result: every matched episode is in the SR denominator")
+display(overall)
+display(by_suite[["suite", "episodes", "unrefined_source_sr_pct",
+                  "delayed_refinement_sr_pct", "delayed_minus_source_pp",
+                  "failure_to_success", "success_to_failure"]])
+paired.to_csv(OUTPUT / "matched_episodes.csv", index=False)
+overall.to_csv(OUTPUT / "overall.csv", index=False)
+by_suite.to_csv(OUTPUT / "by_suite.csv", index=False)'''),
+    md("## 4. Matched success rates and per-suite change"),
+    code(r'''fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+x = np.arange(len(by_suite)); width = .38
+labels = by_suite.suite.str.removeprefix("libero_")
+axes[0].bar(x - width/2, by_suite.unrefined_source_sr_pct, width,
+            label="unrefined source", color="#4C78A8")
+axes[0].bar(x + width/2, by_suite.delayed_refinement_sr_pct, width,
+            label="refine from chunk 6", color="#F58518")
+axes[0].set_xticks(x, labels, rotation=40, ha="right")
+axes[0].set(ylabel="Success rate (%)", ylim=(0, 105),
+            title="Delayed refinement vs matched source baseline")
+axes[0].legend(); axes[0].grid(axis="y", alpha=.2)
+
+colors = np.where(by_suite.delayed_minus_source_pp >= 0, "#54A24B", "#E45756")
+axes[1].bar(x, by_suite.delayed_minus_source_pp, color=colors)
+axes[1].axhline(0, color="black", linewidth=1)
+axes[1].axhline(overall.delayed_minus_source_pp.iloc[0], color="#9467BD",
+                linestyle="--",
+                label=f"overall: {overall.delayed_minus_source_pp.iloc[0]:+.2f} pp")
+axes[1].set_xticks(x, labels, rotation=40, ha="right")
+axes[1].set(ylabel="Delayed refinement minus source SR (percentage points)",
+            title="Whole-matched-cohort SR change by suite")
+axes[1].legend(); axes[1].grid(axis="y", alpha=.2)
+fig.tight_layout()
+fig.savefig(OUTPUT / "source_delayed_refinement.png", dpi=180, bbox_inches="tight")
+plt.show()'''),
+    md("## 5. Concise conclusion"),
+    code(r'''result = overall.iloc[0]
+print(f"Matched episodes: {int(result.episodes)}/{EXPECTED_EPISODES}")
+print(f"Unrefined source:  {result.unrefined_source_sr_pct:.2f}%")
+print(f"Delayed refine:    {result.delayed_refinement_sr_pct:.2f}%")
+print(f"Paired change:     {result.delayed_minus_source_pp:+.2f} pp "
+      f"(95% CI {result.delta_ci_low_pp:+.2f} to {result.delta_ci_high_pp:+.2f})")
+print(f"Transitions:       {int(result.failure_to_success)} F->S, "
+      f"{int(result.success_to_failure)} S->F")'''),
+], "30_analyze_source_delayed_refinement.ipynb")
+
+
 ANALYZE_SOURCE_MULTI_QUERY = notebook([
     md("""# 27 - Analyze source-only multi-query selection
 
@@ -1689,12 +1894,18 @@ def main():
         write_notebook(ROOT / "notebooks" / "workers" /
                        f"29_source_delayed_refinement_worker_{shard_index}.ipynb",
                        source_delayed_refinement_worker_notebook(shard_index))
+    for shard_index in range(2):
+        write_notebook(ROOT / "notebooks" / "workers" /
+                       f"31_source_action_horizon_worker_{shard_index}.ipynb",
+                       source_action_horizon_worker_notebook(shard_index))
     write_notebook(ROOT / "notebooks" / "23_analyze_diversity_chunk_selector.ipynb",
                    ANALYZE_CHUNK_SELECTOR)
     write_notebook(ROOT / "notebooks" / "25_analyze_source_threshold_refinement.ipynb",
                    ANALYZE_SOURCE_THRESHOLD_REFINEMENT)
     write_notebook(ROOT / "notebooks" / "27_analyze_source_multi_query.ipynb",
                    ANALYZE_SOURCE_MULTI_QUERY)
+    write_notebook(ROOT / "notebooks" / "30_analyze_source_delayed_refinement.ipynb",
+                   ANALYZE_SOURCE_DELAYED_REFINEMENT)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ class _Policy:
             action_dim=7, num_steps=None, vf_evals=0, strategy=None, chunk_pos=0.0,
         ))
         self.config = SimpleNamespace(
-            chunk_size=2, max_action_dim=7, num_inference_steps=10,
+            chunk_size=2, n_action_steps=2, max_action_dim=7, num_inference_steps=10,
         )
 
     def reset(self):
@@ -89,6 +89,36 @@ def test_run_episode_can_save_exact_policy_space_chunks():
     assert result["generated_chunks"]["chunks"].shape == (1, 2, 7)
     assert np.allclose(result["generated_chunks"]["chunks"], 1.0)
     assert np.allclose(result["trajectory"]["actions"], 2.0)
+
+
+def test_run_episode_executes_configured_prefix_but_saves_full_generated_chunk():
+    class HorizonPolicy(_Policy):
+        def __init__(self):
+            super().__init__()
+            self.config.chunk_size = 4
+            self.config.n_action_steps = 1
+
+        def predict_action_chunk(self, _batch, noise=None):
+            values = torch.arange(4, dtype=torch.float32).view(1, 4, 1)
+            return values.expand(1, 4, 7)
+
+    env = _Env()
+    policy = HorizonPolicy()
+    ep = {
+        "task_desc": "test task", "max_steps": 3,
+        "init_state": np.zeros(3), "ep_idx": 0,
+        "suite": "test", "task_idx": 0,
+    }
+    config = RolloutConfig(n_action_steps=2, save_generated_chunks=True)
+    with patch("pnp.rollout.obs_to_policy", return_value={}):
+        result = run_episode(
+            env, ep, policy, lambda obs: obs, lambda action: action,
+            torch.device("cpu"), config)
+
+    assert [float(action[0]) for action in env.actions[-3:]] == [0.0, 1.0, 0.0]
+    assert result["n_chunks"] == 2
+    assert result["generated_chunks"]["chunks"].shape == (2, 4, 7)
+    assert policy.config.n_action_steps == 1
 
 
 def test_dual_policy_episode_selects_and_logs_clean_candidate_diversity():

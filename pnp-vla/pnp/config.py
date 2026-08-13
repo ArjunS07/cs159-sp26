@@ -141,6 +141,7 @@ class RolloutConfig:
     candidate_set_id: Optional[str] = None       # immutable model/revision set for online selection
     # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
+    n_action_steps: Optional[int] = None        # generated-chunk prefix executed before replanning
     save_uncertainty: Optional[bool] = None     # default: on iff a probe is set
     save_pcp_features: bool = False             # per-chunk obs_enc + z_hat -> Storage (training)
     save_ahats: bool = False                    # full K a_hats stacks -> Storage (geometry)
@@ -193,6 +194,11 @@ class RolloutConfig:
             raise ValueError("save_uncertainty=True requires a probe")
         if self.render_lead < 1:
             raise ValueError("render_lead must be >= 1 (the consumed step itself)")
+        if self.n_action_steps is not None:
+            if (isinstance(self.n_action_steps, bool)
+                    or int(self.n_action_steps) != self.n_action_steps
+                    or self.n_action_steps < 1):
+                raise ValueError("n_action_steps must be a positive integer")
 
     @property
     def has_probe(self) -> bool:
@@ -227,6 +233,8 @@ class RolloutConfig:
             logical.pop("refine_threshold")
         if logical.get("refine_start_chunk") is None:
             logical.pop("refine_start_chunk")
+        if logical.get("n_action_steps") is None:
+            logical.pop("n_action_steps")
         return logical
 
 
@@ -234,7 +242,8 @@ class RolloutConfig:
 LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "refine", "refine_average", "refine_threshold", "refine_start_chunk",
                   "correction_lambda", "q_gate", "q_ckpt_id",
-                  "num_samples", "ms_probe_steps", "candidate_set_id", "num_inference_steps")
+                  "num_samples", "ms_probe_steps", "candidate_set_id", "num_inference_steps",
+                  "n_action_steps")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -25,6 +25,17 @@ def test_threshold_refinement_config_is_explicit_and_preserves_old_logical_keys(
         RolloutConfig(pnp_steps=(3, 4), pnp_k=5, refine_threshold=0.03)
 
 
+def test_action_execution_horizon_is_explicit_and_hashed():
+    original = RolloutConfig(pnp_steps=(3, 4), pnp_k=5, refine=True)
+    horizon_20 = RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, refine=True, n_action_steps=20)
+    assert "n_action_steps" not in original.logical_dict()
+    assert horizon_20.logical_dict()["n_action_steps"] == 20
+    assert original.logical_dict() != horizon_20.logical_dict()
+    with pytest.raises(ValueError, match="positive integer"):
+        RolloutConfig(n_action_steps=0)
+
+
 def test_threshold_refinement_applies_existing_last_refine_only_above_gate():
     config = RolloutConfig(
         pnp_steps=(3, 4), pnp_k=5, refine=True, refine_threshold=0.03)
@@ -133,3 +144,35 @@ def test_source_delayed_refinement_workers_are_four_fixed_shards():
         assert f"SHARD_INDEX = {shard_index}" in source
         assert "REFINE_START_CHUNK = 5" in source
         assert "source_model_revision=SOURCE_MODEL_REVISION" in source
+
+
+def test_delayed_refinement_analysis_uses_whole_exact_matched_cohort():
+    path = ROOT / "notebooks" / "30_analyze_source_delayed_refinement.ipynb"
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"])
+    assert "SOURCE_DELAYED_REFINEMENT_EXPERIMENT" in source
+    assert '"method", Method.DELAYED_REFINEMENT' in source
+    assert "REFINE_START_CHUNK = 5" in source
+    assert "EXPECTED_EPISODES = 1300" in source
+    assert 'on=DIVERSITY_PAIR_KEYS, validate="one_to_one"' in source
+    assert "delayed_minus_source_pp" in source
+    assert "paired_bootstrap_ci" in source
+    assert "failure_to_success" in source
+    assert "success_to_failure" in source
+
+
+def test_action_horizon_workers_default_to_refinement_on_two_shards():
+    for shard_index in range(2):
+        path = ROOT / "notebooks" / "workers" / (
+            f"31_source_action_horizon_worker_{shard_index}.ipynb")
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"])
+        assert "run_source_action_horizon_worker(" in source
+        assert 'ARM = "refinement"' in source
+        assert "N_ACTION_STEPS = 20" in source
+        assert "EPISODES_PER_TASK = 1" in source
+        assert "SHARD_COUNT = 2" in source
+        assert f"SHARD_INDEX = {shard_index}" in source
+        assert "arm=ARM, n_action_steps=N_ACTION_STEPS" in source
