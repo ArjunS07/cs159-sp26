@@ -1301,6 +1301,60 @@ run_source_action_horizon_worker(
     ], f"31_source_action_horizon_worker_{shard_index}.ipynb")
 
 
+def source_action_horizon_baseline_worker_notebook(shard_index: int):
+    return notebook([
+        md(f"""# 32 - Source 20-action uncertainty-only baseline worker {shard_index}
+
+This is shard {shard_index} of 2 for the full matched 1,300-episode control: 13 LIBERO-PRO suites
+x 10 tasks x 10 episode initializations. The source policy executes 20 actions before replanning
+and runs the same K=5 uncertainty measurement at Euler steps `(3,4)`, but **never refines**.
+
+Each worker collects 650 identities. These are the required matched controls for the 20-action
+always-refinement rollouts from notebook 31. They use the same experiment but a different method
+and hashed configuration, so they cannot overwrite refinement rows. Every 25 new rollouts, the
+progress table prints this 20-action control's current per-suite SR beside the historical
+10-action uncertainty-only source SR. Worker 0 may first set `EPISODE_LIMIT=1`, then restore
+`None`; the completed smoke row will be reused."""),
+        md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
+        md("## 2. Configuration and resumable collection"),
+        code(f'''from pathlib import Path
+from google.colab import drive
+from pnp.config import PI05_REPO_ID
+from pnp.diversity import (SOURCE_ACTION_HORIZON_EXPERIMENT,
+    load_bootstrap_manifest, run_source_action_horizon_worker)
+
+drive.mount("/content/drive")
+
+ARM = "baseline"  # uncertainty measurement only; refinement is disabled
+N_ACTION_STEPS = 20
+EPISODES_PER_TASK = 10  # 13 suites x 10 tasks x 10 initializations = 1,300 episodes
+SHARD_COUNT = 2
+SHARD_INDEX = {shard_index}
+EPISODE_LIMIT = None  # optional worker-0 smoke: set 1 once, then restore None
+EXPERIMENT = SOURCE_ACTION_HORIZON_EXPERIMENT
+MANIFEST_PATH = Path(
+    "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
+manifest = load_bootstrap_manifest(MANIFEST_PATH)
+assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+SOURCE_MODEL_REVISION = manifest["source_model_revision"]
+assert SOURCE_MODEL_REVISION, "v2 manifest is missing source_model_revision"
+
+print({{"experiment": EXPERIMENT, "arm": ARM, "refinement": False,
+       "n_action_steps": N_ACTION_STEPS, "internal_generated_chunk_size": 50,
+       "episodes_per_task": EPISODES_PER_TASK,
+       "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+       "episode_limit": EPISODE_LIMIT,
+       "manifest_hash": manifest["manifest_hash"],
+       "source_model_revision": SOURCE_MODEL_REVISION}})
+run_source_action_horizon_worker(
+    arm=ARM, n_action_steps=N_ACTION_STEPS,
+    episodes_per_task=EPISODES_PER_TASK, episode_limit=EPISODE_LIMIT,
+    shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+    manifest_hash=manifest["manifest_hash"],
+    source_model_revision=SOURCE_MODEL_REVISION, experiment=EXPERIMENT)'''),
+    ], f"32_source_action_horizon_baseline_worker_{shard_index}.ipynb")
+
+
 ANALYZE_CHUNK_SELECTOR = notebook([
     md("""# 23 - Analyze online per-chunk source+m1 aggregation
 
@@ -1898,6 +1952,9 @@ def main():
         write_notebook(ROOT / "notebooks" / "workers" /
                        f"31_source_action_horizon_worker_{shard_index}.ipynb",
                        source_action_horizon_worker_notebook(shard_index))
+        write_notebook(ROOT / "notebooks" / "workers" /
+                       f"32_source_action_horizon_baseline_worker_{shard_index}.ipynb",
+                       source_action_horizon_baseline_worker_notebook(shard_index))
     write_notebook(ROOT / "notebooks" / "23_analyze_diversity_chunk_selector.ipynb",
                    ANALYZE_CHUNK_SELECTOR)
     write_notebook(ROOT / "notebooks" / "25_analyze_source_threshold_refinement.ipynb",

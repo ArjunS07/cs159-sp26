@@ -176,3 +176,19 @@ def test_action_horizon_workers_default_to_refinement_on_two_shards():
         assert "SHARD_COUNT = 2" in source
         assert f"SHARD_INDEX = {shard_index}" in source
         assert "arm=ARM, n_action_steps=N_ACTION_STEPS" in source
+
+
+def test_action_horizon_baseline_workers_cover_full_cohort_without_refinement():
+    for shard_index in range(2):
+        path = ROOT / "notebooks" / "workers" / (
+            f"32_source_action_horizon_baseline_worker_{shard_index}.ipynb")
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"])
+        assert "run_source_action_horizon_worker(" in source
+        assert 'ARM = "baseline"' in source
+        assert '"refinement": False' in source
+        assert "N_ACTION_STEPS = 20" in source
+        assert "EPISODES_PER_TASK = 10" in source
+        assert "SHARD_COUNT = 2" in source
+        assert f"SHARD_INDEX = {shard_index}" in source
