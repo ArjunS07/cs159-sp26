@@ -1464,6 +1464,147 @@ def analyze_checkpoint_refinement(
         pairs, grid_size=grid_size, min_window=min_window)
 
 
+def analyze_source_prefix_gate_proxy(
+        rollouts: pd.DataFrame, steps: pd.DataFrame, *,
+        prefix_counts: Iterable[int] = range(1, 9), grid_size: int = 25,
+        min_selected: int = 25) -> dict[str, pd.DataFrame]:
+    """Screen delayed episode-level refinement gates on matched source rollouts.
+
+    The uncertainty score for prefix ``k`` is the mean over Euler probes and cleanly observed
+    chunks ``0..k-1`` from the *unrefined* source rollout.  Episodes that terminate before ``k``
+    stay in every SR denominator but cannot fire the gate.  If the gate fires, the recorded
+    always-refined terminal outcome is substituted as a retrospective proxy.
+
+    This is deliberately named a proxy: the paired refinement rollout was refined from chunk 0,
+    whereas a deployable delayed gate would follow the baseline trajectory for the prefix and
+    switch only afterward.  A new online arm is required to measure that policy causally.
+    """
+    from .config import Method
+
+    counts = tuple(sorted({int(value) for value in prefix_counts}))
+    if not counts or counts[0] < 1:
+        raise ValueError("prefix_counts must contain positive integers")
+    if grid_size < 2:
+        raise ValueError("grid_size must be at least 2")
+    if min_selected < 1:
+        raise ValueError("min_selected must be positive")
+
+    required = {Method.UNCERTAINTY, Method.REFINEMENT}
+    if set(rollouts.method.unique()) != required:
+        raise ValueError(
+            f"source prefix gate requires exactly {sorted(required)}; "
+            f"found {sorted(rollouts.method.unique())}")
+    if rollouts.status.ne("completed").any():
+        raise ValueError("source prefix gate requires completed rollout rows")
+    observed = rollouts[rollouts.method.eq(Method.UNCERTAINTY)].copy()
+    refined = rollouts[rollouts.method.eq(Method.REFINEMENT)].copy()
+    for label, frame in (("observed", observed), ("refined", refined)):
+        if frame.duplicated(DIVERSITY_PAIR_KEYS).any():
+            raise ValueError(f"source prefix gate contains duplicate {label} identities")
+    paired = observed[DIVERSITY_PAIR_KEYS + ["rollout_id", "success"]].merge(
+        refined[DIVERSITY_PAIR_KEYS + ["rollout_id", "success"]],
+        on=DIVERSITY_PAIR_KEYS, suffixes=("_observed", "_refined"),
+        validate="one_to_one")
+    if len(paired) != len(observed) or len(paired) != len(refined):
+        raise ValueError("source baseline/refinement identities do not match exactly")
+    paired["baseline_success"] = paired.success_observed.astype(bool)
+    paired["always_refined_success"] = paired.success_refined.astype(bool)
+
+    observed_ids = set(paired.rollout_id_observed.astype(str))
+    observed_steps = steps[steps.rollout_id.astype(str).isin(observed_ids)].copy()
+    if observed_steps.empty:
+        raise ValueError("source prefix gate has no unrefined Euler-step rows")
+    chunk_scores = (observed_steps.groupby(["rollout_id", "chunk_idx"])
+                    .u_mean.mean().unstack("chunk_idx"))
+
+    pair_frames = []
+    for count in counts:
+        needed = list(range(count))
+        available = chunk_scores.reindex(columns=needed)
+        prefix = available.mean(axis=1)
+        reached = available.notna().all(axis=1)
+        score = pd.DataFrame({
+            "rollout_id_observed": available.index.astype(str),
+            "prefix_u": prefix.where(reached).to_numpy(float),
+            "reached_prefix": reached.to_numpy(bool),
+        })
+        frame = paired.merge(score, on="rollout_id_observed", how="left",
+                             validate="one_to_one")
+        frame["reached_prefix"] = frame.reached_prefix.fillna(False).astype(bool)
+        frame["prefix_count"] = count
+        pair_frames.append(frame)
+    prefix_pairs = pd.concat(pair_frames, ignore_index=True)
+
+    summary_rows, threshold_rows, window_rows = [], [], []
+    lower_grid = np.linspace(0., .06, grid_size)
+    upper_grid = np.linspace(.01, .08, grid_size)
+    threshold_grid = np.linspace(0., .08, grid_size)
+    for count, group in prefix_pairs.groupby("prefix_count", sort=True):
+        baseline = group.baseline_success.to_numpy(bool)
+        refined_outcome = group.always_refined_success.to_numpy(bool)
+        reached = group.reached_prefix.to_numpy(bool)
+        score = group.prefix_u.to_numpy(float)
+        summary_rows.append({
+            "prefix_count": int(count), "n_total": len(group),
+            "n_reached": int(reached.sum()),
+            "coverage_reached": float(reached.mean()),
+            "baseline_sr": float(baseline.mean()),
+            "always_refined_sr": float(refined_outcome.mean()),
+            "failure_auc_among_reached": _rank_auc(
+                ~baseline[reached], score[reached]),
+        })
+
+        def row_for(selected, **metadata):
+            selected = np.asarray(selected, bool) & reached
+            policy = np.where(selected, refined_outcome, baseline)
+            eligible = int(selected.sum()) >= min_selected
+            return {
+                **metadata, "prefix_count": int(count),
+                "n_total": len(group), "n_reached": int(reached.sum()),
+                "n_selected": int(selected.sum()),
+                "coverage_selected": float(selected.mean()),
+                "eligible": eligible,
+                "proxy_sr_all_episodes": float(policy.mean()) if eligible else math.nan,
+                "proxy_delta_pp": (
+                    float(100 * (policy.mean() - baseline.mean())) if eligible else math.nan),
+                "selected_F_to_S": int((selected & ~baseline & refined_outcome).sum()),
+                "selected_S_to_F": int((selected & baseline & ~refined_outcome).sum()),
+            }
+
+        for threshold in threshold_grid:
+            threshold_rows.append(row_for(
+                np.isfinite(score) & (score >= threshold),
+                gate_type="high_threshold", threshold=float(threshold)))
+        for lower in lower_grid:
+            for upper in upper_grid:
+                if upper <= lower:
+                    continue
+                window_rows.append(row_for(
+                    np.isfinite(score) & (score >= lower) & (score <= upper),
+                    gate_type="window", lower=float(lower), upper=float(upper)))
+
+    summary = pd.DataFrame(summary_rows)
+    threshold_sweep = pd.DataFrame(threshold_rows)
+    window_sweep = pd.DataFrame(window_rows)
+    best_threshold = (threshold_sweep[threshold_sweep.eligible]
+                      .sort_values(["prefix_count", "proxy_delta_pp", "n_selected", "threshold"],
+                                   ascending=[True, False, False, True])
+                      .groupby("prefix_count", sort=False).head(1).reset_index(drop=True))
+    best_window = (window_sweep[window_sweep.eligible]
+                   .sort_values(["prefix_count", "proxy_delta_pp", "n_selected",
+                                 "lower", "upper"],
+                                ascending=[True, False, False, True, True])
+                   .groupby("prefix_count", sort=False).head(1).reset_index(drop=True))
+    return {
+        "source_prefix_gate_pairs": prefix_pairs,
+        "source_prefix_gate_summary": summary,
+        "source_prefix_threshold_sweep": threshold_sweep,
+        "source_prefix_window_sweep": window_sweep,
+        "source_prefix_best_threshold": best_threshold,
+        "source_prefix_best_window": best_window,
+    }
+
+
 def _selective_policy_summary(group: pd.DataFrame, threshold: float) -> dict:
     baseline = group.baseline_success.to_numpy(bool)
     refined = group.refined_success.to_numpy(bool)

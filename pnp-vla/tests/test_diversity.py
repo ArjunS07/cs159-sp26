@@ -13,7 +13,7 @@ from pnp.diversity import (DIVERSITY_EXPERIMENT_PREFIX, DIVERSITY_V2_EXPERIMENT_
                            analyze_checkpoint_refinement,
                            analyze_diversity_chunk_selector,
                            analyze_diversity_selective_refinement, analyze_diversity_signal,
-                           analyze_source_member_ensembles,
+                           analyze_source_member_ensembles, analyze_source_prefix_gate_proxy,
                            bootstrap_manifest_summary,
                            bootstrap_sampler_class, build_bootstrap_manifest,
                            diversity_baseline_cohort, diversity_experiment,
@@ -785,3 +785,53 @@ def test_prefix_scores_use_whole_episode_u_for_short_trajectories():
     assert len(full_window) == 1
     assert full_window.iloc[0].n_refined == 2
     assert np.isclose(full_window.iloc[0].delta_pp, 50.)  # one net fix / both episodes
+
+
+def test_source_prefix_gate_proxy_keeps_short_episodes_in_full_denominator():
+    identities = [
+        {"suite": "libero_goal_swap", "task_idx": 0, "episode_idx": index,
+         "init_state_hash": str(index)}
+        for index in range(4)]
+    rows, steps = [], []
+    baseline = [False, True, False, True]
+    refined = [True, False, True, True]
+    chunk_counts = [1, 4, 4, 4]
+    uncertainty = [.01, .02, .05, .07]
+    for index, identity in enumerate(identities):
+        observed_id = f"observed-prefix-{index}"
+        rows.extend([
+            {**identity, "rollout_id": observed_id, "method": "pnp_uncertainty_only",
+             "status": "completed", "success": baseline[index]},
+            {**identity, "rollout_id": f"refined-prefix-{index}",
+             "method": "pnp_refinement", "status": "completed",
+             "success": refined[index]},
+        ])
+        for chunk_idx in range(chunk_counts[index]):
+            for euler_step in (3, 4):
+                steps.append({"rollout_id": observed_id, "chunk_idx": chunk_idx,
+                              "euler_step": euler_step,
+                              "u_mean": uncertainty[index]})
+
+    analysis = analyze_source_prefix_gate_proxy(
+        pd.DataFrame(rows), pd.DataFrame(steps),
+        prefix_counts=(1, 4), grid_size=5, min_selected=1)
+    summary = analysis["source_prefix_gate_summary"].set_index("prefix_count")
+    assert summary.loc[1].n_total == 4
+    assert summary.loc[4].n_total == 4
+    assert summary.loc[4].n_reached == 3
+
+    pairs = analysis["source_prefix_gate_pairs"]
+    prefix4 = pairs[pairs.prefix_count.eq(4)].sort_values("episode_idx")
+    assert not bool(prefix4.iloc[0].reached_prefix)
+    assert np.isnan(prefix4.iloc[0].prefix_u)
+
+    # At threshold .04, only episodes 2 and 3 fire. Episode 0 ended before the decision and
+    # remains a baseline failure even though its always-refined paired rollout succeeded.
+    sweep = analysis["source_prefix_threshold_sweep"]
+    selected = sweep[
+        sweep.prefix_count.eq(4) & np.isclose(sweep.threshold, .04)].iloc[0]
+    assert selected.n_total == 4
+    assert selected.n_selected == 2
+    assert selected.selected_F_to_S == 1
+    assert selected.selected_S_to_F == 0
+    assert np.isclose(selected.proxy_delta_pp, 25.)
