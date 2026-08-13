@@ -35,6 +35,7 @@ class RolloutTap:
         self._refine_considered = 0
         self._refine_applied = 0
         self._chunk_refine_applied = 0
+        self._chunk_idx = -1
         # correction telemetry (only when the action is a PCP correction)
         self._corr = CorrectTelemetry() if self._correcting else None
         # pcp-features accumulation (only when save_pcp_features)
@@ -50,9 +51,12 @@ class RolloutTap:
     @property
     def needs_baseline_fallback(self) -> bool:
         """Whether a no-fire chunk must return the exact stock sampler output."""
-        return self.config.refine and self.config.refine_threshold is not None
+        return self.config.refine and (
+            self.config.refine_threshold is not None
+            or self.config.refine_start_chunk is not None)
 
     def begin_chunk(self) -> None:
+        self._chunk_idx += 1
         self._chunk_refine_applied = 0
 
     @property
@@ -84,6 +88,12 @@ class RolloutTap:
 
         # action: at most one feedback path (measure-only when no action is set)
         if cfg.refine:
+            # Delayed refinement deliberately preserves the exact stock sampler output before
+            # this zero-based prediction-chunk index. The sampler's baseline fallback guarantees
+            # those early chunks are not merely an approximation from the instrumented loop.
+            if (cfg.refine_start_chunk is not None
+                    and self._chunk_idx < cfg.refine_start_chunk):
+                return x_t
             self._refine_considered += 1
             if (cfg.refine_threshold is not None
                     and float(pr.rec["u_mean"]) < float(cfg.refine_threshold)):

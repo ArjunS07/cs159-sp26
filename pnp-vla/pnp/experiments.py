@@ -195,6 +195,7 @@ HISTORICAL_PRO_BASELINE_SR = {
 
 _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
                   Method.THRESHOLD_REFINEMENT: "U-gated refine",
+                  Method.DELAYED_REFINEMENT: "delayed refine",
                   Method.EXTRA_STEPS: "control",
                   Method.CHUNK_SOURCE_SOURCE: "source x2",
                   Method.CHUNK_SOURCE_MULTI_QUERY: "source multi-query",
@@ -307,7 +308,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
           f"{pending}/{expected} pending")
     refinement_schedules = [
         config.pnp_steps for name, config in methods
-        if name in (Method.REFINEMENT, Method.THRESHOLD_REFINEMENT)
+        if name in (Method.REFINEMENT, Method.THRESHOLD_REFINEMENT,
+                    Method.DELAYED_REFINEMENT)
     ]
     run_config = {"cohort": cohort, "schedules": refinement_schedules, "pnp_k": K,
                   "n_configs": len(methods), "shard_count": shard_count,

@@ -28,6 +28,7 @@ DIVERSITY_EXPERIMENT_PREFIX = "pi05-diversity-signal-v1"
 DIVERSITY_V2_EXPERIMENT_PREFIX = "pi05-diversity-signal-v2"
 DIVERSITY_CHUNK_SELECTOR_EXPERIMENT = "pi05-diversity-chunk-selector-v1"
 SOURCE_THRESHOLD_REFINEMENT_EXPERIMENT = "pi05-source-threshold-refinement-v1"
+SOURCE_DELAYED_REFINEMENT_EXPERIMENT = "pi05-source-delayed-refinement-k5-v1"
 SOURCE_MULTI_QUERY_EXPERIMENT = "pi05-source-multi-query-v1"
 DIVERSITY_PAIR_KEYS = ["suite", "task_idx", "episode_idx", "init_state_hash"]
 DIVERSITY_PREFIX_CHUNKS = (1, 2, 4, 8)
@@ -628,6 +629,121 @@ def run_source_threshold_refinement_worker(
             "refine_threshold": threshold, "threshold_signal": "per_step_u_mean",
             "episodes_per_task": episodes_per_task, "episode_limit": episode_limit,
             "requested_methods": [Method.THRESHOLD_REFINEMENT]},
+        provenance=gather_provenance(
+            model_repo_id=source_repo, model_revision=source_revision),
+        report_every=50, initial_tally=initial_tally, historical_sr=historical_sr)
+
+
+def run_source_delayed_refinement_worker(
+        *, shard_count: int = 4, shard_index: int = 0,
+        episodes_per_task: int = 10, episode_limit: int | None = None,
+        refine_start_chunk: int = 5,
+        manifest_hash: str = "", source_model_revision: str = "",
+        experiment: str = SOURCE_DELAYED_REFINEMENT_EXPERIMENT):
+    """Run a causal test that turns refine-last on permanently after an early prefix.
+
+    ``refine_start_chunk=5`` means prediction chunks 0--4 are exact stock pi0.5 outputs; chunk
+    index 5 and every later prediction use K=5, Euler steps (3,4), last refinement. This is the
+    prospective test of the prefix-gate proxy and contains no uncertainty threshold.
+    """
+    from . import models
+    from .config import Method, RolloutConfig
+    from .experiments import (PRO_EXPANDED_EXPERIMENT,
+                              _prepare_libero_pro_expanded_episodes, _run_collection,
+                              identity_shard)
+    from .store import SupabaseStore, gather_provenance
+
+    if not manifest_hash:
+        raise ValueError("manifest_hash is required; load the shared v2 Drive manifest")
+    if not source_model_revision:
+        raise ValueError(
+            "source_model_revision is required; pass it from the shared v2 Drive manifest")
+    if (isinstance(refine_start_chunk, bool)
+            or int(refine_start_chunk) != refine_start_chunk
+            or refine_start_chunk < 0):
+        raise ValueError("refine_start_chunk must be a non-negative integer")
+    refine_start_chunk = int(refine_start_chunk)
+
+    store = SupabaseStore()
+    source_repo, source_revision = source_checkpoint_model_source(
+        store, expected_revision=source_model_revision)
+    manifest = _prepare_libero_pro_expanded_episodes(episodes_per_task)
+    expected_identities = 13 * 10 * int(episodes_per_task)
+    if len(manifest) != expected_identities:
+        raise ValueError(
+            f"expected {expected_identities} identities for 13 suites x 10 tasks x "
+            f"{episodes_per_task} episodes, found {len(manifest)}")
+    episodes = identity_shard(manifest, shard_count, shard_index)
+    if episode_limit is not None:
+        if int(episode_limit) < 1:
+            raise ValueError("episode_limit must be positive or None")
+        episodes = episodes[:int(episode_limit)]
+
+    historical_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,"
+        "pnp_k,pnp_step_indices",
+        configure=lambda query: query.eq(
+            "experiment", PRO_EXPANDED_EXPERIMENT).eq("method", Method.UNCERTAINTY),
+        order_by=("rollout_id",)))
+    if historical_rows.empty:
+        raise ValueError(
+            f"no unrefined source baseline rows found in {PRO_EXPANDED_EXPERIMENT}")
+    valid_historical = (
+        historical_rows.status.eq("completed")
+        & historical_rows.pnp_k.eq(5)
+        & historical_rows.pnp_step_indices.apply(lambda value: tuple(value or []) == (3, 4)))
+    historical_rows = historical_rows[valid_historical].copy()
+    if historical_rows.empty:
+        raise ValueError("no completed historical source baseline uses K=5 steps (3,4)")
+    historical_sr = historical_rows.groupby("suite").success.mean().astype(float).to_dict()
+
+    config = RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, refine=True, refine_average=False,
+        refine_start_chunk=refine_start_chunk,
+        save_trajectory=True, save_generated_chunks=True,
+        skip_unused_renders=True, render_lead=2)
+    methods = [(Method.DELAYED_REFINEMENT, config)]
+    shard_identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in episodes}
+    existing_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", experiment).eq(
+            "method", Method.DELAYED_REFINEMENT),
+        order_by=("rollout_id",)))
+    if not existing_rows.empty:
+        expected_hash = store.config_hash(store._logical_key(
+            Method.DELAYED_REFINEMENT, config))
+        existing_rows = existing_rows[
+            existing_rows.config_hash.eq(expected_hash)
+            & existing_rows.status.eq("completed")
+            & existing_rows[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(shard_identities)]
+    initial_tally = {} if existing_rows.empty else {
+        (suite, Method.DELAYED_REFINEMENT): [
+            len(group), int(group.success.astype(bool).sum())]
+        for suite, group in existing_rows.groupby("suite", sort=True)}
+
+    print({"source": f"{source_repo}@{source_revision}",
+           "refine_start_chunk": refine_start_chunk,
+           "early_behavior": f"exact stock chunks 0..{refine_start_chunk - 1}",
+           "later_behavior": f"K=5 steps (3,4) refine-last from chunk {refine_start_chunk}",
+           "target_cohort_size": len(manifest), "episodes_in_shard": len(episodes),
+           "historical_comparator": f"{PRO_EXPANDED_EXPERIMENT}/{Method.UNCERTAINTY}"})
+    policy, preprocess, postprocess = models.load_pi05(
+        repo_id=source_repo, revision=source_revision)
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=methods, cohort="source_delayed_refinement",
+        shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="pi05_source_delayed_refinement",
+        run_metadata={
+            "source_model_repo_id": source_repo, "source_model_revision": source_revision,
+            "bootstrap_manifest_hash": manifest_hash, "pnp_k": 5,
+            "pnp_steps": [3, 4], "refine_average": False,
+            "refine_start_chunk": refine_start_chunk,
+            "episodes_per_task": episodes_per_task, "episode_limit": episode_limit,
+            "requested_methods": [Method.DELAYED_REFINEMENT]},
         provenance=gather_provenance(
             model_repo_id=source_repo, model_revision=source_revision),
         report_every=50, initial_tally=initial_tally, historical_sr=historical_sr)

@@ -1193,6 +1193,60 @@ run_source_multi_query_worker(
     ], f"26_source_multi_query_worker_{shard_index}.ipynb")
 
 
+def source_delayed_refinement_worker_notebook(shard_index: int):
+    return notebook([
+        md(f"""# 29 - Source delayed-refinement worker {shard_index}
+
+This is shard {shard_index} of 4 for the causal test suggested by the first-k proxy analysis.
+Prediction chunks **0 through 4 are exact unrefined source-policy chunks**. Starting with
+zero-based chunk index 5 (the sixth prediction, after about 50 executed actions), the existing
+K=5, Euler-steps `(3,4)`, **last-refinement** intervention is enabled for every later chunk.
+There is no uncertainty threshold in this arm.
+
+All four workers cover the same 1,300 LIBERO-PRO identities used previously: 13 suites x 10 tasks
+x 10 episode initializations. Each worker runs about 325 rollouts. Every 50 new rollouts, the
+progress table prints this arm's current per-suite SR beside the matched historical **unrefined
+source** SR. Worker 0 may first use `EPISODE_LIMIT=1`; restore it to `None` for collection, and
+that completed smoke row will be reused."""),
+        md("## 1. Setup a fresh GPU runtime"), code(bootstrap(extras="sim", setup_env=True)),
+        md("## 2. Configuration and resumable collection"),
+        code(f'''from pathlib import Path
+from google.colab import drive
+from pnp.config import PI05_REPO_ID
+from pnp.diversity import (SOURCE_DELAYED_REFINEMENT_EXPERIMENT,
+    load_bootstrap_manifest, run_source_delayed_refinement_worker)
+
+drive.mount("/content/drive")
+
+EPISODES_PER_TASK = 10
+SHARD_COUNT = 4
+SHARD_INDEX = {shard_index}
+EPISODE_LIMIT = None  # worker-0 smoke: set 1 once, then restore None
+REFINE_START_CHUNK = 5  # chunks 0..4 exact stock; refine from chunk index 5 onward
+EXPERIMENT = SOURCE_DELAYED_REFINEMENT_EXPERIMENT
+MANIFEST_PATH = Path(
+    "/content/drive/MyDrive/pnp_diversity_v2/bootstrap_manifest_finetuned_v2.json")
+manifest = load_bootstrap_manifest(MANIFEST_PATH)
+assert manifest["source_model"] == PI05_REPO_ID, manifest["source_model"]
+SOURCE_MODEL_REVISION = manifest["source_model_revision"]
+assert SOURCE_MODEL_REVISION, "v2 manifest is missing source_model_revision"
+
+print({{"experiment": EXPERIMENT, "refine_start_chunk": REFINE_START_CHUNK,
+       "meaning": "chunks 0..4 unrefined; K=5 (3,4) refine-last from chunk 5",
+       "episodes_per_task": EPISODES_PER_TASK,
+       "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+       "episode_limit": EPISODE_LIMIT,
+       "manifest_hash": manifest["manifest_hash"],
+       "source_model_revision": SOURCE_MODEL_REVISION}})
+run_source_delayed_refinement_worker(
+    episodes_per_task=EPISODES_PER_TASK, episode_limit=EPISODE_LIMIT,
+    refine_start_chunk=REFINE_START_CHUNK,
+    shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+    manifest_hash=manifest["manifest_hash"],
+    source_model_revision=SOURCE_MODEL_REVISION, experiment=EXPERIMENT)'''),
+    ], f"29_source_delayed_refinement_worker_{shard_index}.ipynb")
+
+
 ANALYZE_CHUNK_SELECTOR = notebook([
     md("""# 23 - Analyze online per-chunk source+m1 aggregation
 
@@ -1632,6 +1686,9 @@ def main():
         write_notebook(ROOT / "notebooks" / "workers" /
                        f"26_source_multi_query_worker_{shard_index}.ipynb",
                        source_multi_query_worker_notebook(shard_index))
+        write_notebook(ROOT / "notebooks" / "workers" /
+                       f"29_source_delayed_refinement_worker_{shard_index}.ipynb",
+                       source_delayed_refinement_worker_notebook(shard_index))
     write_notebook(ROOT / "notebooks" / "23_analyze_diversity_chunk_selector.ipynb",
                    ANALYZE_CHUNK_SELECTOR)
     write_notebook(ROOT / "notebooks" / "25_analyze_source_threshold_refinement.ipynb",

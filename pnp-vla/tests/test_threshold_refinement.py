@@ -53,6 +53,34 @@ def test_threshold_refinement_applies_existing_last_refine_only_above_gate():
     assert not tap.chunk_intervened
 
 
+def test_delayed_refinement_preserves_five_stock_chunks_then_refines():
+    config = RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, refine=True, refine_start_chunk=5)
+    assert config.logical_dict()["refine_start_chunk"] == 5
+    assert "refine_start_chunk" not in RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, refine=True).logical_dict()
+    with pytest.raises(ValueError, match="requires refine=True"):
+        RolloutConfig(pnp_steps=(3, 4), pnp_k=5, refine_start_chunk=5)
+
+    tap = RolloutTap(config, SimpleNamespace(), device=None, adim=7)
+    assert tap.needs_baseline_fallback
+    ctx = SimpleNamespace(step=3, records=[])
+    x_t = object()
+    refined = object()
+    probes = [SimpleNamespace(rec={"u_mean": 0.04}) for _ in range(6)]
+    with patch("pnp.tap.run_probe", side_effect=probes), patch(
+            "pnp.tap.apply_refine", return_value=refined) as apply_refine:
+        for _ in range(5):
+            tap.begin_chunk()
+            assert tap.step(x_t, 0.7, None, ctx) is x_t
+            assert not tap.chunk_intervened
+        tap.begin_chunk()
+        assert tap.step(x_t, 0.7, None, ctx) is refined
+        assert tap.chunk_intervened
+
+    apply_refine.assert_called_once_with(probes[-1], False)
+
+
 def test_progress_table_can_use_exact_historical_unrefined_rates():
     table = format_progress_table(
         {("libero_goal_swap", Method.THRESHOLD_REFINEMENT): [4, 1]},
@@ -90,3 +118,18 @@ def test_source_multi_query_workers_default_to_two_and_keep_count_explicit():
         assert "SHARD_COUNT = 4" in source
         assert f"SHARD_INDEX = {shard_index}" in source
         assert "run_diversity_chunk_selector_worker" not in source
+
+
+def test_source_delayed_refinement_workers_are_four_fixed_shards():
+    for shard_index in range(4):
+        path = ROOT / "notebooks" / "workers" / (
+            f"29_source_delayed_refinement_worker_{shard_index}.ipynb")
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"])
+        assert "run_source_delayed_refinement_worker(" in source
+        assert "EPISODES_PER_TASK = 10" in source
+        assert "SHARD_COUNT = 4" in source
+        assert f"SHARD_INDEX = {shard_index}" in source
+        assert "REFINE_START_CHUNK = 5" in source
+        assert "source_model_revision=SOURCE_MODEL_REVISION" in source
