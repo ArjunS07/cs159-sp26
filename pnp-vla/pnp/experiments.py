@@ -28,6 +28,10 @@ EXPERIMENT = "libero-hybrid-schedules-k3-v1"
 # generates 50 actions but executes 10 before replanning.
 LIBERO_ACTION_STEPS = 10
 LIBERO_10STEP_EXPERIMENT = "libero-hybrid-schedules-k3-a10-v2"
+# Same OffScreenRenderEnv/robosuite path as PRO. The measured renderer needs two enabled
+# env steps before the observation consumed at the next policy call is fresh.
+LIBERO_SKIP_RENDERS = True
+LIBERO_RENDER_LEAD = 2
 PRO_EXPERIMENT = "libero-pro-canonical-core-k3-v1"
 
 # ── Expanded 16-suite PRO run ────────────────────────────────────────────────
@@ -59,16 +63,20 @@ def build_full_methods(schedules=SCHEDULES, k=K,
     """
     extra_steps = sorted({BASE_INFERENCE_STEPS + k * len(schedule) for schedule in schedules})
     horizon = dict(n_action_steps=n_action_steps)
+    perf = dict(skip_unused_renders=LIBERO_SKIP_RENDERS,
+                render_lead=LIBERO_RENDER_LEAD)
     methods = [
         (Method.UNCERTAINTY, RolloutConfig(
-            pnp_steps=OBSERVED_STEPS, pnp_k=k, save_pcp_features=True, **horizon)),
-        *((Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=steps, **horizon))
+            pnp_steps=OBSERVED_STEPS, pnp_k=k, save_pcp_features=True,
+            **horizon, **perf)),
+        *((Method.EXTRA_STEPS, RolloutConfig(
+            num_inference_steps=steps, **horizon, **perf))
           for steps in extra_steps),
     ]
     for schedule in schedules:
         probe = dict(pnp_steps=schedule, pnp_k=k)
         methods.append((Method.REFINEMENT, RolloutConfig(
-            **probe, refine=True, **horizon)))
+            **probe, refine=True, **horizon, **perf)))
     if len(methods) != 12:
         raise AssertionError(f"expected 12 full methods, got {len(methods)}")
     return methods
@@ -397,14 +405,18 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
         experiment=experiment, episodes=ablation, methods=full_methods,
         cohort="full_ablation", shard_count=shard_count, shard_index=shard_index,
         run_metadata={"n_action_steps": LIBERO_ACTION_STEPS,
-                      "generated_chunk_size": 50},
+                      "generated_chunk_size": 50,
+                      "skip_unused_renders": LIBERO_SKIP_RENDERS,
+                      "render_lead": LIBERO_RENDER_LEAD},
     )
     _run_collection(
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
         experiment=experiment, episodes=broad, methods=broad_methods,
         cohort="broad_validation", shard_count=shard_count, shard_index=shard_index,
         run_metadata={"n_action_steps": LIBERO_ACTION_STEPS,
-                      "generated_chunk_size": 50},
+                      "generated_chunk_size": 50,
+                      "skip_unused_renders": LIBERO_SKIP_RENDERS,
+                      "render_lead": LIBERO_RENDER_LEAD},
     )
 
 

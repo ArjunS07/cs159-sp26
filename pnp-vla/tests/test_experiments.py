@@ -6,6 +6,7 @@ from pnp.experiments import (
     FULL_ABLATION_TASKS,
     LIBERO_10STEP_EXPERIMENT,
     LIBERO_ACTION_STEPS,
+    LIBERO_RENDER_LEAD,
     SCHEDULES,
     build_broad_methods,
     build_full_methods,
@@ -34,6 +35,8 @@ def test_automated_worker_matrices_are_complete_and_unique():
     assert {config.pnp_steps for config in refinements} == set(SCHEDULES)
     assert all(not config.refine_average for config in refinements)
     assert all(config.n_action_steps == LIBERO_ACTION_STEPS for _, config in full)
+    assert all(config.skip_unused_renders for _, config in full)
+    assert all(config.render_lead == LIBERO_RENDER_LEAD == 2 for _, config in full)
     assert LIBERO_10STEP_EXPERIMENT != "libero-hybrid-schedules-k3-v1"
 
 
