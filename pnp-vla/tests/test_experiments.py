@@ -4,6 +4,8 @@ from pathlib import Path
 from pnp import Method
 from pnp.experiments import (
     FULL_ABLATION_TASKS,
+    LIBERO_10STEP_EXPERIMENT,
+    LIBERO_ACTION_STEPS,
     SCHEDULES,
     build_broad_methods,
     build_full_methods,
@@ -31,6 +33,8 @@ def test_automated_worker_matrices_are_complete_and_unique():
     refinements = [config for name, config in full if name == Method.REFINEMENT]
     assert {config.pnp_steps for config in refinements} == set(SCHEDULES)
     assert all(not config.refine_average for config in refinements)
+    assert all(config.n_action_steps == LIBERO_ACTION_STEPS for _, config in full)
+    assert LIBERO_10STEP_EXPERIMENT != "libero-hybrid-schedules-k3-v1"
 
 
 def test_automated_worker_shards_are_disjoint_and_complete():
@@ -79,6 +83,8 @@ def test_six_launchers_have_fixed_unique_indices():
         assert "SHARD_COUNT = 6" in source
         assert f"SHARD_INDEX = {index}" in source
         assert "run_libero_hybrid_worker" in source
+        assert "LIBERO_10STEP_EXPERIMENT" in source
+        assert "experiment=LIBERO_10STEP_EXPERIMENT" in source
         assert "colab_bootstrap.py" in source  # fetch-and-exec bootstrap
 
 

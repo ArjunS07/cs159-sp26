@@ -318,6 +318,9 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                 full_arr = chunk.squeeze(0).detach().cpu().numpy()
                 if generated_chunks is not None:
                     generated_chunks.append(full_arr.copy())
+                # Do not silently consult policy.config here: historical rollout IDs with an
+                # omitted horizon mean "execute the full generated chunk". Corrected/new drivers
+                # must set n_action_steps explicitly so resume cannot mix old and new protocols.
                 execution_horizon = config.n_action_steps
                 arr = (full_arr if execution_horizon is None
                        else full_arr[:int(execution_horizon)])

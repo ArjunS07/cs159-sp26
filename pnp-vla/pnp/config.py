@@ -141,6 +141,8 @@ class RolloutConfig:
     candidate_set_id: Optional[str] = None       # immutable model/revision set for online selection
     # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
+    # None intentionally preserves the legacy full-generated-chunk behavior. Production drivers
+    # should set this explicitly; it does not inherit policy.config.n_action_steps.
     n_action_steps: Optional[int] = None        # generated-chunk prefix executed before replanning
     save_uncertainty: Optional[bool] = None     # default: on iff a probe is set
     save_pcp_features: bool = False             # per-chunk obs_enc + z_hat -> Storage (training)

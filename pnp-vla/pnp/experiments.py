@@ -23,6 +23,11 @@ FULL_ABLATION_TASKS = {
 }
 LIBERO_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 EXPERIMENT = "libero-hybrid-schedules-k3-v1"
+# Corrected standard-LIBERO rerun.  The v1 workers inherited the checkpoint's
+# 50-action execution horizon; LeRobot's published pi0.5 LIBERO evaluation
+# generates 50 actions but executes 10 before replanning.
+LIBERO_ACTION_STEPS = 10
+LIBERO_10STEP_EXPERIMENT = "libero-hybrid-schedules-k3-a10-v2"
 PRO_EXPERIMENT = "libero-pro-canonical-core-k3-v1"
 
 # ── Expanded 16-suite PRO run ────────────────────────────────────────────────
@@ -45,18 +50,25 @@ PRO_EXPANDED_SKIP_RENDERS = True
 PRO_EXPANDED_RENDER_LEAD = 2
 
 
-def build_full_methods(schedules=SCHEDULES, k=K):
-    """The 12-config refine-last matrix used on the historical hard-task cohort."""
+def build_full_methods(schedules=SCHEDULES, k=K,
+                       n_action_steps=LIBERO_ACTION_STEPS):
+    """The corrected 12-config standard-LIBERO matrix.
+
+    The execution horizon is explicit so it cannot silently inherit the
+    50-action value embedded in ``lerobot/pi05_libero_finetuned``.
+    """
     extra_steps = sorted({BASE_INFERENCE_STEPS + k * len(schedule) for schedule in schedules})
+    horizon = dict(n_action_steps=n_action_steps)
     methods = [
         (Method.UNCERTAINTY, RolloutConfig(
-            pnp_steps=OBSERVED_STEPS, pnp_k=k, save_pcp_features=True)),
-        *((Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=steps))
+            pnp_steps=OBSERVED_STEPS, pnp_k=k, save_pcp_features=True, **horizon)),
+        *((Method.EXTRA_STEPS, RolloutConfig(num_inference_steps=steps, **horizon))
           for steps in extra_steps),
     ]
     for schedule in schedules:
         probe = dict(pnp_steps=schedule, pnp_k=k)
-        methods.append((Method.REFINEMENT, RolloutConfig(**probe, refine=True)))
+        methods.append((Method.REFINEMENT, RolloutConfig(
+            **probe, refine=True, **horizon)))
     if len(methods) != 12:
         raise AssertionError(f"expected 12 full methods, got {len(methods)}")
     return methods
@@ -360,8 +372,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
 
 
 def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
-                             experiment: str = EXPERIMENT):
-    """Load pi0.5 once and execute one disjoint shard of the hybrid LIBERO plan."""
+                             experiment: str = LIBERO_10STEP_EXPERIMENT):
+    """Run one corrected, 10-actions-per-query standard-LIBERO shard."""
     from . import models
 
     episodes = identity_shard(_prepare_libero_episodes(), shard_count, shard_index)
@@ -375,7 +387,8 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
     broad_methods = build_broad_methods(full_methods)
 
     print(f"worker {shard_index}/{shard_count}: {len(ablation)} full-ablation + "
-          f"{len(broad)} broad identities")
+          f"{len(broad)} broad identities; execution horizon="
+          f"{LIBERO_ACTION_STEPS}, experiment={experiment}")
     policy, preprocess, postprocess = models.load_pi05()
     device = models.default_device()
     store = SupabaseStore()
@@ -383,11 +396,15 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
         experiment=experiment, episodes=ablation, methods=full_methods,
         cohort="full_ablation", shard_count=shard_count, shard_index=shard_index,
+        run_metadata={"n_action_steps": LIBERO_ACTION_STEPS,
+                      "generated_chunk_size": 50},
     )
     _run_collection(
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
         experiment=experiment, episodes=broad, methods=broad_methods,
         cohort="broad_validation", shard_count=shard_count, shard_index=shard_index,
+        run_metadata={"n_action_steps": LIBERO_ACTION_STEPS,
+                      "generated_chunk_size": 50},
     )
 
 
