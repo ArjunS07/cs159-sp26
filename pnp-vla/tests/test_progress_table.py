@@ -44,6 +44,14 @@ def test_unknown_suite_has_no_historical_reference():
     assert "50% (1/2)" in table
 
 
+def test_historical_column_can_be_omitted_for_standard_libero():
+    table = format_progress_table(
+        {("libero_goal", Method.UNCERTAINTY): [4, 3]}, ARMS,
+        historical_sr=False)
+    assert "historical" not in table
+    assert "75% (3/4)" in table
+
+
 def test_every_collected_suite_has_a_historical_reference():
     """Otherwise the column is blank exactly where the sanity check is needed."""
     for suite in expanded_pro_suites():

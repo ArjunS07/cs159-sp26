@@ -223,26 +223,29 @@ _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
 
 
 def format_progress_table(tally, method_names, historical_sr=None) -> str:
-    """Running success rate per (suite, method), against the historical baseline.
+    """Running success rate per (suite, method), optionally against a historical baseline.
 
     `tally` maps (suite, method) -> [n_rollouts, n_successes]. Only the observed/no-op arm is
     comparable to the historical column: it is an RNG-isolated no-op, so its SR *is* the vanilla
     baseline, while the refine arm is the intervention.
     """
-    historical_sr = HISTORICAL_PRO_BASELINE_SR if historical_sr is None else historical_sr
+    show_historical = historical_sr is not False
+    historical_sr = (HISTORICAL_PRO_BASELINE_SR
+                     if historical_sr is None else historical_sr)
     labels = [(name, _METHOD_LABELS.get(name, name)) for name in method_names]
     lines = ["n = rollouts done in THIS shard, summed over the suite's tasks "
              "(not episodes per task)",
              f"{'suite':<32}" + "".join(f"{label:>16}" for _, label in labels)
-             + f"{'historical':>12}"]
+             + (f"{'historical':>12}" if show_historical else "")]
     for suite in sorted({key[0] for key in tally}):
         cells = ""
         for name, _ in labels:
             n, wins = tally.get((suite, name), (0, 0))
             cells += f"{'-':>16}" if not n else f"{f'{wins / n:.0%} ({wins}/{n})':>16}"
-        reference = historical_sr.get(suite)
-        lines.append(f"{suite:<32}{cells}"
-                     + (f"{'-':>12}" if reference is None else f"{reference:>11.0%} "))
+        if show_historical:
+            reference = historical_sr.get(suite)
+            cells += f"{'-':>12}" if reference is None else f"{reference:>11.0%} "
+        lines.append(f"{suite:<32}{cells}")
     return "\n".join(lines)
 
 
@@ -404,6 +407,7 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
         experiment=experiment, episodes=ablation, methods=full_methods,
         cohort="full_ablation", shard_count=shard_count, shard_index=shard_index,
+        report_every=25, historical_sr=False,
         run_metadata={"n_action_steps": LIBERO_ACTION_STEPS,
                       "generated_chunk_size": 50,
                       "skip_unused_renders": LIBERO_SKIP_RENDERS,
@@ -413,6 +417,7 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
         experiment=experiment, episodes=broad, methods=broad_methods,
         cohort="broad_validation", shard_count=shard_count, shard_index=shard_index,
+        report_every=25, historical_sr=False,
         run_metadata={"n_action_steps": LIBERO_ACTION_STEPS,
                       "generated_chunk_size": 50,
                       "skip_unused_renders": LIBERO_SKIP_RENDERS,
