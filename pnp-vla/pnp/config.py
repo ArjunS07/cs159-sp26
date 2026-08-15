@@ -81,6 +81,8 @@ class Method:
     EXTRA_STEPS = "extra_steps"
     UNCERTAINTY = "pnp_uncertainty_only"    # probe set, no action (RNG-isolated no-op)
     REFINEMENT = "pnp_refinement"           # refine; last vs avg = refine_average column
+    FRACTIONAL_M2 = "pnp_fractional_m2"     # fractional P&P, effective horizon m=2
+    FRACTIONAL_M4 = "pnp_fractional_m4"     # fractional P&P, effective horizon m=4
     THRESHOLD_REFINEMENT = "pnp_threshold_refinement"  # refine selected steps iff U >= threshold
     DELAYED_REFINEMENT = "pnp_delayed_refinement"  # refine every chunk from a fixed chunk index
     MULTI_SAMPLE = "multi_sample_select"
@@ -93,6 +95,7 @@ class Method:
 
 
 ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.REFINEMENT,
+               Method.FRACTIONAL_M2, Method.FRACTIONAL_M4,
                Method.THRESHOLD_REFINEMENT, Method.DELAYED_REFINEMENT,
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
                Method.CHUNK_SOURCE_M1,
@@ -129,6 +132,10 @@ class RolloutConfig:
     # ── (A) action — at most one of refine / correction_lambda / num_samples ──
     refine: bool = False                        # re-noise from the probe's clean estimate
     refine_average: bool = False                # refine from mean of K a_hats (True) vs last (False)
+    # Fractional P&P moves only m/(num_steps-step) of the way from the current state toward the
+    # ordinary full P&P state.  At a 10-step sampler this makes the effective perturbation scale
+    # m/10 at every selected Euler step while keeping the sampler at the same time index.
+    refine_horizon_m: Optional[int] = None
     refine_threshold: Optional[float] = None    # refine selected Euler step iff u_mean >= this
     refine_start_chunk: Optional[int] = None    # leave chunks [0, this) exact-stock; then refine
     correction_lambda: Optional[float] = None   # set => PCP correction action (0.0 == P&P, no grad)
@@ -176,6 +183,13 @@ class RolloutConfig:
             raise ValueError("num_samples carries ms_probe_steps; leave pnp_steps/pnp_time_min unset")
         if self.refine_average and not self.refine:
             raise ValueError("refine_average=True requires refine=True")
+        if self.refine_horizon_m is not None:
+            if not self.refine:
+                raise ValueError("refine_horizon_m requires refine=True")
+            if (isinstance(self.refine_horizon_m, bool)
+                    or int(self.refine_horizon_m) != self.refine_horizon_m
+                    or self.refine_horizon_m < 1):
+                raise ValueError("refine_horizon_m must be a positive integer")
         if self.refine_threshold is not None:
             if not self.refine:
                 raise ValueError("refine_threshold requires refine=True")
@@ -235,6 +249,8 @@ class RolloutConfig:
             logical.pop("refine_threshold")
         if logical.get("refine_start_chunk") is None:
             logical.pop("refine_start_chunk")
+        if logical.get("refine_horizon_m") is None:
+            logical.pop("refine_horizon_m")
         if logical.get("n_action_steps") is None:
             logical.pop("n_action_steps")
         return logical
@@ -242,7 +258,8 @@ class RolloutConfig:
 
 # Behavior-defining fields of RolloutConfig (see RolloutConfig.logical_dict).
 LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
-                  "refine", "refine_average", "refine_threshold", "refine_start_chunk",
+                  "refine", "refine_average", "refine_horizon_m", "refine_threshold",
+                  "refine_start_chunk",
                   "correction_lambda", "q_gate", "q_ckpt_id",
                   "num_samples", "ms_probe_steps", "candidate_set_id", "num_inference_steps",
                   "n_action_steps")

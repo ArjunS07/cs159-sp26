@@ -14,7 +14,7 @@ The sampler's strategy interface is unchanged, so only what BUILDS the tap lives
 from __future__ import annotations
 
 from .config import RolloutConfig
-from .pnp import run_probe, apply_refine, PnPRecorder
+from .pnp import run_probe, apply_refine, apply_fractional_refine, PnPRecorder
 from .pcp import apply_correct, CorrectTelemetry
 
 
@@ -100,6 +100,11 @@ class RolloutTap:
                 return x_t
             self._refine_applied += 1
             self._chunk_refine_applied += 1
+            if cfg.refine_horizon_m is not None:
+                return apply_fractional_refine(
+                    pr, x_t, cfg.refine_average,
+                    horizon_m=cfg.refine_horizon_m,
+                    num_steps=ctx.num_steps, step=ctx.step)
             return apply_refine(pr, cfg.refine_average)
         if self._correcting:
             return apply_correct(pr, ctx, cfg.correction_lambda, cfg.q_gate,

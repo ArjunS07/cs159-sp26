@@ -214,6 +214,8 @@ HISTORICAL_PRO_BASELINE_SR = {
 }
 
 _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
+                  Method.FRACTIONAL_M2: "fractional m=2",
+                  Method.FRACTIONAL_M4: "fractional m=4",
                   Method.THRESHOLD_REFINEMENT: "U-gated refine",
                   Method.DELAYED_REFINEMENT: "delayed refine",
                   Method.EXTRA_STEPS: "control",
@@ -257,7 +259,7 @@ def expanded_pro_suites():
 
 
 def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODES,
-                                          suites=None):
+                                          suites=None, episode_idxs=None):
     """Install the expanded-cohort PRO suites and build their episode manifest.
 
     Unlike the canonical path this asserts no fixed identity count: `_with_milk` suites ship 10
@@ -275,9 +277,18 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
             libero_pro.apply_env_patches(pro_dir=pro_dir)
             libero_pro.patch_torch_load()
             benchmark_dict = libero_pro.reload_benchmark()
+            selected_episode_idxs = (range(episodes_per_task) if episode_idxs is None
+                                     else tuple(episode_idxs))
+            if not selected_episode_idxs:
+                raise ValueError("episode_idxs must contain at least one index")
+            if any(isinstance(index, bool) or int(index) != index or index < 0
+                   for index in selected_episode_idxs):
+                raise ValueError("episode_idxs must contain non-negative integers")
+            if len(set(map(int, selected_episode_idxs))) != len(selected_episode_idxs):
+                raise ValueError("episode_idxs must be unique")
             episodes = libero_pro.build_libero_pro_episodes(
                 benchmark_dict, suites=suites,
-                episode_idxs=range(episodes_per_task))
+                episode_idxs=tuple(map(int, selected_episode_idxs)))
     finally:
         # Print even on failure: the states/task table and the alias/asset warnings are exactly
         # what diagnose a bad install, and they are worthless if an exception swallows them.
@@ -329,11 +340,7 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     )
     print(f"{cohort}: {len(episodes)} identities x {len(methods)} configs; "
           f"{pending}/{expected} pending")
-    refinement_schedules = [
-        config.pnp_steps for name, config in methods
-        if name in (Method.REFINEMENT, Method.THRESHOLD_REFINEMENT,
-                    Method.DELAYED_REFINEMENT)
-    ]
+    refinement_schedules = [config.pnp_steps for _, config in methods if config.refine]
     run_config = {"cohort": cohort, "schedules": refinement_schedules, "pnp_k": K,
                   "n_configs": len(methods), "shard_count": shard_count,
                   "shard_index": shard_index}

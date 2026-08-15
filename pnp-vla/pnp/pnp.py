@@ -168,6 +168,30 @@ def apply_refine(pr: ProbeResult, average: bool) -> torch.Tensor:
     return pr.x_acc
 
 
+def apply_fractional_refine(pr: ProbeResult, x_t: torch.Tensor, average: bool, *,
+                            horizon_m: int, num_steps: int, step: int) -> torch.Tensor:
+    """Move part-way toward ordinary P&P without changing the sampler time index.
+
+    Ordinary P&P at zero-based Euler ``step`` makes a full clean-predict/re-noise excursion whose
+    remaining horizon is ``num_steps - step``.  Scaling that update by
+    ``horizon_m / (num_steps - step)`` gives the same effective excursion ``horizon_m / num_steps``
+    at every selected step.  ``horizon_m == remaining`` is exactly ordinary full P&P.
+    """
+    if isinstance(horizon_m, bool) or int(horizon_m) != horizon_m or horizon_m < 1:
+        raise ValueError("horizon_m must be a positive integer")
+    if isinstance(num_steps, bool) or int(num_steps) != num_steps or num_steps < 1:
+        raise ValueError("num_steps must be a positive integer")
+    if isinstance(step, bool) or int(step) != step or not 0 <= step < num_steps:
+        raise ValueError("step must be a zero-based index within num_steps")
+    remaining = int(num_steps) - int(step)
+    if horizon_m > remaining:
+        raise ValueError(
+            f"horizon_m={horizon_m} exceeds remaining sampler horizon {remaining} at step {step}")
+    full = apply_refine(pr, average)
+    alpha = float(horizon_m) / remaining
+    return x_t + alpha * (full - x_t)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-episode uncertainty recorder.
 # ─────────────────────────────────────────────────────────────────────────────
