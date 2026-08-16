@@ -35,7 +35,7 @@ SOURCE_FRACTIONAL_SHORT_SUITES = (
     "libero_goal_with_milk", "libero_spatial_with_milk")
 SOURCE_SUFFIX_SENSITIVITY_EXPERIMENT = "pi05-source-suffix-sensitivity-v1"
 SOURCE_TAPERED_FULL_EXPERIMENT = "pi05-source-tapered-full-v1"
-SOURCE_PREFIX_STRENGTH_EXPERIMENT = "pi05-source-prefix-strength-v1"
+SOURCE_PREFIX_STRENGTH_EXPERIMENT = "pi05-source-prefix-strength-full-v1"
 SOURCE_MULTI_QUERY_EXPERIMENT = "pi05-source-multi-query-v1"
 DIVERSITY_PAIR_KEYS = ["suite", "task_idx", "episode_idx", "init_state_hash"]
 DIVERSITY_PREFIX_CHUNKS = (1, 2, 4, 8)
@@ -1082,25 +1082,21 @@ def build_source_prefix_strength_methods(inner_strength: float = 0.5):
 
 def run_source_prefix_strength_worker(
         *, shard_count: int = 2, shard_index: int = 0,
-        episode_indices=(10, 11), episode_limit: int | None = None,
+        episodes_per_task: int = 10, episode_limit: int | None = None,
         inner_strength: float = 0.5,
         manifest_hash: str = "", source_model_revision: str = "",
         experiment: str = SOURCE_PREFIX_STRENGTH_EXPERIMENT):
-    """Compare prefix-only P&P with a smaller full-chunk inner P&P excursion."""
+    """Compare prefix-only and reduced-strength P&P on all 1,300 main identities."""
     from . import models
+    from .config import Method, RolloutConfig
     from .experiments import (_prepare_libero_pro_expanded_episodes, _run_collection,
-                              expanded_pro_suites, identity_shard)
+                              identity_shard)
     from .store import SupabaseStore, gather_provenance
 
-    episode_indices = tuple(episode_indices)
-    if not episode_indices:
-        raise ValueError("episode_indices must contain at least one index")
-    if any(isinstance(index, bool) or int(index) != index or index < 0
-           for index in episode_indices):
-        raise ValueError("episode_indices must contain non-negative integers")
-    episode_indices = tuple(map(int, episode_indices))
-    if len(set(episode_indices)) != len(episode_indices):
-        raise ValueError("episode_indices must be unique")
+    if (isinstance(episodes_per_task, bool)
+            or int(episodes_per_task) != episodes_per_task
+            or episodes_per_task != 10):
+        raise ValueError("the fixed full cohort requires episodes_per_task=10")
     if not manifest_hash:
         raise ValueError("manifest_hash is required; load the shared v2 Drive manifest")
     if not source_model_revision:
@@ -1112,27 +1108,62 @@ def run_source_prefix_strength_worker(
     store = SupabaseStore()
     source_repo, source_revision = source_checkpoint_model_source(
         store, expected_revision=source_model_revision)
-    pilot_suites = [
-        suite for suite in expanded_pro_suites()
-        if suite not in SOURCE_FRACTIONAL_SHORT_SUITES]
-    if len(pilot_suites) != 11:
-        raise ValueError(
-            f"expected 11 suites with init indices 10 and 11; found {len(pilot_suites)}")
-    manifest = _prepare_libero_pro_expanded_episodes(
-        suites=pilot_suites, episode_idxs=episode_indices)
-    expected_identities = len(pilot_suites) * 10 * len(episode_indices)
+    manifest = _prepare_libero_pro_expanded_episodes(episodes_per_task=10)
+    expected_identities = 13 * 10 * 10
     if len(manifest) != expected_identities:
         raise ValueError(
-            f"expected {expected_identities} identities for {len(pilot_suites)} suites x "
-            f"10 tasks x {len(episode_indices)} init indices, found {len(manifest)}")
-    if {int(ep["ep_idx"]) for ep in manifest} != set(episode_indices):
-        raise ValueError("prefix/strength manifest contains unexpected episode indices")
+            f"expected {expected_identities} identities for 13 suites x 10 tasks x "
+            f"10 initializations, found {len(manifest)}")
+    manifest_identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in manifest}
     episodes = identity_shard(manifest, shard_count, shard_index)
     if episode_limit is not None:
         if (isinstance(episode_limit, bool) or int(episode_limit) != episode_limit
                 or episode_limit < 1):
             raise ValueError("episode_limit must be a positive integer or None")
         episodes = episodes[:int(episode_limit)]
+
+    # The corrected 10-action source run shares an experiment with old 20-action rows. Select
+    # both references by behavior-derived hashes, then require complete exact identity coverage.
+    historical_configs = {
+        Method.UNCERTAINTY: RolloutConfig(
+            pnp_steps=(3, 4), pnp_k=5, refine=False, refine_average=False,
+            n_action_steps=10),
+        Method.REFINEMENT: RolloutConfig(
+            pnp_steps=(3, 4), pnp_k=5, refine=True, refine_average=False,
+            n_action_steps=10),
+    }
+    historical_hashes = {
+        method: store.config_hash(store._logical_key(method, config))
+        for method, config in historical_configs.items()}
+    historical_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", SOURCE_ACTION_HORIZON_EXPERIMENT).in_(
+            "method", list(historical_configs)), order_by=("rollout_id",)))
+    references = {}
+    reference_labels = {
+        Method.REFINEMENT: "historical full PnP",
+        Method.UNCERTAINTY: "historical unrefined",
+    }
+    for method in (Method.REFINEMENT, Method.UNCERTAINTY):
+        if historical_rows.empty:
+            frame = historical_rows
+        else:
+            frame = historical_rows[
+                historical_rows.method.eq(method)
+                & historical_rows.config_hash.eq(historical_hashes[method])
+                & historical_rows.status.eq("completed")
+                & historical_rows[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(
+                    manifest_identities)].copy()
+        if frame.duplicated(DIVERSITY_PAIR_KEYS).any():
+            raise ValueError(f"duplicate exact historical {method} identities")
+        if len(frame) != expected_identities:
+            raise ValueError(
+                f"expected {expected_identities} exact historical 10-action {method} rows in "
+                f"{SOURCE_ACTION_HORIZON_EXPERIMENT}, found {len(frame)}")
+        references[reference_labels[method]] = (
+            frame.groupby("suite").success.mean().astype(float).to_dict())
 
     methods = build_source_prefix_strength_methods(inner_strength=inner_strength)
     shard_identities = {
@@ -1158,8 +1189,7 @@ def run_source_prefix_strength_worker(
     print({
         "experiment": experiment,
         "source": f"{source_repo}@{source_revision}",
-        "cohort": "11 suites x 10 tasks x held-out init indices 10,11",
-        "excluded_short_asset_suites": list(SOURCE_FRACTIONAL_SHORT_SUITES),
+        "cohort": "13 suites x 10 tasks x init indices 0..9",
         "target_identities": len(manifest),
         "identities_in_shard": len(episodes),
         "rollouts_in_shard": len(episodes) * len(methods),
@@ -1167,8 +1197,11 @@ def run_source_prefix_strength_worker(
         "probe": "K=5 at zero-based Euler steps (3,4); refine-last",
         "prefix_only": "inner P&P updates positions [0:10] only",
         "reduced_strength": f"full-chunk inner P&P proposal scale beta={inner_strength}",
+        "historical_comparators": [
+            f"{SOURCE_ACTION_HORIZON_EXPERIMENT}/{Method.REFINEMENT}/n_action_steps=10",
+            f"{SOURCE_ACTION_HORIZON_EXPERIMENT}/{Method.UNCERTAINTY}/n_action_steps=10"],
     })
-    print("Periodic output: paired SR plus U10/U20/Ufull means for both arms.")
+    print("Periodic output: both live arms, historical full PnP/unrefined, and U means.")
 
     policy, preprocess, postprocess = models.load_pi05(
         repo_id=source_repo, revision=source_revision)
@@ -1185,16 +1218,16 @@ def run_source_prefix_strength_worker(
         run_metadata={
             "source_model_repo_id": source_repo, "source_model_revision": source_revision,
             "bootstrap_manifest_hash": manifest_hash,
-            "suites": pilot_suites,
-            "excluded_short_asset_suites": list(SOURCE_FRACTIONAL_SHORT_SUITES),
-            "episode_indices": list(episode_indices), "target_identities": len(manifest),
+            "suites": sorted({ep["suite"] for ep in manifest}),
+            "episode_indices": list(range(10)), "target_identities": len(manifest),
             "pnp_k": 5, "pnp_steps": [3, 4], "refine_average": False,
             "n_action_steps": 10, "inner_strength": float(inner_strength),
+            "historical_experiment": SOURCE_ACTION_HORIZON_EXPERIMENT,
             "requested_methods": [method for method, _ in methods]},
         provenance=gather_provenance(
             model_repo_id=source_repo, model_revision=source_revision),
         # Ten complete two-arm identities per periodic report.
-        report_every=20, initial_tally=initial_tally, historical_sr=False)
+        report_every=20, initial_tally=initial_tally, historical_sr=references)
 
 
 def run_source_tapered_full_worker(

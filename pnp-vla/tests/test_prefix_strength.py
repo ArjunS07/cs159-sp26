@@ -78,7 +78,7 @@ def test_prefix_strength_pilot_has_two_unique_paired_configs():
     assert [config.save_time_uncertainty for _, config in methods] == [True, True]
 
 
-def test_prefix_strength_workers_are_two_fixed_shards():
+def test_prefix_strength_workers_are_two_full_cohort_shards():
     for shard_index in range(2):
         path = ROOT / "notebooks" / "workers" / (
             f"38_source_prefix_strength_worker_{shard_index}.ipynb")
@@ -86,8 +86,11 @@ def test_prefix_strength_workers_are_two_fixed_shards():
         source = "\n".join(
             "".join(cell.get("source", [])) for cell in notebook["cells"])
         assert "run_source_prefix_strength_worker(" in source
-        assert "EPISODE_INDICES = (10, 11)" in source
+        assert "EPISODES_PER_TASK = 10" in source
         assert "INNER_STRENGTH = 0.5" in source
         assert "SHARD_COUNT = 2" in source
         assert f"SHARD_INDEX = {shard_index}" in source
+        assert "full_cohort_identities': 1300" in source
+        assert "rollouts_in_this_shard': 1300" in source
+        assert "episodes_per_task=EPISODES_PER_TASK" in source
         assert "source_model_revision=SOURCE_MODEL_REVISION" in source
