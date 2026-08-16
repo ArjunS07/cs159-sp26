@@ -85,6 +85,8 @@ class Method:
     FRACTIONAL_M4 = "pnp_fractional_m4"     # fractional P&P, effective horizon m=4
     SUFFIX_SENSITIVITY = "pnp_suffix_sensitivity"  # stock action + tail-to-prefix diagnostic
     TAPERED_REFINEMENT = "pnp_tapered_refinement"  # temporal P&P feedback decays in the tail
+    PREFIX_REFINEMENT = "pnp_prefix_only_refinement"  # inner P&P updates executed positions only
+    REDUCED_STRENGTH_REFINEMENT = "pnp_reduced_strength_refinement"  # smaller inner P&P moves
     THRESHOLD_REFINEMENT = "pnp_threshold_refinement"  # refine selected steps iff U >= threshold
     DELAYED_REFINEMENT = "pnp_delayed_refinement"  # refine every chunk from a fixed chunk index
     MULTI_SAMPLE = "multi_sample_select"
@@ -99,6 +101,7 @@ class Method:
 ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.REFINEMENT,
                Method.FRACTIONAL_M2, Method.FRACTIONAL_M4,
                Method.SUFFIX_SENSITIVITY, Method.TAPERED_REFINEMENT,
+               Method.PREFIX_REFINEMENT, Method.REDUCED_STRENGTH_REFINEMENT,
                Method.THRESHOLD_REFINEMENT, Method.DELAYED_REFINEMENT,
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
                Method.CHUNK_SOURCE_M1,
@@ -146,6 +149,11 @@ class RolloutConfig:
     # Full P&P feedback through n_action_steps, then a linear decay to zero at this action index.
     # Applied inside every P&P iteration, not merely to the final sampler state.
     refine_tail_decay_end: Optional[int] = None
+    # Update only the generated positions that will actually execute during each inner P&P loop.
+    refine_prefix_only: bool = False
+    # Scale every inner predict/perturb proposal toward its destination. Unlike
+    # refine_horizon_m, this changes the intermediate states seen by all K velocity evaluations.
+    refine_inner_strength: Optional[float] = None
     correction_lambda: Optional[float] = None   # set => PCP correction action (0.0 == P&P, no grad)
     q_gate: float = 0.5                         # only correct chunks with predicted P(success) < gate
     q_ckpt_id: Optional[str] = None
@@ -234,6 +242,24 @@ class RolloutConfig:
                     or int(self.refine_tail_decay_end) != self.refine_tail_decay_end
                     or self.refine_tail_decay_end <= self.n_action_steps):
                 raise ValueError("refine_tail_decay_end must be an integer above n_action_steps")
+        if self.refine_prefix_only:
+            if not self.refine or self.n_action_steps is None:
+                raise ValueError(
+                    "refine_prefix_only requires refine=True and explicit n_action_steps")
+            if self.refine_average:
+                raise ValueError("refine_prefix_only currently requires refine_average=False")
+            if self.refine_tail_decay_end is not None:
+                raise ValueError(
+                    "refine_prefix_only and refine_tail_decay_end are mutually exclusive")
+        if self.refine_inner_strength is not None:
+            if not self.refine:
+                raise ValueError("refine_inner_strength requires refine=True")
+            if self.refine_average:
+                raise ValueError(
+                    "refine_inner_strength currently requires refine_average=False")
+            if (not math.isfinite(float(self.refine_inner_strength))
+                    or not 0 < float(self.refine_inner_strength) <= 1):
+                raise ValueError("refine_inner_strength must lie in (0, 1]")
         # Probe-derived sinks need a probe.
         for sink in ("save_pcp_features", "save_ahats", "save_time_uncertainty"):
             if getattr(self, sink) and not self.has_probe:
@@ -297,6 +323,10 @@ class RolloutConfig:
             logical.pop("refine_horizon_m")
         if logical.get("refine_tail_decay_end") is None:
             logical.pop("refine_tail_decay_end")
+        if not logical.get("refine_prefix_only"):
+            logical.pop("refine_prefix_only")
+        if logical.get("refine_inner_strength") is None:
+            logical.pop("refine_inner_strength")
         if logical.get("n_action_steps") is None:
             logical.pop("n_action_steps")
         if not logical.get("suffix_probe_samples"):
@@ -308,6 +338,7 @@ class RolloutConfig:
 LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "refine", "refine_average", "refine_horizon_m", "refine_threshold",
                   "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
+                  "refine_prefix_only", "refine_inner_strength",
                   "correction_lambda", "q_gate", "q_ckpt_id",
                   "num_samples", "ms_probe_steps", "candidate_set_id", "num_inference_steps",
                   "n_action_steps", "suffix_probe_samples")

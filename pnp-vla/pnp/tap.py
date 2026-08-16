@@ -13,9 +13,11 @@ The sampler's strategy interface is unchanged, so only what BUILDS the tap lives
 """
 from __future__ import annotations
 
+import torch
+
 from .config import RolloutConfig
 from .pnp import (run_probe, apply_refine, apply_fractional_refine, PnPRecorder,
-                  temporal_decay_weights)
+                  temporal_decay_weights, temporal_prefix_weights)
 from .pcp import apply_correct, CorrectTelemetry
 
 
@@ -70,10 +72,19 @@ class RolloutTap:
     def step(self, x_t, s, vf, ctx):
         cfg = self.config
         temporal_weights = None
-        if cfg.refine_tail_decay_end is not None:
+        if cfg.refine_prefix_only:
+            temporal_weights = temporal_prefix_weights(
+                x_t.shape[-2], int(cfg.n_action_steps),
+                device=x_t.device, dtype=x_t.dtype)
+        elif cfg.refine_tail_decay_end is not None:
             temporal_weights = temporal_decay_weights(
                 x_t.shape[-2], int(cfg.n_action_steps), int(cfg.refine_tail_decay_end),
                 device=x_t.device, dtype=x_t.dtype)
+        if cfg.refine_inner_strength is not None:
+            strength = float(cfg.refine_inner_strength)
+            temporal_weights = (
+                torch.full((x_t.shape[-2],), strength, device=x_t.device, dtype=x_t.dtype)
+                if temporal_weights is None else temporal_weights * strength)
         pr = run_probe(x_t, s, vf, k=cfg.pnp_k, adim=cfg.action_dim,
                        compute_multimodal=cfg.compute_multimodal,
                        suffix_probe_samples=cfg.suffix_probe_samples,

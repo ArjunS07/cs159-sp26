@@ -108,6 +108,15 @@ def temporal_decay_weights(length: int, prefix: int, decay_end: int, *, device, 
     return weights.clamp_(0.0, 1.0)
 
 
+def temporal_prefix_weights(length: int, prefix: int, *, device, dtype):
+    """One on the executed prefix and zero on every discarded action position."""
+    if not 0 < int(prefix) < int(length):
+        raise ValueError("expected 0 < prefix < action-chunk length")
+    weights = torch.zeros(int(length), device=device, dtype=dtype)
+    weights[:int(prefix)] = 1.0
+    return weights
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The shared K predict-and-perturb block — the PROBE (pure measurement).
 # ─────────────────────────────────────────────────────────────────────────────
