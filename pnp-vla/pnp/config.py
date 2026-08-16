@@ -83,6 +83,8 @@ class Method:
     REFINEMENT = "pnp_refinement"           # refine; last vs avg = refine_average column
     FRACTIONAL_M2 = "pnp_fractional_m2"     # fractional P&P, effective horizon m=2
     FRACTIONAL_M4 = "pnp_fractional_m4"     # fractional P&P, effective horizon m=4
+    SUFFIX_SENSITIVITY = "pnp_suffix_sensitivity"  # stock action + tail-to-prefix diagnostic
+    TAPERED_REFINEMENT = "pnp_tapered_refinement"  # temporal P&P feedback decays in the tail
     THRESHOLD_REFINEMENT = "pnp_threshold_refinement"  # refine selected steps iff U >= threshold
     DELAYED_REFINEMENT = "pnp_delayed_refinement"  # refine every chunk from a fixed chunk index
     MULTI_SAMPLE = "multi_sample_select"
@@ -96,6 +98,7 @@ class Method:
 
 ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.REFINEMENT,
                Method.FRACTIONAL_M2, Method.FRACTIONAL_M4,
+               Method.SUFFIX_SENSITIVITY, Method.TAPERED_REFINEMENT,
                Method.THRESHOLD_REFINEMENT, Method.DELAYED_REFINEMENT,
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
                Method.CHUNK_SOURCE_M1,
@@ -137,7 +140,12 @@ class RolloutConfig:
     # m/10 at every selected Euler step while keeping the sampler at the same time index.
     refine_horizon_m: Optional[int] = None
     refine_threshold: Optional[float] = None    # refine selected Euler step iff u_mean >= this
+    # None gates on full-chunk uncertainty; an integer gates on that many leading actions.
+    refine_uncertainty_horizon: Optional[int] = None
     refine_start_chunk: Optional[int] = None    # leave chunks [0, this) exact-stock; then refine
+    # Full P&P feedback through n_action_steps, then a linear decay to zero at this action index.
+    # Applied inside every P&P iteration, not merely to the final sampler state.
+    refine_tail_decay_end: Optional[int] = None
     correction_lambda: Optional[float] = None   # set => PCP correction action (0.0 == P&P, no grad)
     q_gate: float = 0.5                         # only correct chunks with predicted P(success) < gate
     q_ckpt_id: Optional[str] = None
@@ -154,9 +162,15 @@ class RolloutConfig:
     save_uncertainty: Optional[bool] = None     # default: on iff a probe is set
     save_pcp_features: bool = False             # per-chunk obs_enc + z_hat -> Storage (training)
     save_ahats: bool = False                    # full K a_hats stacks -> Storage (geometry)
+    # Per-action uncertainty profile; uses the existing ahats_path artifact without storing
+    # the much larger K x chunk x action a-hat stack.
+    save_time_uncertainty: bool = False
     save_observations: bool = False             # low-res decision-point frames -> Storage
     save_trajectory: bool = True                # executed actions + robot state -> Storage (cheap)
     save_generated_chunks: bool = False         # exact policy-space clean chunks at t=1
+    # Measurement-only diagnostic: independently re-noise the unused suffix while preserving
+    # the executed-prefix latent, then record how the prefix prediction changes.
+    suffix_probe_samples: int = 0
     video: str = "off"                          # "off" | "failures_only" | "all"
     # ── performance (must not change the trajectory; excluded from LOGICAL_FIELDS) ──
     # Render the cameras only on steps whose observation the policy actually consumes (chunk
@@ -195,6 +209,14 @@ class RolloutConfig:
                 raise ValueError("refine_threshold requires refine=True")
             if not math.isfinite(float(self.refine_threshold)) or self.refine_threshold < 0:
                 raise ValueError("refine_threshold must be finite and non-negative")
+        if self.refine_uncertainty_horizon is not None:
+            if not self.refine or self.refine_threshold is None:
+                raise ValueError(
+                    "refine_uncertainty_horizon requires thresholded refinement")
+            if (isinstance(self.refine_uncertainty_horizon, bool)
+                    or int(self.refine_uncertainty_horizon) != self.refine_uncertainty_horizon
+                    or self.refine_uncertainty_horizon < 1):
+                raise ValueError("refine_uncertainty_horizon must be a positive integer")
         if self.refine_start_chunk is not None:
             if not self.refine:
                 raise ValueError("refine_start_chunk requires refine=True")
@@ -202,8 +224,18 @@ class RolloutConfig:
                     or int(self.refine_start_chunk) != self.refine_start_chunk
                     or self.refine_start_chunk < 0):
                 raise ValueError("refine_start_chunk must be a non-negative integer")
+        if self.refine_tail_decay_end is not None:
+            if not self.refine or self.n_action_steps is None:
+                raise ValueError(
+                    "refine_tail_decay_end requires refine=True and explicit n_action_steps")
+            if self.refine_average:
+                raise ValueError("refine_tail_decay_end currently requires refine_average=False")
+            if (isinstance(self.refine_tail_decay_end, bool)
+                    or int(self.refine_tail_decay_end) != self.refine_tail_decay_end
+                    or self.refine_tail_decay_end <= self.n_action_steps):
+                raise ValueError("refine_tail_decay_end must be an integer above n_action_steps")
         # Probe-derived sinks need a probe.
-        for sink in ("save_pcp_features", "save_ahats"):
+        for sink in ("save_pcp_features", "save_ahats", "save_time_uncertainty"):
             if getattr(self, sink) and not self.has_probe:
                 raise ValueError(f"{sink} requires a probe (its data comes from the probe)")
         if self.save_uncertainty and not self.has_probe:
@@ -215,6 +247,16 @@ class RolloutConfig:
                     or int(self.n_action_steps) != self.n_action_steps
                     or self.n_action_steps < 1):
                 raise ValueError("n_action_steps must be a positive integer")
+        if (isinstance(self.suffix_probe_samples, bool)
+                or int(self.suffix_probe_samples) != self.suffix_probe_samples
+                or self.suffix_probe_samples < 0):
+            raise ValueError("suffix_probe_samples must be a non-negative integer")
+        if self.suffix_probe_samples:
+            if not self.has_probe:
+                raise ValueError("suffix_probe_samples requires a P&P probe")
+            if self.n_action_steps is None:
+                raise ValueError(
+                    "suffix_probe_samples requires explicit n_action_steps as the prefix boundary")
 
     @property
     def has_probe(self) -> bool:
@@ -247,22 +289,28 @@ class RolloutConfig:
             logical.pop("candidate_set_id")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
+        if logical.get("refine_uncertainty_horizon") is None:
+            logical.pop("refine_uncertainty_horizon")
         if logical.get("refine_start_chunk") is None:
             logical.pop("refine_start_chunk")
         if logical.get("refine_horizon_m") is None:
             logical.pop("refine_horizon_m")
+        if logical.get("refine_tail_decay_end") is None:
+            logical.pop("refine_tail_decay_end")
         if logical.get("n_action_steps") is None:
             logical.pop("n_action_steps")
+        if not logical.get("suffix_probe_samples"):
+            logical.pop("suffix_probe_samples")
         return logical
 
 
 # Behavior-defining fields of RolloutConfig (see RolloutConfig.logical_dict).
 LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "refine", "refine_average", "refine_horizon_m", "refine_threshold",
-                  "refine_start_chunk",
+                  "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
                   "correction_lambda", "q_gate", "q_ckpt_id",
                   "num_samples", "ms_probe_steps", "candidate_set_id", "num_inference_steps",
-                  "n_action_steps")
+                  "n_action_steps", "suffix_probe_samples")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

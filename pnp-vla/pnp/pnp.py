@@ -26,7 +26,9 @@ from .config import PERTURB_SEED_MASK, ADIM
 # Isolated perturbation generators (never advance the global / noise RNG).
 # ─────────────────────────────────────────────────────────────────────────────
 _PNP_GENS: dict[str, torch.Generator] = {}
+_DIAGNOSTIC_GENS: dict[str, torch.Generator] = {}
 _PNP_LAST_SEED = [0]
+_DIAGNOSTIC_SEED_MASK = 0xD1A69057
 
 
 def _pnp_gen(device) -> torch.Generator:
@@ -39,6 +41,17 @@ def _pnp_gen(device) -> torch.Generator:
     return g
 
 
+def _diagnostic_gen(device) -> torch.Generator:
+    """Independent stream so suffix diagnostics never change the established P&P sequence."""
+    key = str(device)
+    g = _DIAGNOSTIC_GENS.get(key)
+    if g is None:
+        g = torch.Generator(device=torch.device(device))
+        g.manual_seed(int(_PNP_LAST_SEED[0]) ^ _DIAGNOSTIC_SEED_MASK)
+        _DIAGNOSTIC_GENS[key] = g
+    return g
+
+
 def _pnp_seed_perturb(seed: int) -> None:
     """Seed the dedicated perturbation stream (independent of the global RNG).
 
@@ -47,6 +60,8 @@ def _pnp_seed_perturb(seed: int) -> None:
     _PNP_LAST_SEED[0] = int(seed)
     for g in _PNP_GENS.values():
         g.manual_seed(int(seed) ^ PERTURB_SEED_MASK)
+    for g in _DIAGNOSTIC_GENS.values():
+        g.manual_seed(int(seed) ^ _DIAGNOSTIC_SEED_MASK)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +99,15 @@ def _multimodal_stats(A0: np.ndarray):
     return bc_vec, pc1_frac, bc_pc1
 
 
+def temporal_decay_weights(length: int, prefix: int, decay_end: int, *, device, dtype):
+    """One through the executed prefix, linear decay through the near tail, then zero."""
+    if not 0 < int(prefix) < int(decay_end) <= int(length):
+        raise ValueError("expected 0 < prefix < decay_end <= action-chunk length")
+    positions = torch.arange(int(length), device=device, dtype=dtype)
+    weights = (float(decay_end) - positions) / float(decay_end - prefix)
+    return weights.clamp_(0.0, 1.0)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The shared K predict-and-perturb block — the PROBE (pure measurement).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,12 +122,15 @@ class ProbeResult:
     z_hat_full: torch.Tensor  # (B, chunk, max_adim) — mean of the K FULL-width clean estimates
     x_acc: torch.Tensor       # re-noised state after the LAST iteration (full width)
     last_eps: torch.Tensor    # the last iteration's perturbation noise (for refine-average)
+    u_time: torch.Tensor      # (chunk,) disagreement, averaged over K-pairs/batch/action dims
     s: float
     rec: dict                 # uncertainty record (u_mean/u_max/u_vec/a_std_vec/... + multimodal)
 
 
 def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
-              compute_multimodal: bool = False) -> ProbeResult:
+              compute_multimodal: bool = False, suffix_probe_samples: int = 0,
+              prefix_horizon: int | None = None,
+              temporal_update_weights: torch.Tensor | None = None) -> ProbeResult:
     """Run K predict-and-perturb iterations at fixed noise level s and measure uncertainty.
 
         predict:  a_hat = x - s * v(x, s)
@@ -111,6 +138,21 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
 
     Pure: no global state touched (perturbation noise comes from the dedicated generator).
     """
+    if temporal_update_weights is not None:
+        temporal_update_weights = torch.as_tensor(
+            temporal_update_weights, device=x_t.device, dtype=x_t.dtype)
+        if temporal_update_weights.ndim != 1 or len(temporal_update_weights) != x_t.shape[-2]:
+            raise ValueError("temporal_update_weights must contain one value per action position")
+        if not bool(((temporal_update_weights >= 0) & (temporal_update_weights <= 1)).all()):
+            raise ValueError("temporal_update_weights must lie in [0, 1]")
+        temporal_update_weights = temporal_update_weights.view(1, -1, 1)
+    if suffix_probe_samples:
+        if prefix_horizon is None or not 0 < int(prefix_horizon) < x_t.shape[-2]:
+            raise ValueError("suffix diagnostics require a prefix inside the generated chunk")
+        if isinstance(suffix_probe_samples, bool) or int(suffix_probe_samples) < 1:
+            raise ValueError("suffix_probe_samples must be a positive integer")
+
+    original_x = x_t
     x_acc = x_t
     a_hats, a_hats_full = [], []
     last_eps = None
@@ -121,7 +163,9 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         a_hats.append(a_hat[..., :adim])
         a_hats_full.append(a_hat)
         last_eps = torch.empty_like(x_acc).normal_(generator=gen)   # dedicated stream, not global
-        x_acc = (1.0 - s) * a_hat + s * last_eps
+        proposal = (1.0 - s) * a_hat + s * last_eps
+        x_acc = (proposal if temporal_update_weights is None else
+                 x_acc + temporal_update_weights * (proposal - x_acc))
 
     A = torch.stack(a_hats, dim=0)                     # (K, B, chunk, adim)
     z_hat_full = torch.stack(a_hats_full, dim=0).mean(dim=0)   # (B, chunk, max_adim)
@@ -132,6 +176,7 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
     else:
         d_consecutive = torch.zeros_like(A[:1])
         u_consecutive = torch.zeros_like(A[0]); a_std = torch.zeros_like(A[0])
+    u_time = u_consecutive.mean(dim=(0, 2))
 
     rec = {
         "s": float(s),
@@ -141,6 +186,7 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         "u_vec": u_consecutive.mean(dim=(0, 1)).detach().float().cpu().numpy(),
         "a_std_vec": a_std.mean(dim=(0, 1)).detach().float().cpu().numpy(),
         "a_mean_vec": A.mean(dim=(0, 1, 2)).detach().float().cpu().numpy(),
+        "u_time": u_time.detach().float().cpu().numpy(),
         # Per-ITERATION disagreement, i.e. |a_hat_{i+1} - a_hat_i| for i in 0..K-2, kept instead
         # of collapsed into u_mean. This is what makes "does disagreement DECAY across the K
         # perturbations?" answerable; u_mean/u_vec average that axis away. ~112 bytes per probed
@@ -148,13 +194,46 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         "u_iter": d_consecutive.mean(dim=(1, 2, 3)).detach().float().cpu().numpy(),
         "u_iter_vec": d_consecutive.mean(dim=(1, 2)).detach().float().cpu().numpy(),
     }
+    for horizon in (10, 20):
+        if horizon <= len(u_time):
+            rec[f"u_prefix_{horizon}"] = float(u_time[:horizon].mean())
+
+    if suffix_probe_samples:
+        boundary = int(prefix_horizon)
+        reference = a_hats_full[0][..., :boundary, :adim]
+        suffix_predictions = []
+        diagnostic_gen = _diagnostic_gen(original_x.device)
+        for _ in range(int(suffix_probe_samples)):
+            eps = torch.empty_like(original_x).normal_(generator=diagnostic_gen)
+            variant = original_x.clone()
+            variant[..., boundary:, :] = (
+                (1.0 - s) * a_hats_full[0][..., boundary:, :]
+                + s * eps[..., boundary:, :])
+            variant_clean = variant - s * vfield(variant)
+            suffix_predictions.append(variant_clean[..., :boundary, :adim])
+        suffix_predictions = torch.stack(suffix_predictions)
+        delta = suffix_predictions - reference.unsqueeze(0)
+        candidate_stack = torch.cat([reference.unsqueeze(0), suffix_predictions], dim=0)
+        rec.update({
+            "suffix_prefix_horizon": boundary,
+            "suffix_probe_samples": int(suffix_probe_samples),
+            "suffix_prefix_abs_mean": float(delta.abs().mean()),
+            "suffix_prefix_l2_mean": float(torch.linalg.vector_norm(delta, dim=-1).mean()),
+            "suffix_prefix_std_mean": float(candidate_stack.std(dim=0).mean()),
+            "suffix_prefix_gripper_flip_rate": float(
+                (torch.sign(suffix_predictions[..., 6])
+                 != torch.sign(reference[..., 6]).unsqueeze(0)).float().mean())
+                if adim > 6 else float("nan"),
+            "suffix_prefix_predictions": suffix_predictions.detach().float().cpu().numpy(),
+            "suffix_prefix_reference": reference.detach().float().cpu().numpy(),
+        })
     if compute_multimodal and A.shape[0] >= 4:
         bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(A.detach().float().cpu().numpy()[:, 0])
         rec["bc_vec"] = bc_vec
         rec["mm_pc1_frac"] = float(pc1_frac)
         rec["mm_bc_pc1"] = float(bc_pc1)
     return ProbeResult(a_hats=A, z_hat_full=z_hat_full, x_acc=x_acc,
-                       last_eps=last_eps, s=float(s), rec=rec)
+                       last_eps=last_eps, u_time=u_time, s=float(s), rec=rec)
 
 
 def apply_refine(pr: ProbeResult, average: bool) -> torch.Tensor:
@@ -190,6 +269,28 @@ def apply_fractional_refine(pr: ProbeResult, x_t: torch.Tensor, average: bool, *
     full = apply_refine(pr, average)
     alpha = float(horizon_m) / remaining
     return x_t + alpha * (full - x_t)
+
+
+def summarize_probe_diagnostics(rec_ep: dict | None) -> dict:
+    """Episode means used only for readable worker progress; full data stays in the artifact."""
+    steps = [step for chunk in (rec_ep or {}).get("chunks", [])
+             for step in chunk.get("steps", [])]
+    mapping = {
+        "u_first10": "u_prefix_10",
+        "u_first20": "u_prefix_20",
+        "u_full": "u_mean",
+        "suffix_to_prefix_l2": "suffix_prefix_l2_mean",
+        "suffix_to_prefix_abs": "suffix_prefix_abs_mean",
+        "suffix_to_prefix_std": "suffix_prefix_std_mean",
+        "suffix_gripper_flip": "suffix_prefix_gripper_flip_rate",
+    }
+    summary = {}
+    for output, source in mapping.items():
+        values = [float(step[source]) for step in steps
+                  if step.get(source) is not None and np.isfinite(step[source])]
+        if values:
+            summary[output] = float(np.mean(values))
+    return summary
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -14,7 +14,8 @@ The sampler's strategy interface is unchanged, so only what BUILDS the tap lives
 from __future__ import annotations
 
 from .config import RolloutConfig
-from .pnp import run_probe, apply_refine, apply_fractional_refine, PnPRecorder
+from .pnp import (run_probe, apply_refine, apply_fractional_refine, PnPRecorder,
+                  temporal_decay_weights)
 from .pcp import apply_correct, CorrectTelemetry
 
 
@@ -68,8 +69,16 @@ class RolloutTap:
 
     def step(self, x_t, s, vf, ctx):
         cfg = self.config
+        temporal_weights = None
+        if cfg.refine_tail_decay_end is not None:
+            temporal_weights = temporal_decay_weights(
+                x_t.shape[-2], int(cfg.n_action_steps), int(cfg.refine_tail_decay_end),
+                device=x_t.device, dtype=x_t.dtype)
         pr = run_probe(x_t, s, vf, k=cfg.pnp_k, adim=cfg.action_dim,
-                       compute_multimodal=cfg.compute_multimodal)
+                       compute_multimodal=cfg.compute_multimodal,
+                       suffix_probe_samples=cfg.suffix_probe_samples,
+                       prefix_horizon=(cfg.n_action_steps if cfg.suffix_probe_samples else None),
+                       temporal_update_weights=temporal_weights)
 
         # sink: per-step uncertainty (+ optional a_hats geometry stack)
         if self.records_uncertainty or cfg.compute_multimodal:
@@ -95,9 +104,17 @@ class RolloutTap:
                     and self._chunk_idx < cfg.refine_start_chunk):
                 return x_t
             self._refine_considered += 1
-            if (cfg.refine_threshold is not None
-                    and float(pr.rec["u_mean"]) < float(cfg.refine_threshold)):
-                return x_t
+            if cfg.refine_threshold is not None:
+                gate_score = float(pr.rec["u_mean"])
+                if cfg.refine_uncertainty_horizon is not None:
+                    horizon = int(cfg.refine_uncertainty_horizon)
+                    if horizon > len(pr.u_time):
+                        raise ValueError(
+                            f"refine_uncertainty_horizon={horizon} exceeds chunk length "
+                            f"{len(pr.u_time)}")
+                    gate_score = float(pr.u_time[:horizon].mean())
+                if gate_score < float(cfg.refine_threshold):
+                    return x_t
             self._refine_applied += 1
             self._chunk_refine_applied += 1
             if cfg.refine_horizon_m is not None:

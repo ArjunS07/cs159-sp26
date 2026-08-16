@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import io
+import math
 
 from .config import Method, RolloutConfig
 from .store import SupabaseStore
@@ -216,6 +217,8 @@ HISTORICAL_PRO_BASELINE_SR = {
 _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
                   Method.FRACTIONAL_M2: "fractional m=2",
                   Method.FRACTIONAL_M4: "fractional m=4",
+                  Method.SUFFIX_SENSITIVITY: "diagnostic base",
+                  Method.TAPERED_REFINEMENT: "tapered refine",
                   Method.THRESHOLD_REFINEMENT: "U-gated refine",
                   Method.DELAYED_REFINEMENT: "delayed refine",
                   Method.EXTRA_STEPS: "control",
@@ -248,6 +251,24 @@ def format_progress_table(tally, method_names, historical_sr=None) -> str:
             reference = historical_sr.get(suite)
             cells += f"{'-':>12}" if reference is None else f"{reference:>11.0%} "
         lines.append(f"{suite:<32}{cells}")
+    return "\n".join(lines)
+
+
+def format_probe_diagnostic_table(tally, method_names) -> str:
+    """Running means for newly completed rows; persisted per-step values live in artifacts."""
+    metrics = (
+        ("u_first10", "U first10"), ("u_first20", "U first20"),
+        ("u_full", "U full"), ("suffix_to_prefix_l2", "tail->first10 L2"),
+        ("suffix_gripper_flip", "gripper flip"))
+    lines = ["probe means for NEW rollouts in this invocation",
+             f"{'arm':<18}" + "".join(f"{label:>18}" for _, label in metrics)]
+    for method in method_names:
+        cells = []
+        for metric, _ in metrics:
+            total, count = tally.get((method, metric), (0.0, 0))
+            cells.append("-" if not count else f"{total / count:.5f}")
+        lines.append(f"{_METHOD_LABELS.get(method, method):<18}"
+                     + "".join(f"{cell:>18}" for cell in cells))
     return "\n".join(lines)
 
 
@@ -352,6 +373,7 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     completed = 0
     method_names = [name for name, _ in methods]
     tally = collections.defaultdict(lambda: [0, 0])   # (suite, method) -> [n, successes]
+    probe_tally = collections.defaultdict(lambda: [0.0, 0])
     for key, counts in (initial_tally or {}).items():
         tally[key] = [int(counts[0]), int(counts[1])]
     try:
@@ -368,6 +390,10 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                     counts = tally[(ep["suite"], name)]
                     counts[0] += 1
                     counts[1] += int(result["success"])
+                    for metric, value in (result.get("probe_diagnostics") or {}).items():
+                        if value is not None and math.isfinite(value):
+                            probe_tally[(name, metric)][0] += float(value)
+                            probe_tally[(name, metric)][1] += 1
                     progress.update()
                     # Running SR for this suite/arm, not just the last rollout's outcome.
                     progress.set_postfix_str(
@@ -380,6 +406,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                                    f"({completed}/{pending}) ---")
                         tqdm.write(format_progress_table(
                             tally, method_names, historical_sr=historical_sr))
+                        if probe_tally:
+                            tqdm.write(format_probe_diagnostic_table(probe_tally, method_names))
     except BaseException:
         store.finish_run(status="failed", n_rollouts=completed)
         raise
@@ -387,6 +415,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     print(f"{cohort}: logged {completed} new rollouts")
     if tally:
         print(format_progress_table(tally, method_names, historical_sr=historical_sr))
+    if probe_tally:
+        print(format_probe_diagnostic_table(probe_tally, method_names))
 
 
 def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,

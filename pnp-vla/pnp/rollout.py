@@ -19,7 +19,8 @@ import torch
 
 from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, VIDEO_FPS, RolloutConfig
 from .libero_env import make_env, obs_to_policy, set_camera_observables
-from .pnp import PnPRecorder, _pnp_seed_perturb, multi_policy_select, multi_sample_select
+from .pnp import (PnPRecorder, _pnp_seed_perturb, multi_policy_select, multi_sample_select,
+                  summarize_probe_diagnostics)
 from .tap import RolloutTap
 from . import sampler as _sampler
 
@@ -400,6 +401,8 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
         episode_seed=ep_seed, perturb_seed=ep_seed,
         chunk_noise_seeds=chunk_noise_seeds, instability=inst,
         recorder_episode=recorder.episodes[-1] if recorder.episodes else None,
+        probe_diagnostics=summarize_probe_diagnostics(
+            recorder.episodes[-1] if recorder.episodes else None),
         trajectory=dict(
             actions=np.asarray(executed_actions, dtype=np.float32),
             robot_state=np.asarray(robot_states, dtype=np.float32),

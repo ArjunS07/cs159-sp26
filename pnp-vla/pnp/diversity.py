@@ -33,6 +33,7 @@ SOURCE_ACTION_HORIZON_EXPERIMENT = "pi05-source-action-horizon-20-v1"
 SOURCE_FRACTIONAL_REFINEMENT_EXPERIMENT = "pi05-source-fractional-refinement-v1"
 SOURCE_FRACTIONAL_SHORT_SUITES = (
     "libero_goal_with_milk", "libero_spatial_with_milk")
+SOURCE_SUFFIX_SENSITIVITY_EXPERIMENT = "pi05-source-suffix-sensitivity-v1"
 SOURCE_MULTI_QUERY_EXPERIMENT = "pi05-source-multi-query-v1"
 DIVERSITY_PAIR_KEYS = ["suite", "task_idx", "episode_idx", "init_state_hash"]
 DIVERSITY_PREFIX_CHUNKS = (1, 2, 4, 8)
@@ -1025,6 +1026,140 @@ def run_source_fractional_refinement_worker(
             model_repo_id=source_repo, model_revision=source_revision),
         # A multiple of four keeps every periodic table balanced across all arms.
         report_every=20, initial_tally=initial_tally, historical_sr=False)
+
+
+def build_source_suffix_sensitivity_methods():
+    """Paired stock/full/tapered arms for the tail-to-executed-prefix experiment."""
+    from .config import Method, RolloutConfig
+
+    common = dict(
+        pnp_steps=(3, 4), pnp_k=5, refine_average=False,
+        n_action_steps=10, save_trajectory=True, save_generated_chunks=True,
+        save_time_uncertainty=True, skip_unused_renders=True, render_lead=2)
+    methods = [
+        (Method.SUFFIX_SENSITIVITY, RolloutConfig(
+            **common, suffix_probe_samples=4)),
+        (Method.REFINEMENT, RolloutConfig(**common, refine=True)),
+        (Method.TAPERED_REFINEMENT, RolloutConfig(
+            **common, refine=True, refine_tail_decay_end=20)),
+    ]
+    if len({name for name, _ in methods}) != len(methods):
+        raise AssertionError("suffix-sensitivity arms need unique progress/logging names")
+    return methods
+
+
+def run_source_suffix_sensitivity_worker(
+        *, shard_count: int = 4, shard_index: int = 0,
+        episode_indices=(10, 11), episode_limit: int | None = None,
+        manifest_hash: str = "", source_model_revision: str = "",
+        experiment: str = SOURCE_SUFFIX_SENSITIVITY_EXPERIMENT):
+    """Run stock diagnostics, full P&P, and tapered-tail P&P on 220 held-out identities."""
+    from . import models
+    from .experiments import (_prepare_libero_pro_expanded_episodes, _run_collection,
+                              expanded_pro_suites, identity_shard)
+    from .store import SupabaseStore, gather_provenance
+
+    episode_indices = tuple(episode_indices)
+    if not episode_indices:
+        raise ValueError("episode_indices must contain at least one index")
+    if any(isinstance(index, bool) or int(index) != index or index < 0
+           for index in episode_indices):
+        raise ValueError("episode_indices must contain non-negative integers")
+    episode_indices = tuple(map(int, episode_indices))
+    if len(set(episode_indices)) != len(episode_indices):
+        raise ValueError("episode_indices must be unique")
+    if not manifest_hash:
+        raise ValueError("manifest_hash is required; load the shared v2 Drive manifest")
+    if not source_model_revision:
+        raise ValueError(
+            "source_model_revision is required; pass it from the shared v2 Drive manifest")
+
+    store = SupabaseStore()
+    source_repo, source_revision = source_checkpoint_model_source(
+        store, expected_revision=source_model_revision)
+    pilot_suites = [
+        suite for suite in expanded_pro_suites()
+        if suite not in SOURCE_FRACTIONAL_SHORT_SUITES]
+    if len(pilot_suites) != 11:
+        raise ValueError(
+            f"expected 11 suites with init indices 10 and 11; found {len(pilot_suites)}")
+    manifest = _prepare_libero_pro_expanded_episodes(
+        suites=pilot_suites, episode_idxs=episode_indices)
+    expected_identities = len(pilot_suites) * 10 * len(episode_indices)
+    if len(manifest) != expected_identities:
+        raise ValueError(
+            f"expected {expected_identities} identities for {len(pilot_suites)} suites x "
+            f"10 tasks x {len(episode_indices)} init indices, found {len(manifest)}")
+    if {int(ep["ep_idx"]) for ep in manifest} != set(episode_indices):
+        raise ValueError("suffix-sensitivity manifest contains unexpected episode indices")
+    episodes = identity_shard(manifest, shard_count, shard_index)
+    if episode_limit is not None:
+        if isinstance(episode_limit, bool) or int(episode_limit) != episode_limit \
+                or episode_limit < 1:
+            raise ValueError("episode_limit must be a positive integer or None")
+        episodes = episodes[:int(episode_limit)]
+
+    methods = build_source_suffix_sensitivity_methods()
+    shard_identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in episodes}
+    expected_hashes = {
+        method: store.config_hash(store._logical_key(method, config))
+        for method, config in methods}
+    existing_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", experiment),
+        order_by=("rollout_id",)))
+    if not existing_rows.empty:
+        expected = existing_rows.method.map(expected_hashes)
+        existing_rows = existing_rows[
+            existing_rows.config_hash.eq(expected)
+            & existing_rows.status.eq("completed")
+            & existing_rows[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(shard_identities)]
+    initial_tally = {} if existing_rows.empty else {
+        (suite, method): [len(group), int(group.success.astype(bool).sum())]
+        for (suite, method), group in existing_rows.groupby(["suite", "method"], sort=True)}
+
+    print({
+        "experiment": experiment,
+        "source": f"{source_repo}@{source_revision}",
+        "cohort": "11 suites x 10 tasks x held-out init indices 10,11",
+        "excluded_short_asset_suites": list(SOURCE_FRACTIONAL_SHORT_SUITES),
+        "target_identities": len(manifest),
+        "identities_in_shard": len(episodes),
+        "rollouts_in_shard": len(episodes) * len(methods),
+        "arms": [method for method, _ in methods],
+        "probe": "K=5 at zero-based Euler steps (3,4); refine-last",
+        "suffix_diagnostic": "4 independent tail[10:50] resamples; prefix[0:10] fixed",
+        "tapered_refinement": "weight 1 on [0:10], linear decay on [10:20], 0 on [20:50]",
+    })
+    print("Periodic output: paired SR for all 3 arms plus U10/U20/Ufull and tail->first10 means.")
+
+    policy, preprocess, postprocess = models.load_pi05(
+        repo_id=source_repo, revision=source_revision)
+    if int(policy.config.chunk_size) != 50:
+        raise ValueError(
+            f"suffix-sensitivity design requires a 50-action chunk, found {policy.config.chunk_size}")
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=methods, cohort="source_suffix_sensitivity",
+        shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="pi05_source_suffix_sensitivity",
+        run_metadata={
+            "source_model_repo_id": source_repo, "source_model_revision": source_revision,
+            "bootstrap_manifest_hash": manifest_hash,
+            "suites": pilot_suites,
+            "excluded_short_asset_suites": list(SOURCE_FRACTIONAL_SHORT_SUITES),
+            "episode_indices": list(episode_indices), "target_identities": len(manifest),
+            "pnp_k": 5, "pnp_steps": [3, 4], "refine_average": False,
+            "n_action_steps": 10, "suffix_probe_samples": 4,
+            "uncertainty_horizons": [10, 20, 50], "taper_decay_end": 20,
+            "requested_methods": [method for method, _ in methods]},
+        provenance=gather_provenance(
+            model_repo_id=source_repo, model_revision=source_revision),
+        # Ten complete three-arm identities per periodic report.
+        report_every=30, initial_tally=initial_tally, historical_sr=False)
 
 
 def run_source_multi_query_worker(

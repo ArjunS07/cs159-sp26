@@ -431,10 +431,20 @@ class SupabaseStore:
             blobs["obs_frames"] = result["obs_frames"]
         if result.get("video"):
             blobs["video"] = result["video"]
-        if config.save_ahats and result.get("recorder_episode"):
-            ah = {f"c{c['chunk_idx']}_s{st['step']}": st["a_hats"]
-                  for c in result["recorder_episode"].get("chunks", [])
-                  for st in c.get("steps", []) if "a_hats" in st}
+        if (config.save_ahats or config.save_time_uncertainty) \
+                and result.get("recorder_episode"):
+            ah = {}
+            for c in result["recorder_episode"].get("chunks", []):
+                for st in c.get("steps", []):
+                    key = f"c{c['chunk_idx']}_s{st['step']}"
+                    # Preserve the established a-hat key for existing analyses.
+                    if config.save_ahats and "a_hats" in st:
+                        ah[key] = np.asarray(st["a_hats"])
+                    for field in (
+                            "u_time", "suffix_prefix_predictions",
+                            "suffix_prefix_reference"):
+                        if field in st:
+                            ah[f"{key}_{field}"] = np.asarray(st[field])
             if ah:
                 blobs["ahats"] = ah
         if config.save_pcp_features and result.get("pcp_chunks"):
