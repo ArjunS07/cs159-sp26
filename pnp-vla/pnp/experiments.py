@@ -5,6 +5,7 @@ import collections
 import contextlib
 import io
 import math
+from collections.abc import Mapping
 
 from .config import Method, RolloutConfig
 from .store import SupabaseStore
@@ -230,26 +231,33 @@ _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
 def format_progress_table(tally, method_names, historical_sr=None) -> str:
     """Running success rate per (suite, method), optionally against a historical baseline.
 
-    `tally` maps (suite, method) -> [n_rollouts, n_successes]. Only the observed/no-op arm is
-    comparable to the historical column: it is an RNG-isolated no-op, so its SR *is* the vanilla
-    baseline, while the refine arm is the intervention.
+    `tally` maps (suite, method) -> [n_rollouts, n_successes]. ``historical_sr`` may be one
+    suite-to-rate mapping (the legacy ``historical`` column), a label-to-suite-to-rate mapping
+    for multiple named references, or ``False`` to omit references.
     """
     show_historical = historical_sr is not False
     historical_sr = (HISTORICAL_PRO_BASELINE_SR
                      if historical_sr is None else historical_sr)
+    if not show_historical:
+        references = []
+    elif (isinstance(historical_sr, Mapping) and historical_sr
+          and all(isinstance(value, Mapping) for value in historical_sr.values())):
+        references = list(historical_sr.items())
+    else:
+        references = [("historical", historical_sr)]
     labels = [(name, _METHOD_LABELS.get(name, name)) for name in method_names]
     lines = ["n = rollouts done in THIS shard, summed over the suite's tasks "
              "(not episodes per task)",
              f"{'suite':<32}" + "".join(f"{label:>16}" for _, label in labels)
-             + (f"{'historical':>12}" if show_historical else "")]
+             + "".join(f"{label:>18}" for label, _ in references)]
     for suite in sorted({key[0] for key in tally}):
         cells = ""
         for name, _ in labels:
             n, wins = tally.get((suite, name), (0, 0))
             cells += f"{'-':>16}" if not n else f"{f'{wins / n:.0%} ({wins}/{n})':>16}"
-        if show_historical:
-            reference = historical_sr.get(suite)
-            cells += f"{'-':>12}" if reference is None else f"{reference:>11.0%} "
+        for _, rates in references:
+            reference = rates.get(suite)
+            cells += f"{'-':>18}" if reference is None else f"{reference:>17.0%} "
         lines.append(f"{suite:<32}{cells}")
     return "\n".join(lines)
 

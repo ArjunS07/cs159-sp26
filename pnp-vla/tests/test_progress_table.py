@@ -52,6 +52,21 @@ def test_historical_column_can_be_omitted_for_standard_libero():
     assert "75% (3/4)" in table
 
 
+def test_multiple_named_historical_columns_are_supported():
+    table = format_progress_table(
+        {("libero_goal_swap", Method.TAPERED_REFINEMENT): [5, 2]},
+        [Method.TAPERED_REFINEMENT],
+        historical_sr={
+            "historical full PnP": {"libero_goal_swap": 0.3},
+            "historical unrefined": {"libero_goal_swap": 0.2},
+        })
+    assert "tapered refine" in table
+    assert "historical full PnP" in table
+    assert "historical unrefined" in table
+    assert "40% (2/5)" in table
+    assert "30%" in table and "20%" in table
+
+
 def test_every_collected_suite_has_a_historical_reference():
     """Otherwise the column is blank exactly where the sanity check is needed."""
     for suite in expanded_pro_suites():

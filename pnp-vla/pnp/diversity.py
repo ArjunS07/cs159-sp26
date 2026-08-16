@@ -34,6 +34,7 @@ SOURCE_FRACTIONAL_REFINEMENT_EXPERIMENT = "pi05-source-fractional-refinement-v1"
 SOURCE_FRACTIONAL_SHORT_SUITES = (
     "libero_goal_with_milk", "libero_spatial_with_milk")
 SOURCE_SUFFIX_SENSITIVITY_EXPERIMENT = "pi05-source-suffix-sensitivity-v1"
+SOURCE_TAPERED_FULL_EXPERIMENT = "pi05-source-tapered-full-v1"
 SOURCE_MULTI_QUERY_EXPERIMENT = "pi05-source-multi-query-v1"
 DIVERSITY_PAIR_KEYS = ["suite", "task_idx", "episode_idx", "init_state_hash"]
 DIVERSITY_PREFIX_CHUNKS = (1, 2, 4, 8)
@@ -1046,6 +1047,165 @@ def build_source_suffix_sensitivity_methods():
     if len({name for name, _ in methods}) != len(methods):
         raise AssertionError("suffix-sensitivity arms need unique progress/logging names")
     return methods
+
+
+def build_source_tapered_full_config():
+    """The fixed tapered-P&P intervention promoted from the held-out pilot."""
+    from .config import RolloutConfig
+
+    return RolloutConfig(
+        pnp_steps=(3, 4), pnp_k=5, refine=True, refine_average=False,
+        n_action_steps=10, refine_tail_decay_end=20,
+        save_trajectory=True, save_generated_chunks=True,
+        skip_unused_renders=True, render_lead=2)
+
+
+def run_source_tapered_full_worker(
+        *, shard_count: int = 2, shard_index: int = 0,
+        episodes_per_task: int = 10, episode_limit: int | None = None,
+        manifest_hash: str = "", source_model_revision: str = "",
+        experiment: str = SOURCE_TAPERED_FULL_EXPERIMENT):
+    """Run always-on tapered P&P over the exact corrected 1,300-episode cohort.
+
+    The intervention is compared in-flight with the already collected exact-matched
+    10-action unrefined and ordinary full-P&P arms. Historical rows are selected by their
+    behavior-derived config hashes, preventing old 20-action rows in the same experiment from
+    entering either reference column.
+    """
+    from . import models
+    from .config import Method, RolloutConfig
+    from .experiments import (_prepare_libero_pro_expanded_episodes, _run_collection,
+                              identity_shard)
+    from .store import SupabaseStore, gather_provenance
+
+    if not manifest_hash:
+        raise ValueError("manifest_hash is required; load the shared v2 Drive manifest")
+    if not source_model_revision:
+        raise ValueError(
+            "source_model_revision is required; pass it from the shared v2 Drive manifest")
+    if (isinstance(episodes_per_task, bool) or int(episodes_per_task) != episodes_per_task
+            or episodes_per_task != 10):
+        raise ValueError("the fixed full cohort requires episodes_per_task=10")
+
+    store = SupabaseStore()
+    source_repo, source_revision = source_checkpoint_model_source(
+        store, expected_revision=source_model_revision)
+    manifest = _prepare_libero_pro_expanded_episodes(episodes_per_task=10)
+    expected_identities = 13 * 10 * 10
+    if len(manifest) != expected_identities:
+        raise ValueError(
+            f"expected {expected_identities} identities for 13 suites x 10 tasks x "
+            f"10 initializations, found {len(manifest)}")
+    manifest_identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in manifest}
+    episodes = identity_shard(manifest, shard_count, shard_index)
+    if episode_limit is not None:
+        if (isinstance(episode_limit, bool) or int(episode_limit) != episode_limit
+                or episode_limit < 1):
+            raise ValueError("episode_limit must be a positive integer or None")
+        episodes = episodes[:int(episode_limit)]
+
+    historical_configs = {
+        Method.UNCERTAINTY: RolloutConfig(
+            pnp_steps=(3, 4), pnp_k=5, refine=False, refine_average=False,
+            n_action_steps=10),
+        Method.REFINEMENT: RolloutConfig(
+            pnp_steps=(3, 4), pnp_k=5, refine=True, refine_average=False,
+            n_action_steps=10),
+    }
+    historical_hashes = {
+        method: store.config_hash(store._logical_key(method, config))
+        for method, config in historical_configs.items()}
+    historical_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", SOURCE_ACTION_HORIZON_EXPERIMENT).in_(
+            "method", list(historical_configs)), order_by=("rollout_id",)))
+    references = {}
+    reference_labels = {
+        Method.REFINEMENT: "historical full PnP",
+        Method.UNCERTAINTY: "historical unrefined",
+    }
+    for method in (Method.REFINEMENT, Method.UNCERTAINTY):
+        if historical_rows.empty:
+            frame = historical_rows
+        else:
+            frame = historical_rows[
+                historical_rows.method.eq(method)
+                & historical_rows.config_hash.eq(historical_hashes[method])
+                & historical_rows.status.eq("completed")
+                & historical_rows[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(
+                    manifest_identities)].copy()
+        if frame.duplicated(DIVERSITY_PAIR_KEYS).any():
+            raise ValueError(f"duplicate exact historical {method} identities")
+        if len(frame) != expected_identities:
+            raise ValueError(
+                f"expected {expected_identities} exact historical 10-action {method} rows in "
+                f"{SOURCE_ACTION_HORIZON_EXPERIMENT}, found {len(frame)}")
+        references[reference_labels[method]] = (
+            frame.groupby("suite").success.mean().astype(float).to_dict())
+
+    config = build_source_tapered_full_config()
+    methods = [(Method.TAPERED_REFINEMENT, config)]
+    shard_identities = {
+        (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
+        for ep in episodes}
+    existing_rows = pd.DataFrame(store.fetch_all(
+        "rollouts", "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", experiment).eq(
+            "method", Method.TAPERED_REFINEMENT), order_by=("rollout_id",)))
+    if not existing_rows.empty:
+        expected_hash = store.config_hash(store._logical_key(
+            Method.TAPERED_REFINEMENT, config))
+        existing_rows = existing_rows[
+            existing_rows.config_hash.eq(expected_hash)
+            & existing_rows.status.eq("completed")
+            & existing_rows[DIVERSITY_PAIR_KEYS].apply(tuple, axis=1).isin(shard_identities)]
+    initial_tally = {} if existing_rows.empty else {
+        (suite, Method.TAPERED_REFINEMENT): [
+            len(group), int(group.success.astype(bool).sum())]
+        for suite, group in existing_rows.groupby("suite", sort=True)}
+
+    print({
+        "experiment": experiment,
+        "source": f"{source_repo}@{source_revision}",
+        "cohort": "13 suites x 10 tasks x init indices 0..9",
+        "target_identities": len(manifest),
+        "identities_in_shard": len(episodes),
+        "new_rollouts_in_shard": len(episodes),
+        "n_action_steps": 10,
+        "probe": "K=5 at zero-based Euler steps (3,4); refine-last",
+        "tapered_refinement": "weight 1 on [0:10], linear decay on [10:20], 0 on [20:50]",
+        "historical_comparators": [
+            f"{SOURCE_ACTION_HORIZON_EXPERIMENT}/{Method.REFINEMENT}/n_action_steps=10",
+            f"{SOURCE_ACTION_HORIZON_EXPERIMENT}/{Method.UNCERTAINTY}/n_action_steps=10"],
+    })
+    print("Periodic SR columns: current tapered, historical full PnP, historical unrefined.")
+
+    policy, preprocess, postprocess = models.load_pi05(
+        repo_id=source_repo, revision=source_revision)
+    if int(policy.config.chunk_size) != 50:
+        raise ValueError(
+            f"tapered design requires a 50-action generated chunk, found "
+            f"{policy.config.chunk_size}")
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=methods, cohort="source_tapered_full",
+        shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="pi05_source_tapered_full",
+        run_metadata={
+            "source_model_repo_id": source_repo, "source_model_revision": source_revision,
+            "bootstrap_manifest_hash": manifest_hash,
+            "suites": sorted({ep["suite"] for ep in manifest}),
+            "episode_indices": list(range(10)), "target_identities": len(manifest),
+            "pnp_k": 5, "pnp_steps": [3, 4], "refine_average": False,
+            "n_action_steps": 10, "taper_decay_end": 20,
+            "historical_experiment": SOURCE_ACTION_HORIZON_EXPERIMENT,
+            "requested_methods": [Method.TAPERED_REFINEMENT]},
+        provenance=gather_provenance(
+            model_repo_id=source_repo, model_revision=source_revision),
+        report_every=25, initial_tally=initial_tally, historical_sr=references)
 
 
 def run_source_suffix_sensitivity_worker(
