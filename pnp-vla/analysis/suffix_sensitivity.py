@@ -326,7 +326,10 @@ def threshold_sweep(paired: pd.DataFrame, *, score_column: str,
 
 
 def top_windows(sweep: pd.DataFrame, *, n: int = 10) -> pd.DataFrame:
+    # A caller may attach a comparison label before ranking. Return only sweep-native
+    # columns so the caller can add that label exactly once to the ranked result.
     eligible = sweep[sweep.eligible & sweep.delta_pp.notna()].copy()
+    eligible = eligible.drop(columns=["comparison"], errors="ignore")
     ranked = eligible.sort_values(
         ["delta_pp", "episodes_refined", "lower", "upper"],
         ascending=[False, False, True, True]).head(n).reset_index(drop=True)

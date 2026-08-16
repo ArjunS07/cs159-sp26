@@ -90,6 +90,12 @@ def test_window_delta_uses_every_pair_in_denominator():
         pair, score_column="u_first10_episode", lower=best.lower, upper=best.upper)
     assert by_suite.episodes.sum() == 20
 
+    labelled = sweep.copy()
+    labelled.insert(0, "comparison", "full_pnp")
+    ranked = top_windows(labelled, n=2)
+    assert "comparison" not in ranked
+    ranked.insert(0, "comparison", "full_pnp")  # notebook path must not collide
+
     thresholds = threshold_sweep(
         pair, score_column="u_first10_episode", grid_size=5, min_selected=1)
     assert thresholds.episodes_in_sr_denominator.eq(20).all()
