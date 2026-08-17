@@ -7,7 +7,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from pnp.sampler import measure_chunk_uncertainty
+from pnp.sampler import _EncodingCache, measure_chunk_uncertainty
 from pnp.uncertainty_critic import (
     CANDIDATE_COUNT,
     COLLECTION_EPISODE_INDICES,
@@ -140,7 +140,22 @@ def test_measurement_returns_initial_action_and_intermediate_ablations():
     assert np.all(features["first_a_hat"][0] == 0)
     assert np.all(features["last_a_hat"][0] == 4)
     assert np.all(features["first_a_hat"][1] == 10)
+    assert np.all(features["last_a_hat"][1] == 14)
 
+
+
+def test_encoding_cache_hashes_nested_camera_tensor_lists():
+    cache = _EncodingCache(model_revision="revision")
+    images = [torch.zeros((1, 3, 4, 4)), torch.ones((1, 3, 4, 4))]
+    image_masks = [torch.ones((1,), dtype=torch.bool),
+                   torch.ones((1,), dtype=torch.bool)]
+    tokens = torch.tensor([[1, 2, 3]])
+    masks = torch.ones_like(tokens, dtype=torch.bool)
+    first = cache.key(images, image_masks, tokens, masks)
+    assert first == cache.key(images, image_masks, tokens, masks)
+    changed = [images[0], images[1].clone()]
+    changed[1][0, 0, 0, 0] = 2
+    assert first != cache.key(changed, image_masks, tokens, masks)
 
 def test_four_worker_notebooks_are_fixed_shards_with_smoke_limit():
     paths = sorted((ROOT / "notebooks" / "workers").glob(

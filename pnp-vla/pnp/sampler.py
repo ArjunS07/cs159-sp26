@@ -40,13 +40,28 @@ class _EncodingCache:
         self.hits = 0
         self.misses = 0
 
-    def key(self, *tensors) -> str:
+    def key(self, *inputs) -> str:
         h = hashlib.sha1(self.model_revision.encode())
-        for t in tensors:
-            a = (t.detach().to("cpu", torch.float32) if t.is_floating_point()
-                 else t.detach().cpu()).numpy()
-            h.update(repr(a.shape).encode())
-            h.update(a.tobytes())
+
+        def update(value) -> None:
+            if torch.is_tensor(value):
+                h.update(b"tensor")
+                array = (value.detach().to("cpu", torch.float32)
+                         if value.is_floating_point() else value.detach().cpu()).numpy()
+                h.update(repr(array.shape).encode())
+                h.update(array.tobytes())
+                return
+            if isinstance(value, (list, tuple)):
+                h.update(f"{type(value).__name__}:{len(value)}".encode())
+                for item in value:
+                    update(item)
+                return
+            raise TypeError(
+                f"encoding-cache inputs must be tensors or nested lists/tuples; "
+                f"got {type(value).__name__}")
+
+        for value in inputs:
+            update(value)
         return h.hexdigest()
 
     def get(self, key: str):
