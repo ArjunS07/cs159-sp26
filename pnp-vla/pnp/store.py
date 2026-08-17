@@ -422,6 +422,11 @@ class SupabaseStore:
             if sels[0].get("action_disagreement"):
                 row["ms_candidate_u"]["action_disagreement"] = [
                     s.get("action_disagreement") for s in sels]
+            if sels[0].get("candidate_profiles"):
+                row["ms_candidate_u"]["candidate_profiles"] = [
+                    s.get("candidate_profiles") for s in sels]
+                row["ms_candidate_u"]["selection_uncertainty_horizon"] = [
+                    s.get("selection_uncertainty_horizon") for s in sels]
         blobs = {}
         if result.get("trajectory"):
             blobs["trajectory"] = result["trajectory"]
@@ -441,7 +446,7 @@ class SupabaseStore:
                     if config.save_ahats and "a_hats" in st:
                         ah[key] = np.asarray(st["a_hats"])
                     for field in (
-                            "u_time", "suffix_prefix_predictions",
+                            "u_time", "u_iter_time", "suffix_prefix_predictions",
                             "suffix_prefix_reference"):
                         if field in st:
                             ah[f"{key}_{field}"] = np.asarray(st[field])

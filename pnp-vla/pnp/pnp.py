@@ -196,6 +196,9 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         "a_std_vec": a_std.mean(dim=(0, 1)).detach().float().cpu().numpy(),
         "a_mean_vec": A.mean(dim=(0, 1, 2)).detach().float().cpu().numpy(),
         "u_time": u_time.detach().float().cpu().numpy(),
+        # Keep the perturbation-pair and action-position axes so contraction can be measured
+        # separately on the executed prefix, near tail, and complete generated chunk.
+        "u_iter_time": d_consecutive.mean(dim=(1, 3)).detach().float().cpu().numpy(),
         # Per-ITERATION disagreement, i.e. |a_hat_{i+1} - a_hat_i| for i in 0..K-2, kept instead
         # of collapsed into u_mean. This is what makes "does disagreement DECAY across the K
         # perturbations?" answerable; u_mean/u_vec average that axis away. ~112 bytes per probed
@@ -299,6 +302,22 @@ def summarize_probe_diagnostics(rec_ep: dict | None) -> dict:
                   if step.get(source) is not None and np.isfinite(step[source])]
         if values:
             summary[output] = float(np.mean(values))
+    for horizon, output in ((10, "contraction_first10"),
+                            (20, "contraction_first20"),
+                            (None, "contraction_full")):
+        contractions = []
+        for step in steps:
+            profile = step.get("u_iter_time")
+            if profile is None:
+                continue
+            profile = np.asarray(profile, dtype=float)
+            if profile.ndim != 2 or len(profile) < 2:
+                continue
+            width = profile.shape[1] if horizon is None else min(int(horizon), profile.shape[1])
+            sequence = profile[:, :width].mean(axis=1)
+            contractions.append(float(sequence[0] - sequence[-1]))
+        if contractions:
+            summary[output] = float(np.mean(contractions))
     return summary
 
 
@@ -345,28 +364,35 @@ class PnPRecorder:
 # Multi-sample selection: sample N chunks, keep the lowest-uncertainty one.
 # ─────────────────────────────────────────────────────────────────────────────
 def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_steps,
-                        noise_of, num_iterations=3):
+                        noise_of, num_iterations=3, uncertainty_horizon=None,
+                        return_details=False):
     """Return (chosen_action_chunk, chosen_idx, per_candidate_u).
 
     `noise_of(si)` yields the initial noise for candidate si (from the rollout's per-episode
     noise generator family). Uncertainty is probed in measurement mode.
     """
     from .sampler import measure_chunk_uncertainty  # local import avoids a cycle
-    cand_u, cand_actions = [], []
+    cand_u, cand_actions, candidate_profiles = [], [], []
     for si in range(num_samples):
         noise = noise_of(si)
         _pnp_seed_perturb(base_seed + chunk_idx * 1000 + si)
-        action, u = measure_chunk_uncertainty(
+        measured = measure_chunk_uncertainty(
             policy, batch, noise=noise, probe_steps=probe_steps,
-            num_iterations=num_iterations)
+            num_iterations=num_iterations, uncertainty_horizon=uncertainty_horizon,
+            return_details=return_details)
+        action, u = measured[:2]
         cand_actions.append(action)
         cand_u.append(float(u))
+        if return_details:
+            candidate_profiles.append(measured[2])
     chosen = int(np.argmin(cand_u))
-    return cand_actions[chosen], chosen, cand_u
+    output = (cand_actions[chosen], chosen, cand_u)
+    return (*output, candidate_profiles) if return_details else output
 
 
 def multi_policy_select(candidates, noises, probe_steps, num_iterations=3,
-                        perturb_seeds=None):
+                        perturb_seeds=None, uncertainty_horizon=None,
+                        return_details=False):
     """Select the lowest-uncertainty action from policy/batch candidates.
 
     ``candidates`` is an ordered sequence of ``(policy, preprocessed_batch)`` pairs and
@@ -379,17 +405,22 @@ def multi_policy_select(candidates, noises, probe_steps, num_iterations=3,
         raise ValueError("candidates and noises must have the same non-zero length")
     if perturb_seeds is not None and len(perturb_seeds) != len(candidates):
         raise ValueError("perturb_seeds must match the candidate count")
-    actions, uncertainties = [], []
+    actions, uncertainties, candidate_profiles = [], [], []
     for index, ((policy, batch), noise) in enumerate(zip(candidates, noises)):
         if perturb_seeds is not None:
             _pnp_seed_perturb(int(perturb_seeds[index]))
-        action, uncertainty = measure_chunk_uncertainty(
+        measured = measure_chunk_uncertainty(
             policy, batch, noise=noise, probe_steps=tuple(probe_steps),
-            num_iterations=int(num_iterations))
+            num_iterations=int(num_iterations), uncertainty_horizon=uncertainty_horizon,
+            return_details=return_details)
+        action, uncertainty = measured[:2]
         actions.append(action)
         uncertainties.append(float(uncertainty))
+        if return_details:
+            candidate_profiles.append(measured[2])
     chosen = int(np.argmin(uncertainties))
-    return actions[chosen], chosen, uncertainties, actions
+    output = (actions[chosen], chosen, uncertainties, actions)
+    return (*output, candidate_profiles) if return_details else output
 
 
 # ─────────────────────────────────────────────────────────────────────────────

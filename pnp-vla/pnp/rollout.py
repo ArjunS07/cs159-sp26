@@ -286,15 +286,24 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                         candidate_noises.append(
                             _draw_chunk_noise(candidate_policy, device, candidate_seed))
                         perturb_seeds.append(candidate_seed)
-                    chunk, chosen, cand_u, candidate_actions = multi_policy_select(
+                    detailed_selection = config.selection_uncertainty_horizon is not None
+                    selection = multi_policy_select(
                         candidate_inputs, candidate_noises, tuple(config.ms_probe_steps),
-                        num_iterations=config.pnp_k, perturb_seeds=perturb_seeds)
+                        num_iterations=config.pnp_k, perturb_seeds=perturb_seeds,
+                        uncertainty_horizon=config.selection_uncertainty_horizon,
+                        return_details=detailed_selection)
+                    chunk, chosen, cand_u, candidate_actions = selection[:4]
+                    candidate_profiles = selection[4] if detailed_selection else None
                     labels = [str(bundle[0]) for bundle in candidate_bundles]
                     ms_selections.append({
                         "chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u,
                         "labels": labels, "chosen_label": labels[chosen],
                         "action_disagreement": candidate_action_disagreement(
-                            candidate_actions, action_dim=adim)})
+                            candidate_actions, action_dim=adim),
+                        **({"candidate_profiles": candidate_profiles,
+                            "selection_uncertainty_horizon":
+                                int(config.selection_uncertainty_horizon)}
+                           if candidate_profiles is not None else {})})
                     if candidate_generated_chunks is not None:
                         candidate_generated_chunks.append(np.stack([
                             action.squeeze(0).detach().float().cpu().numpy()
@@ -305,11 +314,21 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                     def _noise_of(si, _ci=ci):
                         return _draw_chunk_noise(policy, device,
                                                  chunk_noise_seed(ep_seed, _ci * 1000 + si))
-                    chunk, chosen, cand_u = multi_sample_select(
+                    detailed_selection = config.selection_uncertainty_horizon is not None
+                    selection = multi_sample_select(
                         policy, batch, ep_seed, ci, config.num_samples,
                         tuple(config.ms_probe_steps), _noise_of,
-                        num_iterations=config.pnp_k)
-                    ms_selections.append({"chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u})
+                        num_iterations=config.pnp_k,
+                        uncertainty_horizon=config.selection_uncertainty_horizon,
+                        return_details=detailed_selection)
+                    chunk, chosen, cand_u = selection[:3]
+                    candidate_profiles = selection[3] if detailed_selection else None
+                    ms_selections.append({
+                        "chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u,
+                        **({"candidate_profiles": candidate_profiles,
+                            "selection_uncertainty_horizon":
+                                int(config.selection_uncertainty_horizon)}
+                           if candidate_profiles is not None else {})})
                     queue_postprocess = postprocess
                 else:
                     batch = preprocess(obs_to_policy(obs, task_desc))
@@ -393,6 +412,23 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
         if config.video == "all" or (config.video == "failures_only" and not success):
             video_bytes = _encode_mp4(frames)
 
+    probe_diagnostics = summarize_probe_diagnostics(
+        recorder.episodes[-1] if recorder.episodes else None)
+    if ms_selections and ms_selections[0].get("candidate_profiles"):
+        chosen_profiles = [
+            selection["candidate_profiles"][selection["chosen"]]
+            for selection in ms_selections]
+        for source, destination in (
+                ("u10", "u_first10"), ("u20", "u_first20"),
+                ("u_full", "u_full"), ("contraction10", "contraction_first10"),
+                ("contraction20", "contraction_first20"),
+                ("contraction_full", "contraction_full")):
+            values = [profile.get(source) for profile in chosen_profiles]
+            values = [float(value) for value in values
+                      if value is not None and np.isfinite(value)]
+            if values:
+                probe_diagnostics[destination] = float(np.mean(values))
+
     result = dict(
         success=success, n_steps=n_steps, elapsed_s=elapsed, status=status, error_msg=error_msg,
         terminated_reason=terminated_reason, started_at=started_at, finished_at=finished_at,
@@ -401,8 +437,7 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
         episode_seed=ep_seed, perturb_seed=ep_seed,
         chunk_noise_seeds=chunk_noise_seeds, instability=inst,
         recorder_episode=recorder.episodes[-1] if recorder.episodes else None,
-        probe_diagnostics=summarize_probe_diagnostics(
-            recorder.episodes[-1] if recorder.episodes else None),
+        probe_diagnostics=probe_diagnostics,
         trajectory=dict(
             actions=np.asarray(executed_actions, dtype=np.float32),
             robot_state=np.asarray(robot_states, dtype=np.float32),

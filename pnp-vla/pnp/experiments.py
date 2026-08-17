@@ -268,7 +268,11 @@ def format_probe_diagnostic_table(tally, method_names) -> str:
     """Running means for newly completed rows; persisted per-step values live in artifacts."""
     metrics = (
         ("u_first10", "U first10"), ("u_first20", "U first20"),
-        ("u_full", "U full"), ("suffix_to_prefix_l2", "tail->first10 L2"),
+        ("u_full", "U full"),
+        ("contraction_first10", "C first10"),
+        ("contraction_first20", "C first20"),
+        ("contraction_full", "C full"),
+        ("suffix_to_prefix_l2", "tail->first10 L2"),
         ("suffix_gripper_flip", "gripper flip"))
     lines = ["probe means for NEW rollouts in this invocation",
              f"{'arm':<18}" + "".join(f"{label:>18}" for _, label in metrics)]

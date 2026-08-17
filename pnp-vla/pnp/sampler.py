@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 
 from .config import ADIM
@@ -198,8 +199,13 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
     return x_t
 
 
-def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3):
-    """Run one measurement-only probe pass; return (action_chunk, u_mean_scalar)."""
+def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3,
+                              uncertainty_horizon=None, return_details=False):
+    """Run one measurement-only probe pass and score a selectable action horizon.
+
+    Historical callers receive ``(action_chunk, full_chunk_u)``. Diagnostic callers may
+    request a leading action horizon and U10/U20/Ufull plus contraction summaries.
+    """
     from .config import RolloutConfig
     from .pnp import PnPRecorder
     from .tap import RolloutTap
@@ -209,5 +215,39 @@ def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iter
     tap = RolloutTap(cfg, rec, device=None, adim=model._pnp.action_dim)
     with _temp_strategy(model, tap):
         action = policy.predict_action_chunk(batch, noise=noise)
-    us = [st["u_mean"] for c in rec.current_chunks() for st in c["steps"]]
-    return action, (float(sum(us) / len(us)) if us else 0.0)
+    records = [st for c in rec.current_chunks() for st in c["steps"]]
+    if not records:
+        details = {"u10": 0.0, "u20": 0.0, "u_full": 0.0,
+                   "contraction10": 0.0, "contraction20": 0.0,
+                   "contraction_full": 0.0}
+        return (action, 0.0, details) if return_details else (action, 0.0)
+    u_time = torch.as_tensor(
+        np.stack([np.asarray(st["u_time"], dtype=float) for st in records]),
+        dtype=torch.float32).mean(dim=0)
+
+    def prefix_mean(horizon):
+        width = len(u_time) if horizon is None else min(int(horizon), len(u_time))
+        return float(u_time[:width].mean())
+
+    contractions = {}
+    for horizon, name in ((10, "contraction10"), (20, "contraction20"),
+                          (None, "contraction_full")):
+        values = []
+        for record in records:
+            profile = record.get("u_iter_time")
+            if profile is None:
+                continue
+            profile = torch.as_tensor(profile, dtype=torch.float32)
+            if profile.ndim != 2 or len(profile) < 2:
+                continue
+            width = profile.shape[1] if horizon is None else min(int(horizon), profile.shape[1])
+            sequence = profile[:, :width].mean(dim=1)
+            values.append(float(sequence[0] - sequence[-1]))
+        contractions[name] = float(np.mean(values)) if values else 0.0
+    details = {"u10": prefix_mean(10), "u20": prefix_mean(20),
+               "u_full": prefix_mean(None), **contractions}
+    if uncertainty_horizon is not None and int(uncertainty_horizon) > len(u_time):
+        raise ValueError(
+            f"uncertainty_horizon={uncertainty_horizon} exceeds chunk length {len(u_time)}")
+    score = prefix_mean(uncertainty_horizon)
+    return (action, score, details) if return_details else (action, score)

@@ -161,6 +161,9 @@ class RolloutConfig:
     q_scaler: object = field(default=None, repr=False, compare=False)  # runtime handle, not serialized
     num_samples: Optional[int] = None           # set => multi-sample-select (chunk level)
     ms_probe_steps: Sequence[int] = (1, 2)      # probe steps for multi-sample uncertainty
+    # Candidate-selection score averages disagreement over this many leading action positions.
+    # None preserves the historical full-generated-chunk score.
+    selection_uncertainty_horizon: Optional[int] = None
     candidate_set_id: Optional[str] = None       # immutable model/revision set for online selection
     # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
@@ -203,6 +206,13 @@ class RolloutConfig:
         # MultiSample carries its own ms_probe_steps and runs at the chunk level.
         if self.num_samples is not None and self.has_probe:
             raise ValueError("num_samples carries ms_probe_steps; leave pnp_steps/pnp_time_min unset")
+        if self.selection_uncertainty_horizon is not None:
+            if self.num_samples is None:
+                raise ValueError("selection_uncertainty_horizon requires num_samples")
+            if (isinstance(self.selection_uncertainty_horizon, bool)
+                    or int(self.selection_uncertainty_horizon) != self.selection_uncertainty_horizon
+                    or self.selection_uncertainty_horizon < 1):
+                raise ValueError("selection_uncertainty_horizon must be a positive integer")
         if self.refine_average and not self.refine:
             raise ValueError("refine_average=True requires refine=True")
         if self.refine_horizon_m is not None:
@@ -313,6 +323,8 @@ class RolloutConfig:
         # bound in their IDs.
         if logical.get("candidate_set_id") is None:
             logical.pop("candidate_set_id")
+        if logical.get("selection_uncertainty_horizon") is None:
+            logical.pop("selection_uncertainty_horizon")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
@@ -340,7 +352,8 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
                   "refine_prefix_only", "refine_inner_strength",
                   "correction_lambda", "q_gate", "q_ckpt_id",
-                  "num_samples", "ms_probe_steps", "candidate_set_id", "num_inference_steps",
+                  "num_samples", "ms_probe_steps", "selection_uncertainty_horizon",
+                  "candidate_set_id", "num_inference_steps",
                   "n_action_steps", "suffix_probe_samples")
 
 
