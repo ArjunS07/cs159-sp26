@@ -1611,7 +1611,8 @@ def run_source_horizon_multi_query_worker(
         episodes_per_task: int = 10, episode_limit: int | None = None,
         num_queries: int = 2, selection_horizon: int = 20,
         manifest_hash: str = "", source_model_revision: str = "",
-        experiment: str = SOURCE_HORIZON_MULTI_QUERY_EXPERIMENT):
+        experiment: str = SOURCE_HORIZON_MULTI_QUERY_EXPERIMENT,
+        include_multi_query: bool = True):
     """Full-cohort U10/U20/U50 diagnostics plus matched source re-query selection.
 
     The diagnostic arm is a true no-op probe and writes compact per-action uncertainty and
@@ -1697,10 +1698,9 @@ def run_source_horizon_multi_query_worker(
         candidate_set_id="|".join([source_id] * num_queries),
         n_action_steps=10, save_trajectory=True, save_generated_chunks=True,
         skip_unused_renders=True, render_lead=2)
-    methods = [
-        (Method.UNCERTAINTY, diagnostic_config),
-        (Method.CHUNK_SOURCE_MULTI_QUERY, multi_query_config),
-    ]
+    methods = [(Method.UNCERTAINTY, diagnostic_config)]
+    if include_multi_query:
+        methods.append((Method.CHUNK_SOURCE_MULTI_QUERY, multi_query_config))
     shard_identities = {
         (ep["suite"], ep["task_idx"], ep["ep_idx"], ep["init_state_hash"])
         for ep in episodes}
@@ -1731,7 +1731,8 @@ def run_source_horizon_multi_query_worker(
         "execution_horizon": 10, "generated_chunk_size": 50,
         "diagnostic_horizons": [10, 20, 50],
         "contraction_horizons": [10, 20, 50],
-        "queries": num_queries, "selection_horizon": selection_horizon,
+        "queries": num_queries if include_multi_query else 0,
+        "selection_horizon": selection_horizon if include_multi_query else None,
         "refinement": False,
         "historical_comparator": (
             f"{SOURCE_ACTION_HORIZON_EXPERIMENT}/{Method.UNCERTAINTY}/n_action_steps=10"),
@@ -1740,16 +1741,19 @@ def run_source_horizon_multi_query_worker(
 
     policy, preprocess, postprocess = models.load_pi05(
         repo_id=source_repo, revision=source_revision)
-    if selection_horizon > int(policy.config.chunk_size):
+    if include_multi_query and selection_horizon > int(policy.config.chunk_size):
         raise ValueError(
             f"selection_horizon={selection_horizon} exceeds chunk_size={policy.config.chunk_size}")
-    candidates = [
-        (f"source_query_{index}", policy, preprocess, postprocess)
-        for index in range(num_queries)]
+    candidates = (
+        [(f"source_query_{index}", policy, preprocess, postprocess)
+         for index in range(num_queries)]
+        if include_multi_query else [])
+    cohort = ("source_horizon_diagnostic_and_multi_query" if include_multi_query
+              else "source_horizon_diagnostic_only")
     _run_collection(
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
         device=models.default_device(), experiment=experiment, episodes=episodes,
-        methods=methods, cohort="source_horizon_diagnostic_and_multi_query",
+        methods=methods, cohort=cohort,
         shard_count=shard_count, shard_index=shard_index,
         benchmark="libero_pro", driver="pi05_source_horizon_multi_query",
         run_metadata={
@@ -1759,12 +1763,16 @@ def run_source_horizon_multi_query_worker(
             "pnp_k": 5, "pnp_steps": [3, 4], "n_action_steps": 10,
             "uncertainty_horizons": [10, 20, 50],
             "contraction_horizons": [10, 20, 50],
-            "num_queries": num_queries, "selection_uncertainty_horizon": selection_horizon,
+            "num_queries": num_queries if include_multi_query else 0,
+            "selection_uncertainty_horizon": selection_horizon if include_multi_query else None,
+            "include_multi_query": include_multi_query,
             "refinement": False, "requested_methods": [method for method, _ in methods]},
         provenance=gather_provenance(
             model_repo_id=source_repo, model_revision=source_revision),
         report_every=50, initial_tally=initial_tally, historical_sr=historical_sr,
-        candidate_bundles_by_method={Method.CHUNK_SOURCE_MULTI_QUERY: candidates})
+        candidate_bundles_by_method=(
+            {Method.CHUNK_SOURCE_MULTI_QUERY: candidates}
+            if include_multi_query else None))
 
 
 def run_diversity_chunk_selector_worker(*, shard_count: int = 4, shard_index: int = 0,

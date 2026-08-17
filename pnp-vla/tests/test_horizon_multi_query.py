@@ -121,3 +121,20 @@ def test_new_worker_notebooks_are_four_fixed_full_cohort_shards():
         assert "N_QUERIES = 2" in source
         assert "SELECTION_HORIZON = 20" in source
         assert "source_model_revision=SOURCE_MODEL_REVISION" in source
+
+
+def test_diagnostic_only_notebooks_resume_the_same_four_shards():
+    assert run_source_horizon_multi_query_worker.__kwdefaults__["include_multi_query"] is True
+    for shard_index in range(4):
+        path = ROOT / "notebooks" / "workers" / (
+            f"41_source_horizon_diagnostic_only_worker_{shard_index}.ipynb")
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"])
+        assert "run_source_horizon_multi_query_worker(" in source
+        assert "EPISODES_PER_TASK = 10" in source
+        assert "SHARD_COUNT = 4" in source
+        assert f"SHARD_INDEX = {shard_index}" in source
+        assert "include_multi_query=False" in source
+        assert "EXPERIMENT = SOURCE_HORIZON_MULTI_QUERY_EXPERIMENT" in source
+        assert "source_model_revision=SOURCE_MODEL_REVISION" in source
