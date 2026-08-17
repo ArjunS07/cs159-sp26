@@ -32,6 +32,10 @@ LIBERO_ACTION_STEPS = 10
 LIBERO_10STEP_EXPERIMENT = "libero-hybrid-schedules-k3-a10-v2"
 # Same OffScreenRenderEnv/robosuite path as PRO. The measured renderer needs two enabled
 # env steps before the observation consumed at the next policy call is fresh.
+LIBERO_HORIZON_DIAGNOSTICS_EXPERIMENT = "libero-u-horizon-k5-steps34-a10-v1"
+LIBERO_HORIZON_DIAGNOSTIC_K = 5
+LIBERO_HORIZON_DIAGNOSTIC_STEPS = (3, 4)
+
 LIBERO_SKIP_RENDERS = True
 LIBERO_RENDER_LEAD = 2
 PRO_EXPERIMENT = "libero-pro-canonical-core-k3-v1"
@@ -82,6 +86,24 @@ def build_full_methods(schedules=SCHEDULES, k=K,
     if len(methods) != 12:
         raise AssertionError(f"expected 12 full methods, got {len(methods)}")
     return methods
+
+
+
+def build_libero_horizon_diagnostic_methods():
+    """One corrected standard-LIBERO no-op arm with rich Q-screening telemetry."""
+    config = RolloutConfig(
+        pnp_steps=LIBERO_HORIZON_DIAGNOSTIC_STEPS,
+        pnp_k=LIBERO_HORIZON_DIAGNOSTIC_K,
+        n_action_steps=LIBERO_ACTION_STEPS,
+        save_pcp_features=True,
+        save_time_uncertainty=True,
+        save_trajectory=True,
+        skip_unused_renders=LIBERO_SKIP_RENDERS,
+        render_lead=LIBERO_RENDER_LEAD,
+    )
+    if config.refine or config.refine_average:
+        raise AssertionError("the horizon diagnostic must remain a no-op probe")
+    return [(Method.UNCERTAINTY, config)]
 
 
 def build_broad_methods(full_methods=None):
@@ -474,6 +496,108 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
                       "skip_unused_renders": LIBERO_SKIP_RENDERS,
                       "render_lead": LIBERO_RENDER_LEAD},
     )
+
+
+
+def run_libero_horizon_diagnostic_worker(
+        *, shard_count: int = 4, shard_index: int = 0,
+        experiment: str = LIBERO_HORIZON_DIAGNOSTICS_EXPERIMENT):
+    """Collect U10/U20/U50, contraction, PCP, and trajectory data on standard LIBERO."""
+    import pandas as pd
+
+    from . import models
+
+    all_episodes = _prepare_libero_episodes()
+    episodes = identity_shard(all_episodes, shard_count, shard_index)
+    methods = build_libero_horizon_diagnostic_methods()
+    method, config = methods[0]
+    store = SupabaseStore()
+
+    # Display the corrected historical 10-action baseline, selected by its behavior hash.
+    historical_method, historical_config = next(
+        item for item in build_full_methods() if item[0] == Method.UNCERTAINTY)
+    historical_hash = store.config_hash(store._logical_key(
+        historical_method, historical_config))
+    historical_rows = pd.DataFrame(store.fetch_all(
+        "rollouts",
+        "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq(
+            "experiment", LIBERO_10STEP_EXPERIMENT).eq(
+            "method", Method.UNCERTAINTY).eq("config_hash", historical_hash),
+        order_by=("rollout_id",)))
+    if historical_rows.empty:
+        raise ValueError(
+            f"no corrected standard-LIBERO baseline rows found in "
+            f"{LIBERO_10STEP_EXPERIMENT}")
+    identity_columns = ["suite", "task_idx", "episode_idx", "init_state_hash"]
+    manifest_identities = {
+        (ep["suite"], ep["task_idx"], ep.get("ep_idx", ep.get("episode_idx")),
+         ep["init_state_hash"])
+        for ep in all_episodes}
+    historical_rows = historical_rows[
+        historical_rows.status.eq("completed")
+        & historical_rows[identity_columns].apply(tuple, axis=1).isin(
+            manifest_identities)].copy()
+    if historical_rows.duplicated(identity_columns).any():
+        raise ValueError("duplicate corrected standard-LIBERO baseline identities")
+    if len(historical_rows) != len(all_episodes):
+        raise ValueError(
+            f"expected {len(all_episodes)} corrected historical baseline rows, "
+            f"found {len(historical_rows)}")
+    historical_sr = historical_rows.groupby("suite").success.mean().astype(float).to_dict()
+
+    expected_hash = store.config_hash(store._logical_key(method, config))
+    shard_identities = {
+        (ep["suite"], ep["task_idx"], ep.get("ep_idx", ep.get("episode_idx")),
+         ep["init_state_hash"])
+        for ep in episodes}
+    existing = pd.DataFrame(store.fetch_all(
+        "rollouts",
+        "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", experiment).eq(
+            "method", method).eq("config_hash", expected_hash),
+        order_by=("rollout_id",)))
+    if not existing.empty:
+        existing = existing[
+            existing.status.eq("completed")
+            & existing[identity_columns].apply(tuple, axis=1).isin(
+                shard_identities)]
+    initial_tally = {} if existing.empty else {
+        (suite, method): [len(group), int(group.success.astype(bool).sum())]
+        for suite, group in existing.groupby("suite", sort=True)}
+
+    print({
+        "experiment": experiment,
+        "cohort": "standard LIBERO: 4 suites x 10 tasks x 10 episodes",
+        "target_identities": len(all_episodes),
+        "identities_in_shard": len(episodes),
+        "rollouts_in_shard": len(episodes),
+        "arm": Method.UNCERTAINTY,
+        "pnp_k": LIBERO_HORIZON_DIAGNOSTIC_K,
+        "pnp_steps": list(LIBERO_HORIZON_DIAGNOSTIC_STEPS),
+        "execution_horizon": LIBERO_ACTION_STEPS,
+        "generated_chunk_size": 50,
+        "diagnostic_horizons": [10, 20, 50],
+        "contraction_horizons": [10, 20, 50],
+        "sinks": ["PCP/Q features", "U-time + contraction", "trajectory"],
+    })
+    print("Periodic output: current SR, corrected historical SR, U10/U20/U50, and contraction.")
+
+    policy, preprocess, postprocess = models.load_pi05()
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=methods, cohort="libero_horizon_diagnostic",
+        shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero", driver="pi05_libero_horizon_diagnostic",
+        run_metadata={
+            "target_identities": len(all_episodes), "pnp_k": config.pnp_k,
+            "pnp_steps": list(config.pnp_steps),
+            "n_action_steps": config.n_action_steps,
+            "uncertainty_horizons": [10, 20, 50],
+            "contraction_horizons": [10, 20, 50],
+            "save_pcp_features": True, "refinement": False},
+        report_every=25, initial_tally=initial_tally, historical_sr=historical_sr)
 
 
 def run_libero_pro_worker(*, shard_count: int, shard_index: int,
