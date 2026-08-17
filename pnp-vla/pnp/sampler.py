@@ -200,7 +200,8 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
 
 
 def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3,
-                              uncertainty_horizon=None, return_details=False):
+                              uncertainty_horizon=None, return_details=False,
+                              return_features=False):
     """Run one measurement-only probe pass and score a selectable action horizon.
 
     Historical callers receive ``(action_chunk, full_chunk_u)``. Diagnostic callers may
@@ -210,7 +211,10 @@ def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iter
     from .pnp import PnPRecorder
     from .tap import RolloutTap
     model = policy.model
-    cfg = RolloutConfig(pnp_steps=tuple(probe_steps), pnp_k=num_iterations, save_trajectory=False)
+    cfg = RolloutConfig(
+        pnp_steps=tuple(probe_steps), pnp_k=num_iterations,
+        save_trajectory=False, save_pcp_features=bool(return_features),
+        save_ahats=bool(return_features))
     rec = PnPRecorder(); rec.new_episode()
     tap = RolloutTap(cfg, rec, device=None, adim=model._pnp.action_dim)
     with _temp_strategy(model, tap):
@@ -220,7 +224,21 @@ def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iter
         details = {"u10": 0.0, "u20": 0.0, "u_full": 0.0,
                    "contraction10": 0.0, "contraction20": 0.0,
                    "contraction_full": 0.0}
-        return (action, 0.0, details) if return_details else (action, 0.0)
+        output = (action, 0.0, details) if return_details else (action, 0.0)
+        if return_features:
+            return (*output, {
+                "obs_enc": np.empty((0,), dtype=np.float32),
+                "step_indices": np.empty((0,), dtype=np.int64),
+                "s": np.empty((0,), dtype=np.float32),
+                "z_hat": np.empty((0, 0, model._pnp.action_dim), dtype=np.float32),
+                "first_a_hat": np.empty(
+                    (0, 0, model._pnp.action_dim), dtype=np.float32),
+                "last_a_hat": np.empty(
+                    (0, 0, model._pnp.action_dim), dtype=np.float32),
+                "u_time": np.empty((0, 0), dtype=np.float32),
+                "u_iter_time": np.empty((0, 0, 0), dtype=np.float32),
+            })
+        return output
     u_time = torch.as_tensor(
         np.stack([np.asarray(st["u_time"], dtype=float) for st in records]),
         dtype=torch.float32).mean(dim=0)
@@ -250,4 +268,33 @@ def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iter
         raise ValueError(
             f"uncertainty_horizon={uncertainty_horizon} exceeds chunk length {len(u_time)}")
     score = prefix_mean(uncertainty_horizon)
-    return (action, score, details) if return_details else (action, score)
+    output = (action, score, details) if return_details else (action, score)
+    if return_features:
+        if not tap.pcp_chunks or len(tap.pcp_chunks) != 1:
+            raise RuntimeError("candidate feature capture expected exactly one PCP chunk")
+        pcp = tap.pcp_chunks[0]
+        pcp_steps = sorted(pcp["steps"], key=lambda item: int(item["step_idx"]))
+        record_by_step = {int(record["step"]): record for record in records}
+        ordered_records = [record_by_step[int(item["step_idx"])] for item in pcp_steps]
+        features = {
+            "obs_enc": np.asarray(pcp["obs_enc"], dtype=np.float32),
+            "step_indices": np.asarray(
+                [item["step_idx"] for item in pcp_steps], dtype=np.int64),
+            "s": np.asarray([item["s"] for item in pcp_steps], dtype=np.float32),
+            "z_hat": np.stack(
+                [np.asarray(item["z_hat"], dtype=np.float32) for item in pcp_steps]),
+            "first_a_hat": np.stack([
+                np.asarray(item["a_hats"], dtype=np.float32)[0, 0]
+                for item in ordered_records]),
+            "last_a_hat": np.stack([
+                np.asarray(item["a_hats"], dtype=np.float32)[-1, 0]
+                for item in ordered_records]),
+            "u_time": np.stack(
+                [np.asarray(item["u_time"], dtype=np.float32)
+                 for item in ordered_records]),
+            "u_iter_time": np.stack(
+                [np.asarray(item["u_iter_time"], dtype=np.float32)
+                 for item in ordered_records]),
+        }
+        return (*output, features)
+    return output
