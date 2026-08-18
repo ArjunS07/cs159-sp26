@@ -458,6 +458,8 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
             result["pcp_telemetry"] = tap.pcp_telemetry
         if tap.refinement_gate_telemetry is not None:
             result["refinement_gate_telemetry"] = tap.refinement_gate_telemetry
+        if tap.uncertainty_gradient_telemetry is not None:
+            result["uncertainty_gradient_telemetry"] = tap.uncertainty_gradient_telemetry
     if ms_selections is not None:
         result["ms_selections"] = ms_selections
     return result

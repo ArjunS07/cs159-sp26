@@ -87,6 +87,8 @@ class Method:
     TAPERED_REFINEMENT = "pnp_tapered_refinement"  # temporal P&P feedback decays in the tail
     PREFIX_REFINEMENT = "pnp_prefix_only_refinement"  # inner P&P updates executed positions only
     REDUCED_STRENGTH_REFINEMENT = "pnp_reduced_strength_refinement"  # smaller inner P&P moves
+    U20_GRADIENT = "pnp_u20_gradient_descent"  # descend exact P&P U20 through the live latent
+    LATENT_RANDOM_CONTROL = "pnp_latent_random_control"  # equal-RMS/equal-compute random update
     THRESHOLD_REFINEMENT = "pnp_threshold_refinement"  # refine selected steps iff U >= threshold
     DELAYED_REFINEMENT = "pnp_delayed_refinement"  # refine every chunk from a fixed chunk index
     MULTI_SAMPLE = "multi_sample_select"
@@ -102,6 +104,7 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.FRACTIONAL_M2, Method.FRACTIONAL_M4,
                Method.SUFFIX_SENSITIVITY, Method.TAPERED_REFINEMENT,
                Method.PREFIX_REFINEMENT, Method.REDUCED_STRENGTH_REFINEMENT,
+               Method.U20_GRADIENT, Method.LATENT_RANDOM_CONTROL,
                Method.THRESHOLD_REFINEMENT, Method.DELAYED_REFINEMENT,
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
                Method.CHUNK_SOURCE_M1,
@@ -154,6 +157,11 @@ class RolloutConfig:
     # Scale every inner predict/perturb proposal toward its destination. Unlike
     # refine_horizon_m, this changes the intermediate states seen by all K velocity evaluations.
     refine_inner_strength: Optional[float] = None
+    # Differentiate exact P&P uncertainty through the frozen VLA and update only the live latent.
+    # The random mode still computes the gradient, then applies an equal-RMS random direction.
+    uncertainty_gradient_mode: Optional[str] = None  # None | "descent" | "random"
+    uncertainty_gradient_step_size: Optional[float] = None  # RMS of the latent update
+    uncertainty_gradient_horizon: int = 20
     correction_lambda: Optional[float] = None   # set => PCP correction action (0.0 == P&P, no grad)
     q_gate: float = 0.5                         # only correct chunks with predicted P(success) < gate
     q_ckpt_id: Optional[str] = None
@@ -197,12 +205,27 @@ class RolloutConfig:
 
     def __post_init__(self):
         n_actions = int(self.refine) + int(self.correction_lambda is not None) \
-            + int(self.num_samples is not None)
+            + int(self.num_samples is not None) + int(self.uncertainty_gradient_mode is not None)
         if n_actions > 1:
-            raise ValueError("at most one action: refine / correction_lambda / num_samples")
+            raise ValueError("at most one action: refine / correction / samples / U-gradient")
         # Refine/correction feed off the probe, so a probe is mandatory for them.
         if (self.refine or self.correction_lambda is not None) and not self.has_probe:
             raise ValueError("refine/correction requires a probe (set pnp_steps or pnp_time_min)")
+        if self.uncertainty_gradient_mode is not None:
+            if not self.has_probe:
+                raise ValueError("uncertainty-gradient feedback requires a P&P probe")
+            if self.uncertainty_gradient_mode not in {"descent", "random"}:
+                raise ValueError("uncertainty_gradient_mode must be 'descent' or 'random'")
+            if (self.uncertainty_gradient_step_size is None
+                    or not math.isfinite(float(self.uncertainty_gradient_step_size))
+                    or float(self.uncertainty_gradient_step_size) <= 0):
+                raise ValueError("uncertainty_gradient_step_size must be finite and positive")
+            if (isinstance(self.uncertainty_gradient_horizon, bool)
+                    or int(self.uncertainty_gradient_horizon) != self.uncertainty_gradient_horizon
+                    or self.uncertainty_gradient_horizon < 1):
+                raise ValueError("uncertainty_gradient_horizon must be a positive integer")
+        elif self.uncertainty_gradient_step_size is not None:
+            raise ValueError("uncertainty_gradient_step_size requires uncertainty_gradient_mode")
         # MultiSample carries its own ms_probe_steps and runs at the chunk level.
         if self.num_samples is not None and self.has_probe:
             raise ValueError("num_samples carries ms_probe_steps; leave pnp_steps/pnp_time_min unset")
@@ -339,6 +362,10 @@ class RolloutConfig:
             logical.pop("refine_prefix_only")
         if logical.get("refine_inner_strength") is None:
             logical.pop("refine_inner_strength")
+        if logical.get("uncertainty_gradient_mode") is None:
+            logical.pop("uncertainty_gradient_mode")
+            logical.pop("uncertainty_gradient_step_size")
+            logical.pop("uncertainty_gradient_horizon")
         if logical.get("n_action_steps") is None:
             logical.pop("n_action_steps")
         if not logical.get("suffix_probe_samples"):
@@ -351,6 +378,8 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "refine", "refine_average", "refine_horizon_m", "refine_threshold",
                   "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
                   "refine_prefix_only", "refine_inner_strength",
+                  "uncertainty_gradient_mode", "uncertainty_gradient_step_size",
+                  "uncertainty_gradient_horizon",
                   "correction_lambda", "q_gate", "q_ckpt_id",
                   "num_samples", "ms_probe_steps", "selection_uncertainty_horizon",
                   "candidate_set_id", "num_inference_steps",

@@ -39,6 +39,7 @@ class RolloutTap:
         self._refine_applied = 0
         self._chunk_refine_applied = 0
         self._chunk_idx = -1
+        self._gradient_records: list[dict] = []
         # correction telemetry (only when the action is a PCP correction)
         self._corr = CorrectTelemetry() if self._correcting else None
         # pcp-features accumulation (only when save_pcp_features)
@@ -49,7 +50,8 @@ class RolloutTap:
     @property
     def invasive(self) -> bool:
         """Whether the action changes inference (drives the sampler's measure-only path)."""
-        return self.config.refine or self._correcting
+        return (self.config.refine or self._correcting
+                or self.config.uncertainty_gradient_mode is not None)
 
     @property
     def needs_baseline_fallback(self) -> bool:
@@ -71,6 +73,7 @@ class RolloutTap:
 
     def step(self, x_t, s, vf, ctx):
         cfg = self.config
+        gradient_updated = None
         temporal_weights = None
         if cfg.refine_prefix_only:
             temporal_weights = temporal_prefix_weights(
@@ -85,11 +88,25 @@ class RolloutTap:
             temporal_weights = (
                 torch.full((x_t.shape[-2],), strength, device=x_t.device, dtype=x_t.dtype)
                 if temporal_weights is None else temporal_weights * strength)
-        pr = run_probe(x_t, s, vf, k=cfg.pnp_k, adim=cfg.action_dim,
-                       compute_multimodal=cfg.compute_multimodal,
-                       suffix_probe_samples=cfg.suffix_probe_samples,
-                       prefix_horizon=(cfg.n_action_steps if cfg.suffix_probe_samples else None),
-                       temporal_update_weights=temporal_weights)
+        if cfg.uncertainty_gradient_mode is not None:
+            from .uncertainty_critic_v2 import direct_latent_uncertainty_update
+            random_seed = (int(torch.initial_seed())
+                           ^ ((self._chunk_idx + 1) * 1_000_003)
+                           ^ (int(ctx.step) * 9_176)) & ((1 << 63) - 1)
+            gradient_updated, pr, telemetry = direct_latent_uncertainty_update(
+                x_t, s, vf, k=cfg.pnp_k,
+                horizon=cfg.uncertainty_gradient_horizon,
+                step_size=cfg.uncertainty_gradient_step_size,
+                mode=cfg.uncertainty_gradient_mode, random_seed=random_seed)
+            telemetry.update({
+                "chunk_idx": self._chunk_idx, "euler_step": int(ctx.step), "s": float(s)})
+            self._gradient_records.append(telemetry)
+        else:
+            pr = run_probe(x_t, s, vf, k=cfg.pnp_k, adim=cfg.action_dim,
+                           compute_multimodal=cfg.compute_multimodal,
+                           suffix_probe_samples=cfg.suffix_probe_samples,
+                           prefix_horizon=(cfg.n_action_steps if cfg.suffix_probe_samples else None),
+                           temporal_update_weights=temporal_weights)
 
         # sink: per-step uncertainty (+ optional a_hats geometry stack)
         if self.records_uncertainty or cfg.compute_multimodal:
@@ -107,6 +124,8 @@ class RolloutTap:
             })
 
         # action: at most one feedback path (measure-only when no action is set)
+        if gradient_updated is not None:
+            return gradient_updated
         if cfg.refine:
             # Delayed refinement deliberately preserves the exact stock sampler output before
             # this zero-based prediction-chunk index. The sampler's baseline fallback guarantees
@@ -159,6 +178,22 @@ class RolloutTap:
     @property
     def pcp_telemetry(self):
         return self._corr.telemetry() if self._corr is not None else None
+
+    @property
+    def uncertainty_gradient_telemetry(self):
+        if self.config.uncertainty_gradient_mode is None:
+            return None
+        records = list(self._gradient_records)
+        if not records:
+            return {"records": [], "n_updates": 0}
+        return {
+            "records": records,
+            "n_updates": len(records),
+            "mean_pre_u20": sum(row["pre_u20"] for row in records) / len(records),
+            "mean_post_u20": sum(row["post_u20"] for row in records) / len(records),
+            "mean_delta_u20": sum(row["delta_u20"] for row in records) / len(records),
+            "mean_update_rms": sum(row["update_rms"] for row in records) / len(records),
+        }
 
     @property
     def refinement_gate_telemetry(self):

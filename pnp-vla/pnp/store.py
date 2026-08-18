@@ -410,6 +410,9 @@ class SupabaseStore:
                        q_ckpt_id=config.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
         if config.refine_threshold is not None:
             row.update(result.get("refinement_gate_telemetry") or {})
+        if result.get("uncertainty_gradient_telemetry"):
+            row["ms_candidate_u"] = {
+                "uncertainty_gradient": result["uncertainty_gradient_telemetry"]}
         if result.get("ms_selections"):
             sels = result["ms_selections"]
             row["ms_chosen_idx"] = sels[0]["chosen"]

@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from .pnp import _pnp_seed_perturb, run_probe
+from .pnp import _pnp_gen, _pnp_seed_perturb, run_probe
 from .sampler import _temp_strategy
 from .uncertainty_critic import CANDIDATE_COUNT, PROBE_STEPS
 from .uncertainty_critic_train import (
@@ -525,6 +525,78 @@ class DirectUncertaintyGradientTap:
 
     def finish(self, ctx):
         pass
+
+
+def direct_latent_uncertainty_update(
+        x_t, s, vf, *, k=5, horizon=20, step_size=.01,
+        mode="descent", random_seed=54321, checkpoint_vfield=True):
+    """Take one online, equal-RMS latent update using exact measured P&P uncertainty.
+
+    The VLA and perturbation draws are fixed. Autograd differentiates U20 only with respect
+    to ``x_t``. The P&P generator is rewound for the post-update measurement, then restored
+    to the state after one probe so telemetry does not alter later perturbations.
+    ``mode='random'`` deliberately computes the same gradient before discarding its direction.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    if mode not in {"descent", "random"}:
+        raise ValueError("mode must be 'descent' or 'random'")
+    generator = _pnp_gen(x_t.device)
+    state_before = generator.get_state()
+
+    def differentiable_vf(value):
+        if checkpoint_vfield:
+            return checkpoint(vf, value, use_reentrant=False)
+        return vf(value)
+
+    with torch.enable_grad():
+        x = x_t.detach().clone().requires_grad_(True)
+        probe = run_probe(x, s, differentiable_vf, k=int(k), adim=ACTION_DIM)
+        if int(horizon) > len(probe.u_time):
+            raise ValueError(
+                f"uncertainty horizon {horizon} exceeds action chunk {len(probe.u_time)}")
+        objective = probe.u_time[:int(horizon)].mean()
+        gradient = torch.autograd.grad(objective, x)[0]
+    state_after = generator.get_state()
+    if not bool(torch.isfinite(gradient).all()):
+        generator.set_state(state_after)
+        raise FloatingPointError("non-finite direct uncertainty gradient")
+
+    gradient_rms = gradient.float().square().mean().sqrt().clamp_min(1e-12)
+    direction = -gradient / gradient_rms.to(gradient.dtype)
+    if mode == "random":
+        random_generator = torch.Generator(device=x_t.device).manual_seed(int(random_seed))
+        direction = torch.empty_like(x_t).normal_(generator=random_generator)
+        random_rms = direction.float().square().mean().sqrt().clamp_min(1e-12)
+        direction = direction / random_rms.to(direction.dtype)
+    updated = (x_t + float(step_size) * direction).detach()
+
+    # Common perturbations make pre/post U20 comparable. Restore the one-probe state after
+    # measurement so the rest of the rollout sees exactly the established P&P noise stream.
+    generator.set_state(state_before)
+    try:
+        with torch.no_grad():
+            measured = run_probe(updated, s, vf, k=int(k), adim=ACTION_DIM)
+            post_u = float(measured.u_time[:int(horizon)].mean())
+    finally:
+        generator.set_state(state_after)
+
+    pre_u = float(objective.detach())
+    telemetry = {
+        "mode": mode, "pre_u20": pre_u, "post_u20": post_u,
+        "delta_u20": post_u - pre_u,
+        "gradient_rms": float(gradient_rms),
+        "update_rms": float((updated - x_t).float().square().mean().sqrt()),
+        "gradient_finite": True,
+    }
+    # Recorder only needs detached values; dropping this graph keeps online memory flat.
+    probe.a_hats = probe.a_hats.detach()
+    probe.z_hat_full = probe.z_hat_full.detach()
+    probe.x_acc = probe.x_acc.detach()
+    probe.last_eps = probe.last_eps.detach()
+    probe.u_time = probe.u_time.detach()
+    del measured, objective, gradient, direction, x
+    return updated, probe, telemetry
 
 
 def direct_uncertainty_gradient_test(policy, batch, noise, *, probe_step=3, k=5,
