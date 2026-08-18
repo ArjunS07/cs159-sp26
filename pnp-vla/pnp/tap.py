@@ -26,7 +26,8 @@ class RolloutTap:
     uncertainty; `_pcp_chunks` collects per-chunk (obs_enc, z_hat) features when that sink is on.
     """
 
-    def __init__(self, config: RolloutConfig, recorder: PnPRecorder, device, adim: int):
+    def __init__(self, config: RolloutConfig, recorder: PnPRecorder, device, adim: int,
+                 action_postprocess=None):
         self.config = config
         self.recorder = recorder
         self.device = device
@@ -40,6 +41,8 @@ class RolloutTap:
         self._chunk_refine_applied = 0
         self._chunk_idx = -1
         self._gradient_records: list[dict] = []
+        self._gradient_action_gate_records: list[dict] = []
+        self._action_postprocess = action_postprocess
         # correction telemetry (only when the action is a PCP correction)
         self._corr = CorrectTelemetry() if self._correcting else None
         # pcp-features accumulation (only when save_pcp_features)
@@ -56,9 +59,11 @@ class RolloutTap:
     @property
     def needs_baseline_fallback(self) -> bool:
         """Whether a no-fire chunk must return the exact stock sampler output."""
-        return self.config.refine and (
-            self.config.refine_threshold is not None
-            or self.config.refine_start_chunk is not None)
+        return bool(
+            (self.config.refine and (
+                self.config.refine_threshold is not None
+                or self.config.refine_start_chunk is not None))
+            or self.config.uncertainty_gradient_action_rms_max is not None)
 
     def begin_chunk(self) -> None:
         self._chunk_idx += 1
@@ -67,6 +72,59 @@ class RolloutTap:
     @property
     def chunk_intervened(self) -> bool:
         return self._chunk_refine_applied > 0
+
+    def _environment_action(self, action, horizon):
+        """Decode each action exactly as the rollout queue does at environment.step."""
+        if self._action_postprocess is None:
+            return action[..., :horizon, :]
+        decoded_actions = []
+        for index in range(horizon):
+            decoded = self._action_postprocess(action[..., index, :])
+            if torch.is_tensor(decoded):
+                decoded = decoded.to(device=action.device, dtype=action.dtype)
+            else:
+                decoded = torch.as_tensor(
+                    decoded, device=action.device, dtype=action.dtype)
+            decoded_actions.append(decoded)
+        return torch.stack(decoded_actions, dim=-2)
+
+    def finalize_action(self, baseline_action, candidate_action):
+        """Choose between exact-stock and candidate after both chunks are fully decoded."""
+        threshold = self.config.uncertainty_gradient_action_rms_max
+        if threshold is None:
+            return candidate_action if self.chunk_intervened else baseline_action
+
+        horizon = min(
+            int(self.config.n_action_steps), baseline_action.shape[-2], candidate_action.shape[-2])
+        stock = self._environment_action(baseline_action, horizon)
+        candidate = self._environment_action(candidate_action, horizon)
+        motion_dim = min(6, self.adim, stock.shape[-1], candidate.shape[-1])
+        if horizon < 1 or motion_dim < 1:
+            raise ValueError("action displacement gate received an empty action prefix")
+        delta = candidate[..., :horizon, :motion_dim] - stock[..., :horizon, :motion_dim]
+        action_rms = float(torch.sqrt(torch.mean(delta.float().square())).item())
+        first_action_l2 = float(torch.linalg.vector_norm(
+            delta[..., 0, :].float(), dim=-1).mean().item())
+        max_abs = float(delta.float().abs().max().item())
+        gripper_disagreement = False
+        if min(stock.shape[-1], candidate.shape[-1]) > 6:
+            stock_gripper = stock[..., :horizon, 6]
+            candidate_gripper = candidate[..., :horizon, 6]
+            gripper_disagreement = bool(
+                torch.any(torch.signbit(stock_gripper) != torch.signbit(candidate_gripper)).item())
+        accepted = action_rms <= float(threshold)
+        self._gradient_action_gate_records.append({
+            "chunk_idx": self._chunk_idx,
+            "action_rms": action_rms,
+            "first_action_l2": first_action_l2,
+            "max_abs_action_change": max_abs,
+            "gripper_sign_disagreement": gripper_disagreement,
+            "threshold": float(threshold),
+            "accepted": accepted,
+            "actions_compared": horizon,
+            "motion_dimensions": motion_dim,
+        })
+        return candidate_action if accepted else baseline_action
 
     def selected(self, step: int, s: float) -> bool:
         return self.config.has_probe and self.config.probe_selected(step, s)
@@ -193,6 +251,12 @@ class RolloutTap:
             "mean_post_u20": sum(row["post_u20"] for row in records) / len(records),
             "mean_delta_u20": sum(row["delta_u20"] for row in records) / len(records),
             "mean_update_rms": sum(row["update_rms"] for row in records) / len(records),
+            **({
+                "action_gate_records": list(self._gradient_action_gate_records),
+                "n_action_gate_considered": len(self._gradient_action_gate_records),
+                "n_action_gate_accepted": sum(
+                    row["accepted"] for row in self._gradient_action_gate_records),
+            } if self.config.uncertainty_gradient_action_rms_max is not None else {}),
         }
 
     @property

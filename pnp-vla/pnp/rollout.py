@@ -160,12 +160,13 @@ def candidate_action_disagreement(actions, action_dim: int = ADIM,
 # ─────────────────────────────────────────────────────────────────────────────
 # Config -> tap (the notebook never constructs the tap directly)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int):
+def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int,
+              action_postprocess=None):
     """A tap exists iff the rollout has a probe. Vanilla / extra_steps / multi-sample (which
     probes at the chunk level) run with no tap installed."""
     if not config.has_probe:
         return None
-    return RolloutTap(config, recorder, device, adim)
+    return RolloutTap(config, recorder, device, adim, action_postprocess=action_postprocess)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,7 +195,7 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
                 "each candidate bundle must be (label, policy, preprocess, postprocess)")
 
     recorder = PnPRecorder()
-    tap = build_tap(config, recorder, device, adim)
+    tap = build_tap(config, recorder, device, adim, action_postprocess=postprocess)
     runtime_policies = ([bundle[1] for bundle in candidate_bundles]
                         if candidate_bundles is not None else [policy])
     unique_policies = list({id(item): item for item in runtime_policies}.values())

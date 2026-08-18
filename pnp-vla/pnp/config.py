@@ -89,6 +89,8 @@ class Method:
     REDUCED_STRENGTH_REFINEMENT = "pnp_reduced_strength_refinement"  # smaller inner P&P moves
     U20_GRADIENT = "pnp_u20_gradient_descent"  # descend exact P&P U20 through the live latent
     LATENT_RANDOM_CONTROL = "pnp_latent_random_control"  # equal-RMS/equal-compute random update
+    U20_GRADIENT_GATE_015 = "pnp_u20_gradient_action_gate_015"
+    U20_GRADIENT_GATE_020 = "pnp_u20_gradient_action_gate_020"
     THRESHOLD_REFINEMENT = "pnp_threshold_refinement"  # refine selected steps iff U >= threshold
     DELAYED_REFINEMENT = "pnp_delayed_refinement"  # refine every chunk from a fixed chunk index
     MULTI_SAMPLE = "multi_sample_select"
@@ -105,6 +107,7 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.SUFFIX_SENSITIVITY, Method.TAPERED_REFINEMENT,
                Method.PREFIX_REFINEMENT, Method.REDUCED_STRENGTH_REFINEMENT,
                Method.U20_GRADIENT, Method.LATENT_RANDOM_CONTROL,
+               Method.U20_GRADIENT_GATE_015, Method.U20_GRADIENT_GATE_020,
                Method.THRESHOLD_REFINEMENT, Method.DELAYED_REFINEMENT,
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
                Method.CHUNK_SOURCE_M1,
@@ -162,6 +165,9 @@ class RolloutConfig:
     uncertainty_gradient_mode: Optional[str] = None  # None | "descent" | "random"
     uncertainty_gradient_step_size: Optional[float] = None  # RMS of the latent update
     uncertainty_gradient_horizon: int = 20
+    # Accept the decoded U-gradient chunk only when its first executed arm actions remain this
+    # close to the exact stock chunk (RMS in postprocessed LIBERO action coordinates).
+    uncertainty_gradient_action_rms_max: Optional[float] = None
     correction_lambda: Optional[float] = None   # set => PCP correction action (0.0 == P&P, no grad)
     q_gate: float = 0.5                         # only correct chunks with predicted P(success) < gate
     q_ckpt_id: Optional[str] = None
@@ -226,6 +232,17 @@ class RolloutConfig:
                 raise ValueError("uncertainty_gradient_horizon must be a positive integer")
         elif self.uncertainty_gradient_step_size is not None:
             raise ValueError("uncertainty_gradient_step_size requires uncertainty_gradient_mode")
+        if self.uncertainty_gradient_action_rms_max is not None:
+            if self.uncertainty_gradient_mode != "descent":
+                raise ValueError(
+                    "uncertainty_gradient_action_rms_max requires descent mode")
+            if self.n_action_steps is None:
+                raise ValueError(
+                    "uncertainty_gradient_action_rms_max requires explicit n_action_steps")
+            if (not math.isfinite(float(self.uncertainty_gradient_action_rms_max))
+                    or float(self.uncertainty_gradient_action_rms_max) <= 0):
+                raise ValueError(
+                    "uncertainty_gradient_action_rms_max must be finite and positive")
         # MultiSample carries its own ms_probe_steps and runs at the chunk level.
         if self.num_samples is not None and self.has_probe:
             raise ValueError("num_samples carries ms_probe_steps; leave pnp_steps/pnp_time_min unset")
@@ -366,6 +383,8 @@ class RolloutConfig:
             logical.pop("uncertainty_gradient_mode")
             logical.pop("uncertainty_gradient_step_size")
             logical.pop("uncertainty_gradient_horizon")
+        if logical.get("uncertainty_gradient_action_rms_max") is None:
+            logical.pop("uncertainty_gradient_action_rms_max")
         if logical.get("n_action_steps") is None:
             logical.pop("n_action_steps")
         if not logical.get("suffix_probe_samples"):
@@ -380,6 +399,7 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "refine_prefix_only", "refine_inner_strength",
                   "uncertainty_gradient_mode", "uncertainty_gradient_step_size",
                   "uncertainty_gradient_horizon",
+                  "uncertainty_gradient_action_rms_max",
                   "correction_lambda", "q_gate", "q_ckpt_id",
                   "num_samples", "ms_probe_steps", "selection_uncertainty_horizon",
                   "candidate_set_id", "num_inference_steps",

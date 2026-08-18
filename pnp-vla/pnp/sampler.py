@@ -209,8 +209,12 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
     strat.finish(ctx)
     if not strat.invasive:
         return baseline_action
-    if needs_baseline_fallback and not bool(getattr(strat, "chunk_intervened", False)):
-        return baseline_action
+    if needs_baseline_fallback:
+        finalize_action = getattr(strat, "finalize_action", None)
+        if finalize_action is None:
+            raise RuntimeError(
+                "strategy requested a baseline fallback without finalize_action")
+        return finalize_action(baseline_action, x_t)
     return x_t
 
 
