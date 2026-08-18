@@ -12,7 +12,7 @@ from .uncertainty_gradient_experiment import (
 )
 
 
-U20_ACTION_GATE_EXPERIMENT = "pi05-u20-gradient-action-gate-pro220-v1"
+U20_ACTION_GATE_EXPERIMENT = "pi05-u20-gradient-action-gate-pro220-v2"
 U20_ACTION_GATE_THRESHOLDS = (0.015, 0.020)
 
 

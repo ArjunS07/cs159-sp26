@@ -79,7 +79,10 @@ class RolloutTap:
             return action[..., :horizon, :]
         decoded_actions = []
         for index in range(horizon):
-            decoded = self._action_postprocess(action[..., index, :])
+            # Third-party processor steps may operate in-place. Never give them a view into
+            # the live chunks: rejecting a candidate must return byte-for-byte stock actions.
+            processor_input = action[..., index, :self.adim].detach().clone()
+            decoded = self._action_postprocess(processor_input)
             if torch.is_tensor(decoded):
                 decoded = decoded.to(device=action.device, dtype=action.dtype)
             else:

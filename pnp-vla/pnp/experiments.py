@@ -426,6 +426,11 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                         env, ep, policy, preprocess, postprocess, device, cfg,
                         candidate_bundles=(candidate_bundles_by_method or {}).get(name))
                     store.log_result(rid, ep, name, cfg, result)
+                    if result.get("status") != "completed":
+                        tqdm.write(
+                            f"ERROR {ep['suite']} task={ep['task_idx']} "
+                            f"episode={ep.get('ep_idx', ep.get('episode_idx'))} "
+                            f"method={name}: {result.get('error_msg')}")
                     completed += 1
                     counts = tally[(ep["suite"], name)]
                     counts[0] += 1

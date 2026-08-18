@@ -47,7 +47,9 @@ def test_action_gate_is_validated_and_behavior_hashed():
 
 def test_gate_measures_postprocessed_first_ten_arm_actions_and_returns_exact_chunk():
     def postprocess(chunk):
-        decoded = chunk[..., :7].clone()
+        # Deliberately mutate the input to reproduce an unsafe third-party processor.
+        assert chunk.shape[-1] == 7
+        decoded = chunk[..., :7]
         decoded[..., :6] *= 2
         return decoded
 
@@ -64,6 +66,8 @@ def test_gate_measures_postprocessed_first_ten_arm_actions_and_returns_exact_chu
     assert tap.needs_baseline_fallback
     assert tap.finalize_action(stock, small) is small
     assert tap.finalize_action(stock, large) is stock
+    assert torch.count_nonzero(stock) == 0
+    assert large[..., :10, :6].mean() == pytest.approx(.010)
     first, second = tap._gradient_action_gate_records
     assert first["action_rms"] == pytest.approx(.010)
     assert first["accepted"] is True
@@ -103,7 +107,7 @@ def test_two_predeclared_arms_and_four_colab_workers():
     assert [config.uncertainty_gradient_action_rms_max for _, config in methods] == [
         .015, .020]
     assert U20_ACTION_GATE_THRESHOLDS == (.015, .020)
-    assert U20_ACTION_GATE_EXPERIMENT == "pi05-u20-gradient-action-gate-pro220-v1"
+    assert U20_ACTION_GATE_EXPERIMENT == "pi05-u20-gradient-action-gate-pro220-v2"
 
     workers = sorted((ROOT / "notebooks" / "workers").glob(
         "50_u20_action_gate_pro220_worker_*.ipynb"))
