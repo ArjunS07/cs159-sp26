@@ -132,3 +132,43 @@ def test_targeted_manifest_can_accept_a_prospective_shortfall():
         rollouts, steps, set(), development_targets={"libero": 0},
         test_targets={"libero": 10}, allow_shortfall=True)
     assert len(manifests["test"]) == 3
+
+
+def test_run_continuation_replans_every_n_action_steps():
+    """The base-policy continuation is open-loop (full chunk) by default and closed-loop
+    (execute n_action_steps, then replan) when n_action_steps is set."""
+    import numpy as np
+    import torch
+    from unittest.mock import patch
+    from pnp.verifier import collection as C
+
+    class FakeEnv:
+        def step(self, _action):
+            return {}, 0.0, False, {}
+
+        def check_success(self):
+            return False
+
+    chunk = torch.zeros((1, 3, 7))  # generated chunk_size = 3
+    ep = {"task_desc": "t", "max_steps": 6}
+    calls = {"predict": 0}
+
+    def fake_predict(_policy, _batch, _noise):
+        calls["predict"] += 1
+        return chunk, None
+
+    with (patch.object(C, "obs_to_policy", lambda _obs, _desc: {}),
+          patch.object(C, "_draw_chunk_noise", lambda *a, **k: None),
+          patch.object(C, "predict_clean_chunk", fake_predict),
+          patch.object(C, "postprocess_chunk", lambda arr, *a, **k: np.asarray(arr))):
+        calls["predict"] = 0
+        success, steps = C._run_continuation(
+            FakeEnv(), {}, ep, None, lambda o: o, lambda a: a, torch.device("cpu"),
+            prefix=[], branch_seed=1, steps_already=0)
+        assert not success and steps == 6 and calls["predict"] == 2  # replan every full chunk (3)
+
+        calls["predict"] = 0
+        success, steps = C._run_continuation(
+            FakeEnv(), {}, ep, None, lambda o: o, lambda a: a, torch.device("cpu"),
+            prefix=[], branch_seed=1, steps_already=0, n_action_steps=1)
+        assert not success and steps == 6 and calls["predict"] == 6  # replan every executed action

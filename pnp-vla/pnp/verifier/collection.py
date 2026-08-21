@@ -313,7 +313,7 @@ def postprocess_chunk(chunk, postprocess, device):
 
 
 def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
-                      prefix, branch_seed, steps_already):
+                      prefix, branch_seed, steps_already, n_action_steps=None):
     success = False
     steps = steps_already
     for action in prefix:
@@ -329,7 +329,11 @@ def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
             batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
             noise = _draw_chunk_noise(policy, device, chunk_noise_seed(branch_seed, replan))
             chunk, _ = predict_clean_chunk(policy, batch, noise)
-            queue = list(chunk.squeeze(0).detach().cpu().numpy())
+            # Closed-loop continuation: execute only the first n_action_steps of each generated
+            # chunk before replanning (mirrors run_episode). None => execute the full chunk
+            # (historical open-loop behavior), so existing callers are unchanged.
+            rows = list(chunk.squeeze(0).detach().cpu().numpy())
+            queue = rows if n_action_steps is None else rows[:int(n_action_steps)]
             replan += 1
         action = queue.pop(0)
         action = postprocess_chunk(np.asarray(action)[None], postprocess, device)[0]
@@ -364,7 +368,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                                    trajectory_seed: int | None = None,
                                    collection_split: str = "development",
                                    manifest_hash: str = "",
-                                   model_revision: str = ""):
+                                   model_revision: str = "",
+                                   n_action_steps: int | None = None):
     """Collect candidates at a mid-rollout state by deterministic action replay.
 
     Unlike simulator snapshots, replay reconstructs wrapper state, contacts, and
@@ -440,7 +445,7 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         success, n_steps = _run_continuation(
             env, branch_obs, ep, policy, preprocess, postprocess, device,
             prefix=env_chunks[kind][:prefix_length], branch_seed=seed ^ 0x51A7,
-            steps_already=steps)
+            steps_already=steps, n_action_steps=n_action_steps)
         candidate_id = hashlib.sha256(f"{group_id}|{kind}".encode()).hexdigest()[:24]
         candidates.append({
             "candidate_id": candidate_id, "candidate_kind": kind, "success": success,
@@ -486,6 +491,7 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                           "collection_split": collection_split,
                           "collection_manifest_hash": manifest_hash,
                           "model_revision": model_revision,
-                          "candidate_count": candidate_count},
+                          "candidate_count": candidate_count,
+                          "continuation_n_action_steps": n_action_steps},
     }
     return group, candidates
