@@ -17,11 +17,12 @@ from itertools import groupby
 import numpy as np
 import torch
 
-from .config import ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, VIDEO_FPS, RolloutConfig
+from .config import (ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, PERTURB_SEED_MASK,
+                     VIDEO_FPS, RolloutConfig)
 from .libero_env import make_env, obs_to_policy, set_camera_observables
 from .pnp import (PnPRecorder, _pnp_seed_perturb, multi_policy_select, multi_sample_select,
                   summarize_probe_diagnostics)
-from .tap import RolloutTap
+from .tap import RolloutTap, BatchedRolloutTap
 from . import sampler as _sampler
 
 
@@ -172,8 +173,8 @@ def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int,
 # ─────────────────────────────────────────────────────────────────────────────
 # The one rollout primitive.
 # ─────────────────────────────────────────────────────────────────────────────
-def run_episode(env, ep, policy, preprocess, postprocess, device,
-                config: RolloutConfig | None = None, *, candidate_bundles=None):
+def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
+                        config: RolloutConfig | None = None, *, candidate_bundles=None):
     """Run one episode under `config`. Returns a result dict (outcome, metrics, trajectory,
     recorder episode, and sink outputs — pcp_chunks / pcp_telemetry / ms_selections).
 
@@ -464,6 +465,202 @@ def run_episode(env, ep, policy, preprocess, postprocess, device,
     if ms_selections is not None:
         result["ms_selections"] = ms_selections
     return result
+
+
+def _stack_batches(items):
+    """Recursively concatenate preprocessor outputs along their batch dimension."""
+    first = items[0]
+    if isinstance(first, torch.Tensor):
+        return torch.cat(items, dim=0)
+    if isinstance(first, dict):
+        return {key: _stack_batches([item[key] for item in items]) for key in first}
+    if isinstance(first, tuple):
+        return tuple(_stack_batches([item[i] for item in items]) for i in range(len(first)))
+    if isinstance(first, list):
+        return [_stack_batches([item[i] for item in items]) for i in range(len(first))]
+    raise TypeError(f"cannot batch preprocessor output of type {type(first).__name__}")
+
+
+def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
+                      config: RolloutConfig | None = None):
+    """Run independent environments with one shared, truly batched policy invocation.
+
+    Results preserve input order. Multi-sample and learned-PCP selection intentionally use the
+    established serial path until candidate/state branching is migrated.
+    """
+    config = config or RolloutConfig()
+    if len(envs) != len(episodes) or not episodes:
+        raise ValueError("envs and episodes must have the same non-zero length")
+    if len(episodes) == 1:
+        return [_run_episode_serial(envs[0], episodes[0], policy, preprocess,
+                                    postprocess, device, config)]
+    if (config.num_samples is not None or config.correction_lambda is not None
+            or config.uncertainty_gradient_mode is not None):
+        reason = ("multi-sample selection" if config.num_samples is not None
+                  else "learned PCP correction" if config.correction_lambda is not None
+                  else "U20 latent-gradient correction")
+        print(f"[rollout] {reason} is not batch-enabled; using serial runner for this collection")
+        return [_run_episode_serial(env, ep, policy, preprocess, postprocess, device, config)
+                for env, ep in zip(envs, episodes)]
+
+    model = policy.model
+    adim, chunk_size = model._pnp.action_dim, policy.config.chunk_size
+    if config.n_action_steps is not None and config.n_action_steps > chunk_size:
+        raise ValueError(
+            f"n_action_steps={config.n_action_steps} exceeds chunk_size={chunk_size}")
+    model._pnp.num_steps = config.num_inference_steps
+    seeds = [episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
+             for ep in episodes]
+    recorders = [PnPRecorder() for _ in episodes]
+    for recorder, ep in zip(recorders, episodes):
+        recorder.new_episode(meta={k: ep.get(k) for k in ("suite", "task_idx", "ep_idx")})
+    states = []
+    now = lambda: dt.datetime.now(dt.timezone.utc).isoformat()
+    for env, ep, seed in zip(envs, episodes, seeds):
+        perturb_gen = torch.Generator(device=torch.device(device))
+        perturb_gen.manual_seed(int(seed) ^ PERTURB_SEED_MASK)
+        state = dict(obs=None, queue=[], ci=0, step=0, success=False, status="completed",
+                     error_msg=None, terminated_reason="max_steps", actions=[], robot_states=[],
+                     boundaries=[], noise_seeds=[],
+                     generated=[] if config.save_generated_chunks else None,
+                     frames=[] if (config.save_observations or config.video != "off") else None,
+                     nan_count=0, inference_ms=0.0, vf_evals=0, perturb_gen=perturb_gen,
+                     started_at=now(), t0=time.time(), done=False)
+        try:
+            env.reset()
+            state["obs"] = env.set_init_state(ep["init_state"])
+            for _ in range(NUM_STEPS_WAIT):
+                state["obs"], _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+        except Exception as exc:
+            state.update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
+                         terminated_reason="error", done=True)
+        states.append(state)
+    policy.reset()
+
+    while any(not state["done"] for state in states):
+        infer_ids = [i for i, state in enumerate(states)
+                     if not state["done"] and not state["queue"]]
+        if infer_ids:
+            batches, noises, positions = [], [], []
+            for i in infer_ids:
+                ep, state = episodes[i], states[i]
+                cseed = chunk_noise_seed(seeds[i], state["ci"])
+                state["noise_seeds"].append(cseed)
+                noises.append(_draw_chunk_noise(policy, device, cseed))
+                batches.append(preprocess(obs_to_policy(state["obs"], ep["task_desc"])))
+                positions.append(min(state["ci"] / max(1, round(ep["max_steps"] / chunk_size)), 1.0))
+            tap = (BatchedRolloutTap(config, [recorders[i] for i in infer_ids],
+                                     [states[i]["perturb_gen"] for i in infer_ids], device, adim)
+                   if config.has_probe else None)
+            _sampler.set_strategy(model, tap)
+            model._pnp.chunk_pos = positions
+            before_vf = model._pnp.vf_evals
+            started = time.perf_counter()
+            try:
+                with torch.no_grad():
+                    chunks = policy.predict_action_chunk(
+                        _stack_batches(batches), noise=torch.cat(noises, dim=0))
+                infer_ms = (time.perf_counter() - started) * 1000.0
+                vf_delta = model._pnp.vf_evals - before_vf
+                arrays = chunks.detach().cpu().numpy()
+                for lane, i in enumerate(infer_ids):
+                    state = states[i]; arr = arrays[lane]
+                    state["inference_ms"] += infer_ms
+                    state["vf_evals"] += vf_delta or (
+                        config.num_inference_steps or policy.config.num_inference_steps)
+                    # Closed-loop execution: execute only the first n_action_steps of the
+                    # generated chunk, then replan (mirrors _run_episode_serial). Omitted =>
+                    # execute the full generated chunk (historical open-loop behavior).
+                    horizon = config.n_action_steps
+                    rows = arr if horizon is None else arr[:int(horizon)]
+                    if horizon is not None and len(rows) != int(horizon):
+                        raise ValueError(
+                            f"policy returned only {len(arr)} actions, cannot execute "
+                            f"n_action_steps={horizon}")
+                    state["queue"] = [row.copy() for row in rows]
+                    state["boundaries"].append(arr[0, :adim].copy())
+                    if state["generated"] is not None: state["generated"].append(arr.copy())
+                    state["ci"] += 1
+                    if tap is not None and tap.save_pcp:
+                        # Tap instances are inference-call-local; transfer their lane output.
+                        target = state.setdefault("pcp_chunks", [])
+                        for chunk in tap.pcp_chunks[lane]:
+                            chunk["chunk_idx"] = len(target)
+                            target.append(chunk)
+            except Exception as exc:
+                for i in infer_ids:
+                    states[i].update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
+                                     terminated_reason="error", done=True)
+                continue
+
+        step_ids = [i for i, state in enumerate(states) if not state["done"]]
+        raw = []
+        for i in step_ids:
+            a = states[i]["queue"].pop(0)
+            if not np.all(np.isfinite(a)):
+                states[i]["nan_count"] += 1
+                a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            raw.append(torch.as_tensor(a, device=device).unsqueeze(0))
+        processed = postprocess(torch.cat(raw, dim=0))
+        if isinstance(processed, torch.Tensor): processed = processed.detach().cpu().numpy()
+        processed = np.asarray(processed)
+        for lane, i in enumerate(step_ids):
+            env, ep, state = envs[i], episodes[i], states[i]
+            a, obs = np.asarray(processed[lane]), state["obs"]
+            try:
+                state["actions"].append(a.flatten()[:adim].copy())
+                if state["frames"] is not None:
+                    state["frames"].append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
+                state["robot_states"].append(np.concatenate([
+                    obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"]]).copy())
+                state["step"] += 1
+                state["obs"], _, env_done, _ = env.step(a)
+                if env.check_success():
+                    state.update(success=True, terminated_reason="success", done=True)
+                elif env_done:
+                    state.update(terminated_reason="env_done", done=True)
+                elif state["step"] >= ep["max_steps"]:
+                    state["done"] = True
+            except Exception as exc:
+                state.update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
+                             terminated_reason="error", done=True)
+
+    results = []
+    for i, (ep, state, recorder) in enumerate(zip(episodes, states, recorders)):
+        recorder.close_episode(state["success"], state["step"])
+        frames = state["frames"]
+        video = (_encode_mp4(frames) if frames and config.video != "off" and
+                 (config.video == "all" or not state["success"]) else None)
+        result = dict(success=state["success"], n_steps=state["step"],
+            elapsed_s=time.time() - state["t0"], status=state["status"], error_msg=state["error_msg"],
+            terminated_reason=state["terminated_reason"], started_at=state["started_at"],
+            finished_at=now(), inference_ms_total=state["inference_ms"],
+            nan_action_count=state["nan_count"], n_chunks=state["ci"],
+            n_vf_evals=state["vf_evals"], chunk_size=chunk_size, episode_seed=seeds[i],
+            perturb_seed=seeds[i], chunk_noise_seeds=state["noise_seeds"],
+            instability=compute_instability(state["actions"], state["boundaries"]),
+            recorder_episode=recorder.episodes[-1] if recorder.episodes else None,
+            trajectory=dict(actions=np.asarray(state["actions"], dtype=np.float32),
+                            robot_state=np.asarray(state["robot_states"], dtype=np.float32))
+                       if config.save_trajectory else None,
+            generated_chunks=(dict(chunks=np.asarray(state["generated"], dtype=np.float32))
+                              if state["generated"] is not None else None),
+            obs_frames=frames if config.save_observations else None, video=video)
+        if config.save_pcp_features: result["pcp_chunks"] = state.get("pcp_chunks", [])
+        results.append(result)
+    return results
+
+
+def run_episode(env, ep, policy, preprocess, postprocess, device,
+                config: RolloutConfig | None = None, *, candidate_bundles=None):
+    """Singleton compatibility wrapper around :func:`run_episode_batch`.
+
+    ``candidate_bundles`` (multi-policy selection) is serial-only, so it routes straight to
+    :func:`_run_episode_serial` rather than through the batched runner."""
+    if candidate_bundles is not None:
+        return _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
+                                   config, candidate_bundles=candidate_bundles)
+    return run_episode_batch([env], [ep], policy, preprocess, postprocess, device, config)[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

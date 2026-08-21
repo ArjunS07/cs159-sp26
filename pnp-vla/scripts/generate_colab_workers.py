@@ -10,6 +10,7 @@ from nb_common import bootstrap
 ROOT = Path(__file__).parents[1]
 OUT = ROOT / "notebooks" / "workers"
 SHARD_COUNT = 6
+ROLLOUT_BATCH_SIZE = 2
 
 # Clone/install [sim] and run env setup in one fetched bootstrap cell.
 BOOTSTRAP = bootstrap("sim", setup_env=True)
@@ -41,7 +42,9 @@ def notebook(shard_index: int, *, benchmark: str = "libero") -> dict:
 
 SHARD_COUNT = {SHARD_COUNT}
 SHARD_INDEX = {shard_index}
-{function}(shard_count=SHARD_COUNT, shard_index=SHARD_INDEX)
+ROLLOUT_BATCH_SIZE = {ROLLOUT_BATCH_SIZE}
+{function}(shard_count=SHARD_COUNT, shard_index=SHARD_INDEX,
+           rollout_batch_size=ROLLOUT_BATCH_SIZE)
 '''
     return {
         "nbformat": 4,

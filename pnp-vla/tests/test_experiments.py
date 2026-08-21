@@ -74,21 +74,21 @@ def test_automated_worker_cohort_is_historical_eight_tasks():
     assert {suite for suite, _ in FULL_ABLATION_TASKS} == {"libero_spatial", "libero_goal"}
 
 
-def test_four_libero_launchers_have_fixed_unique_indices():
+def test_six_libero_launchers_have_fixed_unique_indices():
     worker_dir = Path(__file__).parents[1] / "notebooks" / "workers"
     launchers = sorted(worker_dir.glob("libero_worker_*.ipynb"))
-    assert len(launchers) == 4
+    assert len(launchers) == 6
     for index, path in enumerate(launchers):
         notebook = json.loads(path.read_text())
         source = "\n".join(
             "".join(cell.get("source", [])) for cell in notebook["cells"]
         )
-        assert "SHARD_COUNT = 4" in source
+        assert "SHARD_COUNT = 6" in source
         assert f"SHARD_INDEX = {index}" in source
         assert "run_libero_hybrid_worker" in source
-        assert "LIBERO_10STEP_EXPERIMENT" in source
-        assert "experiment=LIBERO_10STEP_EXPERIMENT" in source
         assert "colab_bootstrap.py" in source  # fetch-and-exec bootstrap
+        assert "ROLLOUT_BATCH_SIZE = 2" in source
+        assert "rollout_batch_size=ROLLOUT_BATCH_SIZE" in source
 
 
 def test_six_pro_launchers_have_fixed_unique_indices():
@@ -104,6 +104,8 @@ def test_six_pro_launchers_have_fixed_unique_indices():
         assert f"SHARD_INDEX = {index}" in source
         assert "run_libero_pro_worker" in source
         assert "colab_bootstrap.py" in source  # fetch-and-exec bootstrap
+        assert "ROLLOUT_BATCH_SIZE = 2" in source
+        assert "rollout_batch_size=ROLLOUT_BATCH_SIZE" in source
 
 
 def test_three_verifier_v2_launchers_have_fixed_unique_indices():

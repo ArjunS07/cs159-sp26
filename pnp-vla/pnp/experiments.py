@@ -5,6 +5,7 @@ import collections
 import contextlib
 import io
 import math
+import time
 from collections.abc import Mapping
 
 from .config import Method, RolloutConfig
@@ -389,9 +390,13 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                     methods, cohort, shard_count, shard_index,
                     benchmark="libero", driver="hybrid_schedules", run_metadata=None,
                     report_every=50, provenance=None, initial_tally=None,
-                    candidate_bundles_by_method=None, historical_sr=None):
+                    candidate_bundles_by_method=None, historical_sr=None,
+                    rollout_batch_size: int = 2):
     from tqdm.auto import tqdm
-    from .rollout import iter_task_envs, run_episode
+    from .libero_env import make_env
+    from .rollout import run_episode_batch
+    if rollout_batch_size < 1:
+        raise ValueError("rollout_batch_size must be at least 1")
 
     expected = len(episodes) * len(methods)
     done = store.existing_keys(experiment)
@@ -404,7 +409,7 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     refinement_schedules = [config.pnp_steps for _, config in methods if config.refine]
     run_config = {"cohort": cohort, "schedules": refinement_schedules, "pnp_k": K,
                   "n_configs": len(methods), "shard_count": shard_count,
-                  "shard_index": shard_index}
+                  "shard_index": shard_index, "rollout_batch_size": rollout_batch_size}
     run_config.update(run_metadata or {})
     store.start_run(
         driver=driver, benchmark=benchmark, experiment=experiment,
@@ -416,43 +421,78 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     probe_tally = collections.defaultdict(lambda: [0.0, 0])
     for key, counts in (initial_tally or {}).items():
         tally[key] = [int(counts[0]), int(counts[1])]
+    occupied_lanes = batch_slots = 0
+    inference_ms_total = 0.0
+    collection_t0 = time.time()
     try:
         with tqdm(total=pending, desc=f"{cohort}[{shard_index}]", unit="rollout",
                   dynamic_ncols=True) as progress:
-            for env, task_episodes in iter_task_envs(episodes):
-                for ep, name, cfg, rid in store.iter_todo(
-                        experiment, task_episodes, methods, done=done):
-                    result = run_episode(
-                        env, ep, policy, preprocess, postprocess, device, cfg,
-                        candidate_bundles=(candidate_bundles_by_method or {}).get(name))
-                    store.log_result(rid, ep, name, cfg, result)
-                    if result.get("status") != "completed":
-                        tqdm.write(
-                            f"ERROR {ep['suite']} task={ep['task_idx']} "
-                            f"episode={ep.get('ep_idx', ep.get('episode_idx'))} "
-                            f"method={name}: {result.get('error_msg')}")
-                    completed += 1
-                    counts = tally[(ep["suite"], name)]
-                    counts[0] += 1
-                    counts[1] += int(result["success"])
-                    for metric, value in (result.get("probe_diagnostics") or {}).items():
-                        if value is not None and math.isfinite(value):
-                            probe_tally[(name, metric)][0] += float(value)
-                            probe_tally[(name, metric)][1] += 1
-                    progress.update()
-                    # Running SR for this suite/arm, not just the last rollout's outcome.
-                    progress.set_postfix_str(
-                        f"{ep['suite'].removeprefix('libero_')} "
-                        f"{_METHOD_LABELS.get(name, name)} "
-                        f"sr={counts[1] / counts[0]:.0%} ({counts[1]}/{counts[0]})",
-                        refresh=False)
-                    if report_every and completed % report_every == 0:
-                        tqdm.write(f"\n--- {cohort}[{shard_index}] after {completed} rollouts "
-                                   f"({completed}/{pending}) ---")
-                        tqdm.write(format_progress_table(
-                            tally, method_names, historical_sr=historical_sr))
-                        if probe_tally:
-                            tqdm.write(format_probe_diagnostic_table(probe_tally, method_names))
+            def _record(ep, name, cfg, rid, result):
+                nonlocal completed
+                store.log_result(rid, ep, name, cfg, result)
+                if result.get("status") != "completed":
+                    tqdm.write(
+                        f"ERROR {ep['suite']} task={ep['task_idx']} "
+                        f"episode={ep.get('ep_idx', ep.get('episode_idx'))} "
+                        f"method={name}: {result.get('error_msg')}")
+                completed += 1
+                counts = tally[(ep["suite"], name)]
+                counts[0] += 1
+                counts[1] += int(result["success"])
+                for metric, value in (result.get("probe_diagnostics") or {}).items():
+                    if value is not None and math.isfinite(value):
+                        probe_tally[(name, metric)][0] += float(value)
+                        probe_tally[(name, metric)][1] += 1
+                progress.update()
+                # Running SR for this suite/arm, not just the last rollout's outcome.
+                progress.set_postfix_str(
+                    f"{ep['suite'].removeprefix('libero_')} "
+                    f"{_METHOD_LABELS.get(name, name)} "
+                    f"sr={counts[1] / counts[0]:.0%} ({counts[1]}/{counts[0]})",
+                    refresh=False)
+                if report_every and completed % report_every == 0:
+                    tqdm.write(f"\n--- {cohort}[{shard_index}] after {completed} rollouts "
+                               f"({completed}/{pending}) ---")
+                    tqdm.write(format_progress_table(
+                        tally, method_names, historical_sr=historical_sr))
+                    if probe_tally:
+                        tqdm.write(format_probe_diagnostic_table(probe_tally, method_names))
+
+            task_keys = sorted({(ep["suite"], ep["task_idx"]) for ep in episodes})
+            for task_key in task_keys:
+                task_episodes = [ep for ep in episodes
+                                 if (ep["suite"], ep["task_idx"]) == task_key]
+                envs = []
+                try:
+                    for _ in range(min(rollout_batch_size, len(task_episodes))):
+                        envs.append(make_env(task_episodes[0]["bddl_path"]))
+                    # A batch shares all sampler behavior; grouping by method/config also keeps
+                    # resumption deterministic when only part of a task is already complete.
+                    for name, cfg in methods:
+                        todo = list(store.iter_todo(
+                            experiment, task_episodes, [(name, cfg)], done=done))
+                        bundles = (candidate_bundles_by_method or {}).get(name)
+                        if bundles is not None:
+                            # Multi-policy selection is serial-only; one env per episode.
+                            for ep, method, config, rid in todo:
+                                result = run_episode(
+                                    envs[0], ep, policy, preprocess, postprocess, device,
+                                    config, candidate_bundles=bundles)
+                                _record(ep, method, config, rid, result)
+                            continue
+                        for start in range(0, len(todo), rollout_batch_size):
+                            group = todo[start:start + rollout_batch_size]
+                            batch_t0 = time.perf_counter()
+                            results = run_episode_batch(
+                                envs[:len(group)], [item[0] for item in group], policy,
+                                preprocess, postprocess, device, cfg)
+                            inference_ms_total += (time.perf_counter() - batch_t0) * 1000.0
+                            occupied_lanes += len(group); batch_slots += rollout_batch_size
+                            for (ep, method, config, rid), result in zip(group, results):
+                                _record(ep, method, config, rid, result)
+                finally:
+                    for env in envs:
+                        env.close()
     except BaseException:
         store.finish_run(status="failed", n_rollouts=completed)
         raise
@@ -462,13 +502,26 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
         print(format_progress_table(tally, method_names, historical_sr=historical_sr))
     if probe_tally:
         print(format_probe_diagnostic_table(probe_tally, method_names))
+    peak_gb = 0.0
+    try:
+        import torch
+        if torch.cuda.is_available(): peak_gb = torch.cuda.max_memory_allocated() / 2**30
+    except ImportError:
+        pass
+    elapsed_h = max((time.time() - collection_t0) / 3600, 1e-9)
+    print(f"{cohort}: batch utilization {occupied_lanes / max(batch_slots, 1):.1%}; "
+          f"{completed / elapsed_h:.1f} rollouts/hour; inference {inference_ms_total / 1000:.1f}s; "
+          f"peak CUDA {peak_gb:.2f} GiB")
 
 
 def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
-                             experiment: str = LIBERO_10STEP_EXPERIMENT):
+                             experiment: str = LIBERO_10STEP_EXPERIMENT,
+                             rollout_batch_size: int = 2):
     """Run one corrected, 10-actions-per-query standard-LIBERO shard."""
     from . import models
 
+    if rollout_batch_size < 1:
+        raise ValueError("rollout_batch_size must be at least 1")
     episodes = identity_shard(_prepare_libero_episodes(), shard_count, shard_index)
     ablation = [
         ep for ep in episodes if (ep["suite"], ep["task_idx"]) in FULL_ABLATION_TASKS
@@ -494,6 +547,7 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
                       "generated_chunk_size": 50,
                       "skip_unused_renders": LIBERO_SKIP_RENDERS,
                       "render_lead": LIBERO_RENDER_LEAD},
+        rollout_batch_size=rollout_batch_size,
     )
     _run_collection(
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess, device=device,
@@ -504,6 +558,7 @@ def run_libero_hybrid_worker(*, shard_count: int, shard_index: int,
                       "generated_chunk_size": 50,
                       "skip_unused_renders": LIBERO_SKIP_RENDERS,
                       "render_lead": LIBERO_RENDER_LEAD},
+        rollout_batch_size=rollout_batch_size,
     )
 
 
@@ -610,10 +665,13 @@ def run_libero_horizon_diagnostic_worker(
 
 
 def run_libero_pro_worker(*, shard_count: int, shard_index: int,
-                          experiment: str = PRO_EXPERIMENT):
+                          experiment: str = PRO_EXPERIMENT,
+                          rollout_batch_size: int = 2):
     """Run one of six disjoint shards of the 600-identity canonical PRO core plan."""
     from . import libero_pro, models
 
+    if rollout_batch_size < 1:
+        raise ValueError("rollout_batch_size must be at least 1")
     episodes = identity_shard(_prepare_libero_pro_episodes(), shard_count, shard_index)
     methods = build_pro_methods()
     expected = len(episodes) * len(methods)
@@ -628,13 +686,15 @@ def run_libero_pro_worker(*, shard_count: int, shard_index: int,
         cohort="canonical", shard_count=shard_count, shard_index=shard_index,
         benchmark="libero_pro", driver="canonical_pro_core",
         run_metadata={"libero_pro_revision": libero_pro.LIBERO_PRO_REVISION},
+        rollout_batch_size=rollout_batch_size,
     )
 
 
 def run_libero_pro_expanded_worker(*, shard_count: int, shard_index: int,
                                    experiment: str = PRO_EXPANDED_EXPERIMENT,
                                    episodes_per_task: int = PRO_EXPANDED_EPISODES,
-                                   include_control: bool = PRO_EXPANDED_INCLUDE_CONTROL):
+                                   include_control: bool = PRO_EXPANDED_INCLUDE_CONTROL,
+                                   rollout_batch_size: int = 2):
     """Run one shard of the expanded 16-suite PRO plan at K=5, refine-last (3,4).
 
     Apply supabase/migrations/004_u_iter.sql FIRST. The per-iteration disagreement this run
@@ -670,4 +730,5 @@ def run_libero_pro_expanded_worker(*, shard_count: int, shard_index: int,
                       "pnp_k": PRO_EXPANDED_K, "pnp_steps": list(PRO_EXPANDED_STEPS),
                       "episodes_per_task": episodes_per_task,
                       "include_control": include_control},
+        rollout_batch_size=rollout_batch_size,
     )
