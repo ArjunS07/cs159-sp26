@@ -7,7 +7,7 @@ import torch
 from pnp.config import RolloutConfig
 from pnp.rollout import (_run_episode_serial, candidate_action_disagreement,
                          candidate_chunk_noise_seed, chunk_noise_seed, run_episode,
-                         run_episode_batch, _stack_batches)
+                         run_episode_batch, _stack_batches, _stack_policy_batches)
 
 
 def _observation():
@@ -217,6 +217,17 @@ def test_stack_batches_preserves_optional_processor_fields():
     assert batched["tokens"].shape == (2, 2)
     assert batched["pixel_mask"] is None
     assert batched["metadata"] == 0.5
+
+
+def test_stack_policy_batches_discards_transition_bookkeeping_fields():
+    batched = _stack_policy_batches([
+        {"observation.state": torch.ones(1, 2), "reward": 0.1,
+         "done": False, "info": {"elapsed": 1.0}},
+        {"observation.state": torch.zeros(1, 2), "reward": 0.2,
+         "done": False, "info": {"elapsed": 2.0}},
+    ])
+    assert set(batched) == {"observation.state"}
+    assert batched["observation.state"].shape == (2, 2)
 
 
 def test_batch_lane_noise_is_order_independent():

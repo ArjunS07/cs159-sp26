@@ -616,6 +616,27 @@ def _stack_batches(items):
     raise TypeError(f"cannot batch preprocessor output of type {type(first).__name__}")
 
 
+def _stack_policy_batches(items: list[dict]) -> dict[str, torch.Tensor]:
+    """Batch only the tensor fields consumed by ``PI05Policy.predict_action_chunk``.
+
+    LeRobot's preprocessor returns a canonical transition batch, which also includes bookkeeping
+    fields such as reward/done/info.  A singleton policy call ignores those non-tensor fields;
+    attempting to merge them across independent environments is both undefined and unnecessary.
+    PI05's inference contract consumes direct tensor fields only (images/state/tokens/masks and
+    optional tensor pad masks), so preserving precisely those fields matches stock behavior.
+    """
+    if not items or not all(isinstance(item, dict) for item in items):
+        raise TypeError("preprocessor must return non-empty dictionaries for batched PI05 rollout")
+    keys = set(items[0])
+    if any(set(item) != keys for item in items):
+        raise ValueError("preprocessor output keys differ across lanes")
+    return {
+        key: _stack_batches([item[key] for item in items])
+        for key in sorted(keys)
+        if all(isinstance(item[key], torch.Tensor) for item in items)
+    }
+
+
 def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                       config: RolloutConfig | None = None):
     """Run independent environments with one shared, truly batched policy invocation.
@@ -712,7 +733,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
             try:
                 with torch.no_grad():
                     chunks = policy.predict_action_chunk(
-                        _stack_batches(batches), noise=torch.cat(noises, dim=0))
+                        _stack_policy_batches(batches), noise=torch.cat(noises, dim=0))
                 infer_ms = (time.perf_counter() - started) * 1000.0
                 vf_delta = model._pnp.vf_evals - before_vf
                 arrays = chunks.detach().cpu().numpy()
@@ -819,7 +840,8 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
         try:
             with torch.no_grad():
                 terminal_chunks = policy.predict_action_chunk(
-                    _stack_batches(terminal_batches), noise=torch.cat(terminal_noises, dim=0))
+                    _stack_policy_batches(terminal_batches),
+                    noise=torch.cat(terminal_noises, dim=0))
             terminal_arrays = terminal_chunks.detach().cpu().numpy()
             for lane, i in enumerate(terminal_ids):
                 states[i]["terminal_generated_chunk"] = terminal_arrays[lane].copy()
