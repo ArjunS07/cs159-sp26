@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import datetime as dt
+import math
 import time
 from itertools import groupby
 
@@ -593,6 +594,17 @@ def _stack_batches(items):
         if any(item is not None for item in items):
             raise ValueError("preprocessor output mixes None and non-None values across lanes")
         return None
+    # Processor metadata sometimes remains a Python scalar (rather than becoming a tensor).
+    # Same-task rollout groups must agree on it, and the policy expects the scalar unchanged.
+    if isinstance(first, (bool, int, float, str, np.generic)):
+        def equal(value):
+            return (value == first
+                    or (isinstance(value, (float, np.floating))
+                        and isinstance(first, (float, np.floating))
+                        and math.isnan(value) and math.isnan(first)))
+        if not all(equal(item) for item in items):
+            raise ValueError("preprocessor scalar metadata differs across lanes")
+        return first
     if isinstance(first, torch.Tensor):
         return torch.cat(items, dim=0)
     if isinstance(first, dict):

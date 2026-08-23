@@ -211,11 +211,12 @@ def test_run_episode_batch_preserves_order_and_shrinks_active_lanes():
 
 def test_stack_batches_preserves_optional_processor_fields():
     batched = _stack_batches([
-        {"tokens": torch.ones(1, 2), "pixel_mask": None},
-        {"tokens": torch.zeros(1, 2), "pixel_mask": None},
+        {"tokens": torch.ones(1, 2), "pixel_mask": None, "metadata": 0.5},
+        {"tokens": torch.zeros(1, 2), "pixel_mask": None, "metadata": 0.5},
     ])
     assert batched["tokens"].shape == (2, 2)
     assert batched["pixel_mask"] is None
+    assert batched["metadata"] == 0.5
 
 
 def test_batch_lane_noise_is_order_independent():
