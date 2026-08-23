@@ -14,6 +14,17 @@ CREATE INDEX IF NOT EXISTS idx_rollouts_training_ready
 CREATE INDEX IF NOT EXISTS idx_rollouts_pcp_training_split
     ON rollouts(training_ready, pcp_train_eligible, benchmark, suite);
 
+-- Rows collected by the initial standard-LIBERO workers before partition labels existed are
+-- valid PCP-search training data.  This deliberately touches only standard LIBERO, never PRO,
+-- so a later heldout PRO manifest cannot become train-eligible through this backfill.
+UPDATE rollouts
+SET pcp_partition_id = COALESCE(pcp_partition_id, 'standard_libero'),
+    pcp_data_split = COALESCE(pcp_data_split, 'train'),
+    pcp_train_eligible = COALESCE(pcp_train_eligible, TRUE)
+WHERE experiment = 'pcp-search-rollouts-v1'
+  AND benchmark = 'libero'
+  AND training_ready IS TRUE;
+
 CREATE TABLE IF NOT EXISTS pcp_search_manifests (
     manifest_id        TEXT PRIMARY KEY,
     name               TEXT NOT NULL,
