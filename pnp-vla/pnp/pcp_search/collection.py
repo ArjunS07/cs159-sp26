@@ -51,7 +51,12 @@ def manifest_shard(items: Iterable[ManifestItem], shard_count: int,
 
 
 def resolve_manifest_episodes(manifest: RolloutManifest) -> dict[int, dict]:
-    """Resolve index-only manifest membership against the installed pinned LIBERO assets."""
+    """Resolve index-only membership against the benchmark pinned by the manifest."""
+    benchmark = manifest.collection_config.get("benchmark", "libero")
+    if benchmark == "libero_pro":
+        return _resolve_libero_pro_manifest_episodes(manifest)
+    if benchmark != "libero":
+        raise ValueError(f"unsupported PCP-search benchmark {benchmark!r}")
     from .. import libero_env
 
     tasks = sorted({item.task_key for item in manifest.items})
@@ -76,8 +81,54 @@ def resolve_manifest_episodes(manifest: RolloutManifest) -> dict[int, dict]:
             behavior_seed_index=item.behavior_seed_index,
             manifest_id=manifest.manifest_id,
             manifest_ordinal=item.ordinal,
+            pcp_partition_id=manifest.collection_config.get("partition_id", "standard_libero"),
+            pcp_data_split=manifest.collection_config.get("data_split", "train"),
+            pcp_train_eligible=bool(manifest.collection_config.get("train_eligible", True)),
         )
         resolved[item.ordinal] = episode
+    return resolved
+
+
+def _resolve_libero_pro_manifest_episodes(manifest: RolloutManifest) -> dict[int, dict]:
+    """Install the pinned PRO assets once, then resolve manifest indices exactly.
+
+    LIBERO-PRO modifies the installed benchmark package, so this setup intentionally lives in
+    the package worker rather than a notebook cell.  The notebook remains a thin launcher.
+    """
+    from .. import libero_pro
+
+    suites = sorted({item.suite for item in manifest.items})
+    state_indices = sorted({item.init_state_index for item in manifest.items})
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+        pro_dir = libero_pro.clone_libero_pro()
+        libero_pro.install_assets(suites=suites, pro_dir=pro_dir)
+        libero_pro.apply_env_patches(pro_dir=pro_dir)
+        libero_pro.patch_torch_load()
+        benchmark_dict = libero_pro.reload_benchmark()
+        episodes = libero_pro.build_libero_pro_episodes(
+            benchmark_dict, suites=suites, episode_idxs=state_indices)
+    by_identity = {
+        (episode["suite"], episode["task_idx"], episode["ep_idx"]): episode
+        for episode in episodes
+    }
+    resolved = {}
+    for item in manifest.items:
+        key = (item.suite, item.task_idx, item.init_state_index)
+        if key not in by_identity:
+            tail = captured.getvalue()[-2000:]
+            raise ValueError(f"manifest PRO state {key} is unavailable in pinned LIBERO-PRO\n{tail}")
+        episode = dict(by_identity[key])
+        episode.update(
+            behavior_seed_index=item.behavior_seed_index,
+            manifest_id=manifest.manifest_id,
+            manifest_ordinal=item.ordinal,
+            pcp_partition_id=manifest.collection_config["partition_id"],
+            pcp_data_split=manifest.collection_config["data_split"],
+            pcp_train_eligible=bool(manifest.collection_config["train_eligible"]),
+        )
+        resolved[item.ordinal] = episode
+    print(captured.getvalue()[-4000:])
     return resolved
 
 
@@ -103,6 +154,9 @@ def run_pcp_search_worker(*, manifest_id: str, shard_count: int = 4,
     manifest = registry.load(manifest_id)
     if manifest.manifest_id != manifest_id:
         raise ValueError("loaded manifest ID does not match requested content")
+    if manifest.collection_config.get("benchmark") == "libero_pro":
+        from .pro import validate_pro_manifest
+        validate_pro_manifest(manifest)
     items = manifest_shard(manifest.items, shard_count, shard_index)
     episodes = resolve_manifest_episodes(manifest)
     config = build_collection_config(manifest)
@@ -136,8 +190,9 @@ def run_pcp_search_worker(*, manifest_id: str, shard_count: int = 4,
     device = models.default_device()
     provenance = gather_provenance(
         model_repo_id=manifest.policy_repo_id, model_revision=manifest.policy_revision)
+    benchmark = manifest.collection_config.get("benchmark", "libero")
     store.start_run(
-        driver="pcp_search_collection", benchmark="libero", experiment=experiment,
+        driver="pcp_search_collection", benchmark=benchmark, experiment=experiment,
         provenance=provenance,
         config={
             "manifest_id": manifest_id,
@@ -150,6 +205,8 @@ def run_pcp_search_worker(*, manifest_id: str, shard_count: int = 4,
             "pnp_steps": list(config.pnp_steps),
             "pnp_k": config.pnp_k,
             "save_training_data": True,
+            "partition_id": manifest.collection_config.get("partition_id", "standard_libero"),
+            "data_split": manifest.collection_config.get("data_split", "train"),
         })
     logged = 0
     try:

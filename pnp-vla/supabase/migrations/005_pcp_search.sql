@@ -6,8 +6,13 @@ ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS training_data_path TEXT;
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS training_data_schema_version INTEGER;
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS training_ready BOOLEAN DEFAULT FALSE;
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS training_validation_json JSONB;
+ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS pcp_partition_id TEXT;
+ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS pcp_data_split TEXT;
+ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS pcp_train_eligible BOOLEAN;
 CREATE INDEX IF NOT EXISTS idx_rollouts_training_ready
     ON rollouts(training_ready, suite, task_idx);
+CREATE INDEX IF NOT EXISTS idx_rollouts_pcp_training_split
+    ON rollouts(training_ready, pcp_train_eligible, benchmark, suite);
 
 CREATE TABLE IF NOT EXISTS pcp_search_manifests (
     manifest_id        TEXT PRIMARY KEY,

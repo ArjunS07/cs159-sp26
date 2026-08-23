@@ -60,8 +60,23 @@ def test_generated_worker_notebooks_are_thin_and_parse():
                       if cell["cell_type"] == "code"]
         assert len(code_cells) == 2
         assert "run_pcp_search_worker" in code_cells[-1]
-        assert "ROLLOUT_BATCH_SIZE = 8" in code_cells[-1]
+        assert "ROLLOUT_BATCH_SIZE = 16" in code_cells[-1]
         assert "rollout_batch_size=ROLLOUT_BATCH_SIZE" in code_cells[-1]
         assert "SupabaseStore" not in code_cells[-1]
+        for source in code_cells:
+            ast.parse(source)
+
+
+def test_pro_worker_notebooks_are_independent_thin_launchers():
+    root = Path(__file__).parents[1]
+    for index in range(4):
+        path = root / "notebooks" / "workers" / f"53_pcp_search_pro_worker_{index}.ipynb"
+        document = json.loads(path.read_text())
+        code_cells = ["".join(cell["source"]) for cell in document["cells"]
+                      if cell["cell_type"] == "code"]
+        assert len(code_cells) == 2
+        assert f"SHARD_INDEX = {index}" in code_cells[-1]
+        assert "ROLLOUT_BATCH_SIZE = 16" in code_cells[-1]
+        assert "run_pcp_search_worker" in code_cells[-1]
         for source in code_cells:
             ast.parse(source)

@@ -31,3 +31,12 @@ states, raw and processed observations at all decision boundaries (including ter
 frozen VLA prefixes/tokens/masks/positions, stock normalized and environment actions, rewards and
 terminal masks, generated chunks, and complete steps-3/4 K=5 P&P traces. The P&P pass is
 measurement-only: executed actions are the pinned vanilla policy's actions.
+
+## Partitioned LIBERO-PRO program
+
+`53_pcp_search_initial_survey.ipynb` is read-only: it profiles the historical stock P&P PRO
+cohort, confirms that its old 50-action execution artifacts are selection-only, and prints the
+approved 640 train / 160 heldout whole-suite partition. `54_pcp_search_manifest_control.ipynb`
+freezes the train and heldout PRO manifests and each standard adaptive tranche. The four
+`53_pcp_search_pro_worker_*.ipynb` launchers accept either frozen PRO manifest ID. Heldout rows
+are fully collected but have `pcp_train_eligible=false`; loaders must never fit on them.
