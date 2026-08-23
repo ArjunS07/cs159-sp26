@@ -5,7 +5,8 @@ from unittest.mock import patch
 import httpx
 import numpy as np
 
-from pnp.store import SupabaseStore
+from pnp.store import (SupabaseStore, TRAINING_DATA_MULTIPART_FORMAT,
+                       _training_data_payloads)
 
 
 class StoreSerializationTests(unittest.TestCase):
@@ -43,6 +44,30 @@ class StoreSerializationTests(unittest.TestCase):
         self.assertEqual(files.calls, 2)
         self.assertEqual(store._bytes_written, 3)
         sleep.assert_called_once_with(1)
+
+    def test_large_training_artifact_round_trips_through_multipart_storage(self):
+        rng = np.random.default_rng(7)
+        arrays = {
+            "prefix/prefix_embeddings": rng.integers(
+                0, 256, size=(9, 4096), dtype=np.uint8),
+            "boundary/raw_agentview": rng.integers(
+                0, 256, size=(9, 2048), dtype=np.uint8),
+            "schema_version": np.asarray(1, dtype=np.int16),
+        }
+        path, uploads = _training_data_payloads("rollout", arrays, max_part_bytes=10_000)
+        self.assertTrue(path.endswith("/manifest.json"))
+        self.assertGreater(len(uploads), 2)
+        payloads = dict(uploads)
+        manifest = __import__("json").loads(payloads[path])
+        self.assertEqual(manifest["format"], TRAINING_DATA_MULTIPART_FORMAT)
+        self.assertTrue(all(len(data) <= 10_000 for key, data in uploads if key != path))
+
+        store = object.__new__(SupabaseStore)
+        store._download = payloads.__getitem__
+        loaded = store.load_training_data(path)
+        self.assertEqual(set(loaded), set(arrays))
+        for key, value in arrays.items():
+            np.testing.assert_array_equal(loaded[key], value)
 
 
 if __name__ == "__main__":

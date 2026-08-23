@@ -25,6 +25,11 @@ import httpx
 from .config import SCHEMA_VERSION, SAMPLER_ALGO_VERSION, PI05_REPO_ID, ADIM
 
 BUCKET = "artifacts"
+# Supabase Storage rejects objects above the project's configured per-object limit. Keep every
+# PCP training fragment comfortably below the common 50 MiB cap, even if compression is ineffective
+# for VLA embeddings or images.
+TRAINING_DATA_PART_BYTES = 24 * 1024 * 1024
+TRAINING_DATA_MULTIPART_FORMAT = "pcp-search-training-npz-v1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,6 +106,78 @@ def _npz_bytes(arrays: dict[str, np.ndarray]) -> bytes:
     buf = io.BytesIO()
     np.savez_compressed(buf, **{k: np.asarray(v) for k, v in arrays.items()})
     return buf.getvalue()
+
+
+def _training_data_payloads(rid: str, arrays: dict[str, np.ndarray],
+                            *, max_part_bytes: int = TRAINING_DATA_PART_BYTES
+                            ) -> tuple[str, list[tuple[str, bytes]]]:
+    """Serialize an artifact below Storage's object limit.
+
+    Small artifacts retain the original single-``.npz`` representation. Larger artifacts are
+    split only for transport: a JSON manifest at ``training_data_path`` records each array's
+    shape/dtype and its first-axis fragments, so loading reconstructs exactly the original dict.
+    """
+    if max_part_bytes < 1024:
+        raise ValueError("max_part_bytes must leave room for NPZ metadata")
+    arrays = {name: np.asarray(value) for name, value in arrays.items()}
+    legacy_key = f"pcp_search/training_data/{rid}.npz"
+    single = _npz_bytes(arrays)
+    if len(single) <= max_part_bytes:
+        return legacy_key, [(legacy_key, single)]
+
+    base = f"pcp_search/training_data/{rid}"
+    manifest = {"format": TRAINING_DATA_MULTIPART_FORMAT, "arrays": {}}
+    fragments: list[tuple[str, np.ndarray, int | None, int | None]] = []
+    for name in sorted(arrays):
+        value = arrays[name]
+        manifest["arrays"][name] = {
+            "dtype": value.dtype.str,
+            "shape": list(value.shape),
+            "parts": [],
+        }
+        if value.ndim == 0 or value.shape[0] == 0 or value.nbytes <= max_part_bytes:
+            fragments.append((name, value, None, None))
+            continue
+        bytes_per_row = max(1, int(np.ceil(value.nbytes / value.shape[0])))
+        rows = max(1, max_part_bytes // bytes_per_row)
+        for start in range(0, value.shape[0], rows):
+            stop = min(value.shape[0], start + rows)
+            fragments.append((name, value[start:stop], start, stop))
+
+    uploads: list[tuple[str, bytes]] = []
+    pending: dict[str, np.ndarray] = {}
+    pending_entries: list[tuple[str, int | None, int | None]] = []
+    pending_bytes = 0
+
+    def flush() -> None:
+        nonlocal pending, pending_entries, pending_bytes
+        if not pending:
+            return
+        payload = _npz_bytes(pending)
+        if len(payload) > max_part_bytes:
+            raise ValueError(
+                f"training-data fragment is {len(payload)} bytes, above transport cap "
+                f"{max_part_bytes}; reduce TRAINING_DATA_PART_BYTES")
+        key = f"{base}/parts/{len(uploads):04d}.npz"
+        uploads.append((key, payload))
+        for name, start, stop in pending_entries:
+            manifest["arrays"][name]["parts"].append(
+                {"path": key, "start": start, "stop": stop})
+        pending, pending_entries, pending_bytes = {}, [], 0
+
+    for name, value, start, stop in fragments:
+        # A first-axis slice is always below the raw transport budget. Do not combine it with
+        # other values if doing so would exceed that budget before compression.
+        if pending and pending_bytes + value.nbytes > max_part_bytes:
+            flush()
+        pending[name] = value
+        pending_entries.append((name, start, stop))
+        pending_bytes += value.nbytes
+    flush()
+    manifest_key = f"{base}/manifest.json"
+    uploads.append((manifest_key, json.dumps(
+        manifest, sort_keys=True, separators=(",", ":")).encode()))
+    return manifest_key, uploads
 
 
 def _parquet_bytes(df) -> bytes:
@@ -258,7 +335,13 @@ class SupabaseStore:
         rollout_row.setdefault("experiment", self.experiment)
         rollout_row.setdefault("sampler_algo_version", SAMPLER_ALGO_VERSION)
         rollout_row.setdefault("schema_version", SCHEMA_VERSION)
-        for name, key, payload in self._blob_specs(rid, blobs or {}):
+        blobs = blobs or {}
+        if blobs.get("training_data"):
+            training_path, uploads = _training_data_payloads(rid, blobs["training_data"])
+            for key, payload in uploads:
+                self._upload(key, payload)
+            rollout_row["training_data_path"] = training_path
+        for name, key, payload in self._blob_specs(rid, blobs):
             self._upload(key, payload)
             rollout_row[f"{name}_path"] = key
 
@@ -287,9 +370,6 @@ class SupabaseStore:
         if blobs.get("generated_chunks"):
             yield "generated_chunks", f"generated_chunks/{rid}.npz", _npz_bytes(
                 blobs["generated_chunks"])
-        if blobs.get("training_data"):
-            yield "training_data", f"pcp_search/training_data/{rid}.npz", _npz_bytes(
-                blobs["training_data"])
         if blobs.get("obs_frames"):
             yield "obs_frames", f"obs_frames/{rid}.npz", _npz_bytes(
                 {f"f{i}": a for i, a in enumerate(blobs["obs_frames"])})
@@ -520,6 +600,43 @@ class SupabaseStore:
             out.append({"rollout_id": r["rollout_id"], "suite": r["suite"],
                         "task_idx": r["task_idx"], "success": r["success"], "chunks": chunks})
         return out
+
+    def load_training_data(self, path: str) -> dict[str, np.ndarray]:
+        """Load either legacy single-file or multipart PCP-search training artifacts."""
+        payload = self._download(path)
+        if path.endswith(".npz"):
+            with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+                return {name: archive[name] for name in archive.files}
+        manifest = json.loads(payload)
+        if manifest.get("format") != TRAINING_DATA_MULTIPART_FORMAT:
+            raise ValueError(f"unsupported training-data manifest at {path}")
+        cached: dict[str, dict[str, np.ndarray]] = {}
+        result = {}
+        for name, spec in manifest["arrays"].items():
+            shape, dtype = tuple(spec["shape"]), np.dtype(spec["dtype"])
+            if not shape:
+                parts = spec["parts"]
+                if len(parts) != 1 or parts[0]["start"] is not None:
+                    raise ValueError(f"invalid scalar training-data parts for {name}")
+                key = parts[0]["path"]
+                if key not in cached:
+                    with np.load(io.BytesIO(self._download(key)), allow_pickle=False) as archive:
+                        cached[key] = {item: archive[item] for item in archive.files}
+                result[name] = cached[key][name]
+                continue
+            value = np.empty(shape, dtype=dtype)
+            for part in spec["parts"]:
+                key = part["path"]
+                if key not in cached:
+                    with np.load(io.BytesIO(self._download(key)), allow_pickle=False) as archive:
+                        cached[key] = {item: archive[item] for item in archive.files}
+                start, stop = part["start"], part["stop"]
+                if start is None or stop is None:
+                    value[...] = cached[key][name]
+                else:
+                    value[start:stop] = cached[key][name]
+            result[name] = value
+        return result
 
     # ── Q-corrector registry ─────────────────────────────────────────────────
     def register_q_corrector(self, q_ckpt_id: str, ckpt_bytes: bytes, meta: dict,
