@@ -5,6 +5,7 @@ import pytest
 from pnp.pcp_search.pro import (
     PRO_HELDOUT_QUOTAS,
     PRO_TRAIN_QUOTAS,
+    PRO_EVALUATION_ONLY_SUITES,
     build_pro_manifest,
     build_pro_sentinel_manifest,
     pro_partition_summary,
@@ -17,7 +18,9 @@ def test_pro_partition_is_exact_whole_suite_and_disjoint():
     assert summary["train_eligible_rollouts"] == 640
     assert summary["heldout_rollouts"] == 160
     assert not (set(PRO_TRAIN_QUOTAS) & set(PRO_HELDOUT_QUOTAS))
-    assert {"libero_10_swap", "libero_object_task", "libero_object_temp_x0.3"} <= set(PRO_HELDOUT_QUOTAS)
+    assert not any("_temp_" in suite for suite in PRO_TRAIN_QUOTAS)
+    assert all("_temp_" in suite for suite in PRO_HELDOUT_QUOTAS)
+    assert set(PRO_EVALUATION_ONLY_SUITES).isdisjoint(PRO_TRAIN_QUOTAS)
 
 
 @pytest.mark.parametrize("split, expected", [("train", 640), ("heldout", 160)])
@@ -37,7 +40,7 @@ def test_pro_manifest_round_trip_preserves_content_address():
     assert type(manifest).from_json(manifest.to_json()).manifest_id == manifest.manifest_id
 
 
-@pytest.mark.parametrize("split, expected", [("train", 9), ("heldout", 7)])
+@pytest.mark.parametrize("split, expected", [("train", 8), ("heldout", 6)])
 def test_pro_sentinel_covers_each_suite_once(split, expected):
     manifest = build_pro_sentinel_manifest(split=split)
     assert len(manifest.items) == expected

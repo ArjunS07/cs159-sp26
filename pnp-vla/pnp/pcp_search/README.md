@@ -36,7 +36,8 @@ measurement-only: executed actions are the pinned vanilla policy's actions.
 
 `53_pcp_search_initial_survey.ipynb` is read-only: it profiles the historical stock P&P PRO
 cohort, confirms that its old 50-action execution artifacts are selection-only, and prints the
-approved 640 train / 160 heldout whole-suite partition. `54_pcp_search_manifest_control.ipynb`
+approved 640 train / 160 heldout **position-perturbation category** partition.
+`54_pcp_search_manifest_control.ipynb`
 freezes the train and heldout PRO manifests and each standard adaptive tranche. The four
 `53_pcp_search_pro_worker_*.ipynb` launchers accept either frozen PRO manifest ID. Heldout rows
 are fully collected but have `pcp_train_eligible=false`; loaders must never fit on them.

@@ -45,7 +45,7 @@ def publish_pro_partition(*, store: SupabaseStore | None = None) -> dict[str, st
 
 
 def publish_pro_sentinels(*, store: SupabaseStore | None = None) -> dict[str, str]:
-    """Freeze the 9+7 artifact-validation sentinels before full PRO release."""
+    """Freeze the 8+6 artifact-validation sentinels before full PRO release."""
     store = store or SupabaseStore()
     registry = ManifestRegistry(store)
     manifests = {split: build_pro_sentinel_manifest(split=split)

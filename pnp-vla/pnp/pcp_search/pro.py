@@ -9,28 +9,28 @@ from .task_selection import COLLECTION_CONFIG, POLICY_REPO_ID, POLICY_REVISION
 
 PRO_PARTITION_ID = "pcp-search-pro-suite-partition-v1"
 
-# Each quota is divisible by ten tasks.  Whole suites are either train-eligible or held out;
-# the three historically zero-success suites are deliberately evaluation-only.
+# Each quota is divisible by ten tasks.  Position perturbations are a fully held-out category:
+# no temperature/position suite is train-eligible.  The two non-position zero-success suites are
+# neither collected for critic fitting nor allocated fresh budget in this first program.
 PRO_TRAIN_QUOTAS = {
-    "libero_object_temp_x0.1": 80,
-    "libero_object_temp_y0.1": 80,
-    "libero_object_temp_y0.2": 100,
     "libero_goal_swap": 60,
+    "libero_object_swap": 60,
     "libero_spatial_swap": 60,
-    "libero_goal_task": 80,
-    "libero_goal_with_milk": 60,
-    "libero_goal_with_yellow_book": 60,
-    "libero_object_with_mug": 60,
+    "libero_goal_task": 100,
+    "libero_goal_with_milk": 90,
+    "libero_spatial_with_milk": 90,
+    "libero_object_with_mug": 90,
+    "libero_goal_with_yellow_book": 90,
 }
 PRO_HELDOUT_QUOTAS = {
-    "libero_object_temp_x0.2": 20,
-    "libero_object_temp_y0.3": 20,
+    "libero_object_temp_x0.1": 30,
+    "libero_object_temp_y0.1": 30,
+    "libero_object_temp_x0.2": 30,
+    "libero_object_temp_y0.2": 30,
     "libero_object_temp_x0.3": 20,
-    "libero_object_swap": 20,
-    "libero_10_swap": 20,
-    "libero_object_task": 20,
-    "libero_spatial_with_milk": 40,
+    "libero_object_temp_y0.3": 20,
 }
+PRO_EVALUATION_ONLY_SUITES = ("libero_10_swap", "libero_object_task")
 
 
 def _validate_partition() -> None:
@@ -43,6 +43,10 @@ def _validate_partition() -> None:
         raise AssertionError("PRO heldout allocation must be 160 rollouts")
     if any(quota % 10 for quota in (*PRO_TRAIN_QUOTAS.values(), *PRO_HELDOUT_QUOTAS.values())):
         raise AssertionError("PRO quotas must allocate an equal integer count per task")
+    if any("_temp_" in suite for suite in PRO_TRAIN_QUOTAS):
+        raise AssertionError("position perturbations must be held out as a category")
+    if not all("_temp_" in suite for suite in PRO_HELDOUT_QUOTAS):
+        raise AssertionError("heldout collection must contain only position perturbations")
 
 
 def pro_partition_summary() -> dict:
@@ -53,6 +57,8 @@ def pro_partition_summary() -> dict:
         "heldout_rollouts": sum(PRO_HELDOUT_QUOTAS.values()),
         "train_suites": dict(PRO_TRAIN_QUOTAS),
         "heldout_suites": dict(PRO_HELDOUT_QUOTAS),
+        "heldout_category": "position_perturb",
+        "evaluation_only_suites": list(PRO_EVALUATION_ONLY_SUITES),
     }
 
 
@@ -86,9 +92,9 @@ def build_pro_manifest(*, split: str, name: str | None = None) -> RolloutManifes
         provenance={
             **pro_partition_summary(),
             "benchmark": "libero_pro",
-            "selection_policy": "whole-suite partition; stock P&P; execute 10 then replan",
-            "zero_success_suites": ["libero_10_swap", "libero_object_task",
-                                    "libero_object_temp_x0.3"],
+            "selection_policy": "whole-category position holdout; stock P&P; execute 10 then replan",
+            "heldout_category": "position_perturb",
+            "evaluation_only_suites": list(PRO_EVALUATION_ONLY_SUITES),
         })
 
 
