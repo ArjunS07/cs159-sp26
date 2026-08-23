@@ -586,6 +586,13 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
 def _stack_batches(items):
     """Recursively concatenate preprocessor outputs along their batch dimension."""
     first = items[0]
+    # LeRobot processor outputs legitimately carry optional fields (for example a camera mask
+    # or metadata) as None. They are not batch dimensions and must remain None when every lane
+    # agrees; the previous implementation only surfaced this after a batch shrank to one lane.
+    if first is None:
+        if any(item is not None for item in items):
+            raise ValueError("preprocessor output mixes None and non-None values across lanes")
+        return None
     if isinstance(first, torch.Tensor):
         return torch.cat(items, dim=0)
     if isinstance(first, dict):
