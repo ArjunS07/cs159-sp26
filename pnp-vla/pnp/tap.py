@@ -13,12 +13,66 @@ The sampler's strategy interface is unchanged, so only what BUILDS the tap lives
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from .config import RolloutConfig, PERTURB_SEED_MASK
 from .pnp import (run_probe, apply_refine, apply_fractional_refine, PnPRecorder,
                   temporal_decay_weights, temporal_prefix_weights)
 from .pcp import apply_correct, CorrectTelemetry
+
+
+def _prefix_lane(value, lane: int):
+    """Extract one batch lane while preserving the preprocessor's nested image structure."""
+    if isinstance(value, np.ndarray):
+        if value.ndim < 1 or lane >= value.shape[0]:
+            raise ValueError("captured prefix tensor has no requested batch lane")
+        return value[lane].copy()
+    if isinstance(value, list):
+        return [_prefix_lane(item, lane) for item in value]
+    if isinstance(value, dict):
+        return {key: _prefix_lane(item, lane) for key, item in value.items()}
+    raise TypeError(f"unsupported captured prefix value {type(value).__name__}")
+
+
+class PrefixCaptureTap:
+    """Non-invasive terminal-boundary prefix capture without running a P&P probe."""
+
+    invasive = False
+    capture_training_prefix = True
+
+    def __init__(self):
+        self.training_prefixes: list[dict] = []
+
+    @staticmethod
+    def selected(step, s):
+        return False
+
+    def finish(self, ctx):
+        if ctx.training_prefix is None:
+            raise RuntimeError("terminal prefix capture produced no model inputs")
+        self.training_prefixes.append(_prefix_lane(ctx.training_prefix, 0))
+
+
+class BatchedPrefixCaptureTap:
+    """Capture terminal prefixes for a batch of completed environments in one model call."""
+
+    invasive = False
+    capture_training_prefix = True
+
+    def __init__(self, batch_size: int):
+        self.batch_size = int(batch_size)
+        self.training_prefixes: list[dict] = []
+
+    @staticmethod
+    def selected(step, s):
+        return False
+
+    def finish(self, ctx):
+        if ctx.training_prefix is None:
+            raise RuntimeError("terminal prefix capture produced no model inputs")
+        self.training_prefixes = [
+            _prefix_lane(ctx.training_prefix, lane) for lane in range(self.batch_size)]
 
 
 class RolloutTap:
@@ -35,6 +89,7 @@ class RolloutTap:
         self.records_uncertainty = config.records_uncertainty
         self.save_ahats = config.save_ahats
         self.save_pcp = config.save_pcp_features
+        self.capture_training_prefix = config.save_training_data
         self._correcting = config.correction_lambda is not None
         self._refine_considered = 0
         self._refine_applied = 0
@@ -48,6 +103,7 @@ class RolloutTap:
         # pcp-features accumulation (only when save_pcp_features)
         self._pcp_chunks: list = []
         self._pcp_buf: list = []
+        self._training_prefixes: list[dict] = []
 
     # ── sampler-facing interface ────────────────────────────────────────────
     @property
@@ -230,11 +286,19 @@ class RolloutTap:
                 "steps": list(self._pcp_buf),
             })
             self._pcp_buf = []
+        if self.capture_training_prefix:
+            if ctx.training_prefix is None:
+                raise RuntimeError("training-data sink requested but sampler captured no prefix")
+            self._training_prefixes.append(_prefix_lane(ctx.training_prefix, 0))
 
     # ── result extraction (read by run_episode after the episode) ───────────
     @property
     def pcp_chunks(self):
         return self._pcp_chunks
+
+    @property
+    def training_prefixes(self):
+        return self._training_prefixes
 
     @property
     def pcp_telemetry(self):
@@ -278,9 +342,11 @@ class BatchedRolloutTap:
         self.config, self.recorders, self.adim = config, recorders, adim
         self.invasive = config.refine
         self.save_pcp = config.save_pcp_features
+        self.capture_training_prefix = config.save_training_data
         self.records_uncertainty = config.records_uncertainty or config.compute_multimodal
         self.pcp_chunks = [[] for _ in recorders]
         self._pcp_buf = [[] for _ in recorders]
+        self.training_prefixes = [[] for _ in recorders]
         self.generators = []
         for seed in seeds:
             if isinstance(seed, torch.Generator):
@@ -299,8 +365,23 @@ class BatchedRolloutTap:
                        generators=self.generators)
         for i, rec in enumerate(pr.lane_recs):
             rec = dict(rec); rec["step"] = ctx.step
+            # The batched path must retain the same complete per-position/per-iteration P&P
+            # trace as the serial collector; lane_recs alone only contains scalar summaries.
+            lane_ahats = pr.a_hats[:, i]
+            delta = (lane_ahats[1:] - lane_ahats[:-1]).abs()
+            if len(delta):
+                u_time = delta.mean(dim=(0, 2))
+                rec.update(
+                    u_time=u_time.detach().float().cpu().numpy(),
+                    u_iter_time=delta.mean(dim=2).detach().float().cpu().numpy(),
+                    u_iter=delta.mean(dim=(1, 2)).detach().float().cpu().numpy(),
+                    u_iter_vec=delta.mean(dim=1).detach().float().cpu().numpy(),
+                )
+                for horizon in (10, 20):
+                    if horizon <= len(u_time):
+                        rec[f"u_prefix_{horizon}"] = float(u_time[:horizon].mean())
             if self.config.save_ahats:
-                rec["a_hats"] = pr.a_hats[:, i].detach().float().cpu().numpy()
+                rec["a_hats"] = lane_ahats.detach().float().cpu().numpy()
             if self.records_uncertainty:
                 ctx.records[i].append(rec)
             if self.save_pcp:
@@ -317,3 +398,8 @@ class BatchedRolloutTap:
                     "obs_enc": ctx.obs_enc[i].detach().float().cpu().numpy(),
                     "chunk_pos": float(ctx.chunk_positions[i]), "steps": list(self._pcp_buf[i])})
                 self._pcp_buf[i] = []
+            if self.capture_training_prefix:
+                if ctx.training_prefix is None:
+                    raise RuntimeError(
+                        "training-data sink requested but sampler captured no prefix")
+                self.training_prefixes[i].append(_prefix_lane(ctx.training_prefix, i))

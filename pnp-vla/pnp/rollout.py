@@ -29,8 +29,13 @@ from . import sampler as _sampler
 # ─────────────────────────────────────────────────────────────────────────────
 # Seeding
 # ─────────────────────────────────────────────────────────────────────────────
-def episode_seed(init_state, episode_idx) -> int:
-    b = hashlib.md5(np.asarray(init_state).tobytes() + str(episode_idx or 0).encode()).digest()
+def episode_seed(init_state, episode_idx, behavior_seed_index: int = 0) -> int:
+    payload = np.asarray(init_state).tobytes() + str(episode_idx or 0).encode()
+    # Preserve every historical seed exactly. Only new manifests that explicitly request another
+    # behavior stream add the suffix.
+    if behavior_seed_index:
+        payload += f":behavior:{int(behavior_seed_index)}".encode()
+    b = hashlib.md5(payload).digest()
     return int.from_bytes(b[:4], "big")
 
 
@@ -170,6 +175,32 @@ def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int,
     return RolloutTap(config, recorder, device, adim, action_postprocess=action_postprocess)
 
 
+def _raw_robot_state(obs) -> np.ndarray:
+    """Free physical state: xyz + quaternion + two gripper joints (9D)."""
+    return np.concatenate([
+        obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"]
+    ]).astype(np.float32, copy=True)
+
+
+def _training_decision(obs, env, task_desc: str, step: int, policy_observation) -> dict:
+    proprio = policy_observation["observation.state"]
+    if torch.is_tensor(proprio):
+        proprio = proprio.detach().cpu().numpy()
+    sim_state = _sim_state(env)
+    if sim_state is None:
+        raise RuntimeError("PCP-search training collection requires raw simulator state")
+    return {
+        "step": int(step),
+        # Simulator-native camera orientation, plus exact post-preprocessor images in the prefix.
+        "raw_agentview": np.asarray(obs["agentview_image"]).copy(),
+        "raw_wrist": np.asarray(obs["robot0_eye_in_hand_image"]).copy(),
+        "raw_robot_state": _raw_robot_state(obs),
+        "policy_proprio": np.asarray(proprio, dtype=np.float32).copy(),
+        "sim_state": sim_state,
+        "instruction": str(task_desc),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The one rollout primitive.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,7 +245,9 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
     for runtime_policy in unique_policies:
         runtime_policy.model._pnp.num_steps = config.num_inference_steps
 
-    ep_seed = episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
+    ep_seed = episode_seed(
+        ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)),
+        ep.get("behavior_seed_index", 0))
     torch.manual_seed(ep_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(ep_seed)
@@ -228,7 +261,13 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
     est_chunks = max(1, round(max_steps / chunk_size))
     queue, ci = [], 0
     queue_postprocess = postprocess
-    executed_actions, robot_states, chunk_boundary_actions, chunk_noise_seeds = [], [], [], []
+    executed_actions, normalized_actions = [], []
+    robot_states, sim_states = [], []
+    rewards, terminated_flags, truncated_flags, step_success_flags = [], [], [], []
+    chunk_boundary_actions, chunk_noise_seeds, chunk_start_steps = [], [], []
+    training_decisions = [] if config.save_training_data else None
+    terminal_generated_chunk = None
+    terminal_noise_seed = None
     generated_chunks = [] if config.save_generated_chunks else None
     candidate_generated_chunks = (
         [] if config.save_generated_chunks and candidate_bundles is not None else None)
@@ -268,13 +307,25 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
             _render_next(wait_step >= NUM_STEPS_WAIT - lead)
             obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
 
+        if config.save_training_data:
+            robot_states.append(_raw_robot_state(obs))
+            initial_sim_state = _sim_state(env)
+            if initial_sim_state is None:
+                raise RuntimeError("PCP-search collection requires simulator state")
+            sim_states.append(initial_sim_state)
+
         for step in range(max_steps):
             if not queue:
+                chunk_start_steps.append(step)
                 for runtime_policy in unique_policies:
                     runtime_policy.model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
                 cns = chunk_noise_seed(ep_seed, ci)
                 chunk_noise_seeds.append(cns)
                 noise = _draw_chunk_noise(policy, device, cns)
+                policy_observation = obs_to_policy(obs, task_desc)
+                if training_decisions is not None:
+                    training_decisions.append(_training_decision(
+                        obs, env, task_desc, step, policy_observation))
                 inference_t0 = time.perf_counter()
                 if candidate_bundles is not None:
                     candidate_inputs, candidate_noises, perturb_seeds = [], [], []
@@ -282,7 +333,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                                           _) in enumerate(candidate_bundles):
                         candidate_inputs.append((
                             candidate_policy,
-                            candidate_preprocess(obs_to_policy(obs, task_desc))))
+                            candidate_preprocess(policy_observation)))
                         candidate_seed = candidate_chunk_noise_seed(
                             ep_seed, ci, candidate_index)
                         candidate_noises.append(
@@ -312,7 +363,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                             for action in candidate_actions]))
                     queue_postprocess = candidate_bundles[chosen][3]
                 elif multisample:
-                    batch = preprocess(obs_to_policy(obs, task_desc))
+                    batch = preprocess(policy_observation)
                     def _noise_of(si, _ci=ci):
                         return _draw_chunk_noise(policy, device,
                                                  chunk_noise_seed(ep_seed, _ci * 1000 + si))
@@ -333,7 +384,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                            if candidate_profiles is not None else {})})
                     queue_postprocess = postprocess
                 else:
-                    batch = preprocess(obs_to_policy(obs, task_desc))
+                    batch = preprocess(policy_observation)
                     with torch.no_grad():
                         chunk = policy.predict_action_chunk(batch, noise=noise)
                     queue_postprocess = postprocess
@@ -358,6 +409,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
             if not np.all(np.isfinite(a)):
                 nan_count += 1
                 a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            normalized_actions.append(np.asarray(a).flatten()[:ADIM].copy())
             # predict_action_chunk returns normalized policy-space actions. LIBERO must receive
             # the official postprocessor's environment-space action, exactly as in LeRobot's
             # select_action evaluation path and the pre-refactor notebooks.
@@ -370,19 +422,57 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
             executed_actions.append(np.asarray(a).flatten()[:ADIM].copy())
             if frames is not None:
                 frames.append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
-            robot_states.append(np.concatenate([
-                obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"]]).copy())
+            if not config.save_training_data:
+                robot_states.append(_raw_robot_state(obs))
             # The queue empties in `len(queue)` more steps, and the step that empties it returns
             # the obs the next re-plan consumes. Arm the cameras `lead` steps ahead of it.
             _render_next(len(queue) < lead)
-            obs, _, done, _ = env.step(a)
-            if env.check_success():
+            obs, reward, done, _ = env.step(a)
+            step_success = bool(env.check_success())
+            is_last_budget_step = step + 1 >= max_steps
+            terminated = bool(done or step_success)
+            truncated = bool(is_last_budget_step and not terminated)
+            rewards.append(float(reward))
+            terminated_flags.append(terminated)
+            truncated_flags.append(truncated)
+            step_success_flags.append(step_success)
+            if config.save_training_data:
+                robot_states.append(_raw_robot_state(obs))
+                next_sim_state = _sim_state(env)
+                if next_sim_state is None:
+                    raise RuntimeError("PCP-search collection requires simulator state")
+                sim_states.append(next_sim_state)
+            if step_success:
                 success = True
                 terminated_reason = "success"
                 break
             if done:
                 terminated_reason = "env_done"
                 break
+
+        # Bellman/RL-token data includes the final boundary. Generate (but never execute) one
+        # deterministic next chunk under a capture-only strategy; terminal masks ensure its Q
+        # contribution is zero while retaining the exact terminal VLA prefix for representation
+        # training and auditability.
+        if config.save_training_data:
+            if generated_chunks is None:
+                raise ValueError("save_training_data requires save_generated_chunks=True")
+            terminal_step = len(executed_actions)
+            terminal_observation = obs_to_policy(obs, task_desc)
+            training_decisions.append(_training_decision(
+                obs, env, task_desc, terminal_step, terminal_observation))
+            from .tap import PrefixCaptureTap
+            terminal_tap = PrefixCaptureTap()
+            terminal_noise_seed = chunk_noise_seed(ep_seed, ci)
+            terminal_noise = _draw_chunk_noise(policy, device, terminal_noise_seed)
+            _sampler.set_strategy(model, terminal_tap)
+            model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
+            with torch.no_grad():
+                terminal_chunk = policy.predict_action_chunk(
+                    preprocess(terminal_observation), noise=terminal_noise)
+            terminal_generated_chunk = (
+                terminal_chunk.squeeze(0).detach().cpu().numpy().copy())
+            _sampler.set_strategy(model, tap)
     except Exception as e:                              # log errored episodes, don't drop them
         status, error_msg = "errored", f"{type(e).__name__}: {e}"
         terminated_reason = "error"
@@ -399,7 +489,9 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
 
     elapsed = time.time() - t0
     finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    n_steps = step + 1
+    # The training contract requires an exact action count. Preserve the legacy error-row
+    # convention elsewhere so this persistence-only sink cannot rewrite historical semantics.
+    n_steps = len(executed_actions) if config.save_training_data else step + 1
     recorder.close_episode(success, n_steps)
     inst = compute_instability(executed_actions, chunk_boundary_actions)
 
@@ -431,6 +523,27 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
             if values:
                 probe_diagnostics[destination] = float(np.mean(values))
 
+    training_data = None
+    if config.save_training_data and status == "completed":
+        from .pcp_search.data import build_training_artifact
+        prefixes = list(tap.training_prefixes) + list(terminal_tap.training_prefixes)
+        training_data = build_training_artifact(
+            decisions=training_decisions, prefixes=prefixes,
+            generated_chunks=np.asarray(
+                [*generated_chunks, terminal_generated_chunk], dtype=np.float32),
+            normalized_actions=np.asarray(normalized_actions, dtype=np.float32),
+            env_actions=np.asarray(executed_actions, dtype=np.float32),
+            rewards=np.asarray(rewards, dtype=np.float32),
+            terminated=np.asarray(terminated_flags, dtype=bool),
+            truncated=np.asarray(truncated_flags, dtype=bool),
+            step_success=np.asarray(step_success_flags, dtype=bool),
+            robot_states=np.asarray(robot_states, dtype=np.float32),
+            sim_states=np.asarray(sim_states), chunk_start_steps=chunk_start_steps,
+            chunk_noise_seeds=[*chunk_noise_seeds, terminal_noise_seed], episode_seed=ep_seed,
+            perturb_seed=ep_seed ^ PERTURB_SEED_MASK,
+            initial_state=np.asarray(ep["init_state"]),
+        )
+
     result = dict(
         success=success, n_steps=n_steps, elapsed_s=elapsed, status=status, error_msg=error_msg,
         terminated_reason=terminated_reason, started_at=started_at, finished_at=finished_at,
@@ -442,7 +555,9 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
         probe_diagnostics=probe_diagnostics,
         trajectory=dict(
             actions=np.asarray(executed_actions, dtype=np.float32),
-            robot_state=np.asarray(robot_states, dtype=np.float32),
+            robot_state=np.asarray(
+                robot_states[:-1] if config.save_training_data else robot_states,
+                dtype=np.float32),
         ) if config.save_trajectory else None,
         generated_chunks=(dict(
             chunks=np.asarray(generated_chunks, dtype=np.float32),
@@ -450,6 +565,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                 candidate_generated_chunks, dtype=np.float32)}
                if candidate_generated_chunks is not None else {}))
             if generated_chunks is not None else None),
+        training_data=training_data,
         obs_frames=frames if config.save_observations else None,
         video=video_bytes,
     )
@@ -509,7 +625,8 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
         raise ValueError(
             f"n_action_steps={config.n_action_steps} exceeds chunk_size={chunk_size}")
     model._pnp.num_steps = config.num_inference_steps
-    seeds = [episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)))
+    seeds = [episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0)),
+                          ep.get("behavior_seed_index", 0))
              for ep in episodes]
     recorders = [PnPRecorder() for _ in episodes]
     for recorder, ep in zip(recorders, episodes):
@@ -520,8 +637,13 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
         perturb_gen = torch.Generator(device=torch.device(device))
         perturb_gen.manual_seed(int(seed) ^ PERTURB_SEED_MASK)
         state = dict(obs=None, queue=[], ci=0, step=0, success=False, status="completed",
-                     error_msg=None, terminated_reason="max_steps", actions=[], robot_states=[],
-                     boundaries=[], noise_seeds=[],
+                     error_msg=None, terminated_reason="max_steps", actions=[],
+                     normalized_actions=[], robot_states=[], sim_states=[], rewards=[],
+                     terminated_flags=[], truncated_flags=[], step_success_flags=[],
+                     boundaries=[], noise_seeds=[], chunk_start_steps=[],
+                     training_decisions=[] if config.save_training_data else None,
+                     training_prefixes=[] if config.save_training_data else None,
+                     terminal_generated_chunk=None, terminal_noise_seed=None,
                      generated=[] if config.save_generated_chunks else None,
                      frames=[] if (config.save_observations or config.video != "off") else None,
                      nan_count=0, inference_ms=0.0, vf_evals=0, perturb_gen=perturb_gen,
@@ -531,6 +653,12 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
             state["obs"] = env.set_init_state(ep["init_state"])
             for _ in range(NUM_STEPS_WAIT):
                 state["obs"], _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+            if config.save_training_data:
+                state["robot_states"].append(_raw_robot_state(state["obs"]))
+                initial_sim_state = _sim_state(env)
+                if initial_sim_state is None:
+                    raise RuntimeError("PCP-search collection requires simulator state")
+                state["sim_states"].append(initial_sim_state)
         except Exception as exc:
             state.update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
                          terminated_reason="error", done=True)
@@ -544,10 +672,16 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
             batches, noises, positions = [], [], []
             for i in infer_ids:
                 ep, state = episodes[i], states[i]
+                state["chunk_start_steps"].append(state["step"])
                 cseed = chunk_noise_seed(seeds[i], state["ci"])
                 state["noise_seeds"].append(cseed)
                 noises.append(_draw_chunk_noise(policy, device, cseed))
-                batches.append(preprocess(obs_to_policy(state["obs"], ep["task_desc"])))
+                policy_observation = obs_to_policy(state["obs"], ep["task_desc"])
+                if state["training_decisions"] is not None:
+                    state["training_decisions"].append(_training_decision(
+                        state["obs"], envs[i], ep["task_desc"], state["step"],
+                        policy_observation))
+                batches.append(preprocess(policy_observation))
                 positions.append(min(state["ci"] / max(1, round(ep["max_steps"] / chunk_size)), 1.0))
             tap = (BatchedRolloutTap(config, [recorders[i] for i in infer_ids],
                                      [states[i]["perturb_gen"] for i in infer_ids], device, adim)
@@ -587,6 +721,8 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                         for chunk in tap.pcp_chunks[lane]:
                             chunk["chunk_idx"] = len(target)
                             target.append(chunk)
+                    if tap is not None and tap.capture_training_prefix:
+                        state["training_prefixes"].extend(tap.training_prefixes[lane])
             except Exception as exc:
                 for i in infer_ids:
                     states[i].update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
@@ -600,6 +736,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
             if not np.all(np.isfinite(a)):
                 states[i]["nan_count"] += 1
                 a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            states[i]["normalized_actions"].append(np.asarray(a).flatten()[:ADIM].copy())
             raw.append(torch.as_tensor(a, device=device).unsqueeze(0))
         processed = postprocess(torch.cat(raw, dim=0))
         if isinstance(processed, torch.Tensor): processed = processed.detach().cpu().numpy()
@@ -611,11 +748,24 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 state["actions"].append(a.flatten()[:adim].copy())
                 if state["frames"] is not None:
                     state["frames"].append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
-                state["robot_states"].append(np.concatenate([
-                    obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"]]).copy())
+                if not config.save_training_data:
+                    state["robot_states"].append(_raw_robot_state(obs))
                 state["step"] += 1
-                state["obs"], _, env_done, _ = env.step(a)
-                if env.check_success():
+                state["obs"], reward, env_done, _ = env.step(a)
+                step_success = bool(env.check_success())
+                terminated = bool(env_done or step_success)
+                truncated = bool(state["step"] >= ep["max_steps"] and not terminated)
+                state["rewards"].append(float(reward))
+                state["terminated_flags"].append(terminated)
+                state["truncated_flags"].append(truncated)
+                state["step_success_flags"].append(step_success)
+                if config.save_training_data:
+                    state["robot_states"].append(_raw_robot_state(state["obs"]))
+                    next_sim_state = _sim_state(env)
+                    if next_sim_state is None:
+                        raise RuntimeError("PCP-search collection requires simulator state")
+                    state["sim_states"].append(next_sim_state)
+                if step_success:
                     state.update(success=True, terminated_reason="success", done=True)
                 elif env_done:
                     state.update(terminated_reason="env_done", done=True)
@@ -625,12 +775,67 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 state.update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
                              terminated_reason="error", done=True)
 
+    # Capture all final decision boundaries together. This does not execute another action; it
+    # supplies the terminal/truncated RL-token prefix and A_next required by the masked Bellman
+    # transition while retaining a batched GPU call.
+    terminal_ids = [i for i, state in enumerate(states)
+                    if config.save_training_data and state["status"] == "completed"]
+    if terminal_ids:
+        from .tap import BatchedPrefixCaptureTap
+        terminal_batches, terminal_noises, terminal_positions = [], [], []
+        for i in terminal_ids:
+            ep, state = episodes[i], states[i]
+            policy_observation = obs_to_policy(state["obs"], ep["task_desc"])
+            state["training_decisions"].append(_training_decision(
+                state["obs"], envs[i], ep["task_desc"], state["step"], policy_observation))
+            state["terminal_noise_seed"] = chunk_noise_seed(seeds[i], state["ci"])
+            terminal_noises.append(_draw_chunk_noise(
+                policy, device, state["terminal_noise_seed"]))
+            terminal_batches.append(preprocess(policy_observation))
+            terminal_positions.append(min(
+                state["ci"] / max(1, round(ep["max_steps"] / chunk_size)), 1.0))
+        terminal_tap = BatchedPrefixCaptureTap(len(terminal_ids))
+        _sampler.set_strategy(model, terminal_tap)
+        model._pnp.chunk_pos = terminal_positions
+        try:
+            with torch.no_grad():
+                terminal_chunks = policy.predict_action_chunk(
+                    _stack_batches(terminal_batches), noise=torch.cat(terminal_noises, dim=0))
+            terminal_arrays = terminal_chunks.detach().cpu().numpy()
+            for lane, i in enumerate(terminal_ids):
+                states[i]["terminal_generated_chunk"] = terminal_arrays[lane].copy()
+                states[i]["training_prefixes"].extend(terminal_tap.training_prefixes[lane:lane + 1])
+        except Exception as exc:
+            for i in terminal_ids:
+                states[i].update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
+                                 terminated_reason="error")
+
     results = []
     for i, (ep, state, recorder) in enumerate(zip(episodes, states, recorders)):
         recorder.close_episode(state["success"], state["step"])
         frames = state["frames"]
         video = (_encode_mp4(frames) if frames and config.video != "off" and
                  (config.video == "all" or not state["success"]) else None)
+        training_data = None
+        if config.save_training_data and state["status"] == "completed":
+            from .pcp_search.data import build_training_artifact
+            training_data = build_training_artifact(
+                decisions=state["training_decisions"], prefixes=state["training_prefixes"],
+                generated_chunks=np.asarray(
+                    [*state["generated"], state["terminal_generated_chunk"]], dtype=np.float32),
+                normalized_actions=np.asarray(state["normalized_actions"], dtype=np.float32),
+                env_actions=np.asarray(state["actions"], dtype=np.float32),
+                rewards=np.asarray(state["rewards"], dtype=np.float32),
+                terminated=np.asarray(state["terminated_flags"], dtype=bool),
+                truncated=np.asarray(state["truncated_flags"], dtype=bool),
+                step_success=np.asarray(state["step_success_flags"], dtype=bool),
+                robot_states=np.asarray(state["robot_states"], dtype=np.float32),
+                sim_states=np.asarray(state["sim_states"]),
+                chunk_start_steps=state["chunk_start_steps"],
+                chunk_noise_seeds=[*state["noise_seeds"], state["terminal_noise_seed"]],
+                episode_seed=seeds[i], perturb_seed=seeds[i] ^ PERTURB_SEED_MASK,
+                initial_state=np.asarray(ep["init_state"]),
+            )
         result = dict(success=state["success"], n_steps=state["step"],
             elapsed_s=time.time() - state["t0"], status=state["status"], error_msg=state["error_msg"],
             terminated_reason=state["terminated_reason"], started_at=state["started_at"],
@@ -641,10 +846,14 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
             instability=compute_instability(state["actions"], state["boundaries"]),
             recorder_episode=recorder.episodes[-1] if recorder.episodes else None,
             trajectory=dict(actions=np.asarray(state["actions"], dtype=np.float32),
-                            robot_state=np.asarray(state["robot_states"], dtype=np.float32))
+                            robot_state=np.asarray(
+                                state["robot_states"][:-1]
+                                if config.save_training_data else state["robot_states"],
+                                dtype=np.float32))
                        if config.save_trajectory else None,
             generated_chunks=(dict(chunks=np.asarray(state["generated"], dtype=np.float32))
                               if state["generated"] is not None else None),
+            training_data=training_data,
             obs_frames=frames if config.save_observations else None, video=video)
         if config.save_pcp_features: result["pcp_chunks"] = state.get("pcp_chunks", [])
         results.append(result)

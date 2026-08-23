@@ -249,7 +249,8 @@ class SupabaseStore:
         """Upsert one rollout (+ its per-step rows + Storage blobs).
 
         `blobs` may contain: ahats(dict of arrays), trajectory(dict of arrays), generated_chunks,
-        obs_frames(list of arrays), video(bytes), pcp_chunks(pandas.DataFrame).
+        training_data(dict of arrays), obs_frames(list of arrays), video(bytes),
+        pcp_chunks(pandas.DataFrame).
         Their Storage keys are written back onto the row.
         """
         rid = rollout_row["rollout_id"]
@@ -286,6 +287,9 @@ class SupabaseStore:
         if blobs.get("generated_chunks"):
             yield "generated_chunks", f"generated_chunks/{rid}.npz", _npz_bytes(
                 blobs["generated_chunks"])
+        if blobs.get("training_data"):
+            yield "training_data", f"pcp_search/training_data/{rid}.npz", _npz_bytes(
+                blobs["training_data"])
         if blobs.get("obs_frames"):
             yield "obs_frames", f"obs_frames/{rid}.npz", _npz_bytes(
                 {f"f{i}": a for i, a in enumerate(blobs["obs_frames"])})
@@ -325,7 +329,12 @@ class SupabaseStore:
 
     def rollout_id(self, experiment: str, ep: dict, method: str, config) -> str:
         identity = {k: ep.get(k) for k in
-                    ("benchmark", "suite", "task_idx", "episode_idx", "ep_idx", "init_state_hash")}
+                    ("benchmark", "suite", "task_idx", "episode_idx", "ep_idx",
+                     "init_state_hash")}
+        # Added for PCP-search manifests. Omit it for legacy episode dictionaries so every
+        # historical rollout ID remains byte-for-byte stable.
+        if "behavior_seed_index" in ep:
+            identity["behavior_seed_index"] = int(ep["behavior_seed_index"])
         return self.make_rollout_id(experiment, identity, self._logical_key(method, config))
 
     @staticmethod
@@ -382,6 +391,7 @@ class SupabaseStore:
             "benchmark": ep.get("benchmark"), "suite": ep["suite"], "task_idx": ep["task_idx"],
             "task_desc": ep.get("task_desc"), "episode_idx": ep.get("ep_idx", ep.get("episode_idx")),
             "init_state_hash": ep.get("init_state_hash"), "bddl_sha256": ep.get("bddl_sha256"),
+            "behavior_seed_index": ep.get("behavior_seed_index", 0),
             "suite_family": ep.get("suite_family"), "perturb_axis": ep.get("perturb_axis"),
             "perturb_strength": ep.get("perturb_strength"),
             "distractor_object": ep.get("distractor_object"),
@@ -399,6 +409,15 @@ class SupabaseStore:
             "started_at": result.get("started_at"), "finished_at": result.get("finished_at"),
             **denorm, **summary, **result["instability"],
         }
+        if result.get("training_data"):
+            from .pcp_search.data import (
+                TRAINING_ARTIFACT_SCHEMA_VERSION, validate_training_artifact)
+            validation = validate_training_artifact(result["training_data"])
+            row.update(
+                training_ready=bool(validation["training_ready"]),
+                training_data_schema_version=TRAINING_ARTIFACT_SCHEMA_VERSION,
+                training_validation_json=validation,
+            )
         # Keep stock LIBERO compatible with pre-cohort schemas. PRO manifests carry these keys
         # and require the idempotent migration at the bottom of supabase/schema.sql.
         for cohort_key in ("canonical_member", "expanded_member"):
@@ -435,6 +454,8 @@ class SupabaseStore:
             blobs["trajectory"] = result["trajectory"]
         if result.get("generated_chunks"):
             blobs["generated_chunks"] = result["generated_chunks"]
+        if result.get("training_data"):
+            blobs["training_data"] = result["training_data"]
         if result.get("obs_frames"):
             blobs["obs_frames"] = result["obs_frames"]
         if result.get("video"):

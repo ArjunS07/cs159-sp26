@@ -100,6 +100,7 @@ class Method:
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
+    PCP_SEARCH_COLLECT = "pcp_search_collect"  # Bellman/RL-token-ready vanilla collection
 
 
 ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.REFINEMENT,
@@ -111,7 +112,7 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.THRESHOLD_REFINEMENT, Method.DELAYED_REFINEMENT,
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
                Method.CHUNK_SOURCE_M1,
-               Method.PNP_ONLY, Method.PCP)
+               Method.PNP_ONLY, Method.PCP, Method.COLLECT, Method.PCP_SEARCH_COLLECT)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 
 
@@ -193,6 +194,9 @@ class RolloutConfig:
     save_observations: bool = False             # low-res decision-point frames -> Storage
     save_trajectory: bool = True                # executed actions + robot state -> Storage (cheap)
     save_generated_chunks: bool = False         # exact policy-space clean chunks at t=1
+    # PCP-search's lossless decision/transition artifact. This is persistence-only: enabling it
+    # must not change the executed trajectory or rollout ID.
+    save_training_data: bool = False
     # Measurement-only diagnostic: independently re-noise the unused suffix while preserving
     # the executed-prefix latent, then record how the prefix prediction changes.
     suffix_probe_samples: int = 0
@@ -314,6 +318,13 @@ class RolloutConfig:
         for sink in ("save_pcp_features", "save_ahats", "save_time_uncertainty"):
             if getattr(self, sink) and not self.has_probe:
                 raise ValueError(f"{sink} requires a probe (its data comes from the probe)")
+        if self.save_training_data:
+            if not self.has_probe:
+                raise ValueError("save_training_data requires a P&P probe")
+            if not self.save_generated_chunks:
+                raise ValueError("save_training_data requires save_generated_chunks=True")
+            if self.n_action_steps != 10:
+                raise ValueError("save_training_data requires explicit n_action_steps=10")
         if self.save_uncertainty and not self.has_probe:
             raise ValueError("save_uncertainty=True requires a probe")
         if self.render_lead < 1:

@@ -95,6 +95,7 @@ class ChunkContext:
     device: Any = None
     records: list = field(default_factory=list)
     chunk_positions: Any = None
+    training_prefix: Any = None  # exact frozen-VLA prefix/model inputs, CPU arrays when requested
 
 
 @dataclass
@@ -187,10 +188,33 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
         past_key_values=None, inputs_embeds=[prefix_embs, None], use_cache=True)
 
     positions = self._pnp.chunk_pos
+    training_prefix = None
+    if bool(getattr(strat, "capture_training_prefix", False)):
+        def cpu(value):
+            if torch.is_tensor(value):
+                return value.detach().cpu().numpy()
+            if isinstance(value, dict):
+                return {key: cpu(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [cpu(item) for item in value]
+            return np.asarray(value)
+
+        training_prefix = {
+            "processed_images": cpu(images),
+            "processed_image_masks": cpu(img_masks),
+            "token_ids": cpu(tokens),
+            "token_masks": cpu(masks),
+            "prefix_embeddings": prefix_embs.detach().to(
+                device="cpu", dtype=torch.float16).numpy(),
+            "prefix_pad_masks": cpu(prefix_pad_masks),
+            "prefix_attention_masks": cpu(prefix_att_masks),
+            "prefix_attention_2d_masks": cpu(prefix_att_2d_masks),
+            "prefix_position_ids": cpu(prefix_position_ids),
+        }
     ctx = ChunkContext(num_steps=num_steps, device=device,
                        obs_enc=prefix_embs.mean(dim=1).detach(),
                        chunk_pos=float(positions) if not isinstance(positions, (list, tuple)) else 0.0,
-                       chunk_positions=positions)
+                       chunk_positions=positions, training_prefix=training_prefix)
     if hasattr(strat, "recorders"):
         ctx.records = [[] for _ in range(bsize)]
 
