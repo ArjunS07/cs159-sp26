@@ -81,7 +81,10 @@ CREATE TRIGGER pcp_search_manifest_immutable
 BEFORE UPDATE OR DELETE ON pcp_search_manifests
 FOR EACH ROW EXECUTE FUNCTION reject_frozen_pcp_search_manifest_mutation();
 
-CREATE OR REPLACE VIEW pcp_search_training_ready_rollouts AS
+-- ``r.*`` gains columns as the rollout contract grows. Recreating the view avoids PostgreSQL's
+-- output-column-order restriction when this idempotent migration is re-run.
+DROP VIEW IF EXISTS pcp_search_training_ready_rollouts;
+CREATE VIEW pcp_search_training_ready_rollouts AS
 SELECT r.*, m.manifest_id, m.name AS manifest_name, mr.ordinal AS manifest_ordinal
 FROM rollouts r
 JOIN pcp_search_manifest_results mr ON mr.rollout_id = r.rollout_id
