@@ -19,6 +19,10 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
   checkpoint-bundle registration.
 - `10_train_hybrid_chunk_critic.ipynb` — twin 50-step IQL critic, distilled twin 10-step
   candidate critic, causal ranking sweep, controls, and checkpoint registration.
+- `56_pcp_critic_preflight.ipynb` — creates a frozen train-eligible PCP critic snapshot.
+- `57_train_pcp_critic.ipynb` — trains a new Cal-QL or IQL PCP critic checkpoint.
+- `58_pcp_critic_offline_eval.ipynb` — reads a registered checkpoint for offline diagnostics.
+- `59_pcp_search_adapter_smoke.ipynb` — verifies the guarded, offline-only adapter contract.
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 
