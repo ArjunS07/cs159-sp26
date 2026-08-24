@@ -3,7 +3,8 @@ import json
 from pathlib import Path
 
 from pnp.config import Method
-from pnp.pcp_search.collection import build_collection_config, manifest_shard
+from pnp.pcp_search.collection import build_collection_config, manifest_shard, rollout_batches
+from pnp.pcp_search.manifest import ManifestItem
 from pnp.pcp_search.task_selection import build_initial_manifest, ALL_TASKS
 from pnp.rollout import episode_seed
 from pnp.store import SupabaseStore
@@ -49,6 +50,21 @@ def test_manifest_shards_are_disjoint_and_complete():
     shards = [manifest_shard(items, 4, index) for index in range(4)]
     assert [len(shard) for shard in shards] == [100, 100, 100, 100]
     assert {item.ordinal for shard in shards for item in shard} == set(range(400))
+
+
+def test_mixed_task_batches_fill_gpu_lanes_without_changing_membership():
+    # The PRO collection has only 6--10 states per task. A nominal batch of 24
+    # must therefore span tasks; every manifest item must still occur exactly once.
+    items = [ManifestItem(ordinal=index, suite="libero_goal_swap", task_idx=index // 6,
+                          init_state_index=index % 6, behavior_seed_index=0,
+                          tier="test", selection_reason="test")
+             for index in range(18)]
+    mixed = rollout_batches(items, 12)
+    same_task = rollout_batches(items, 12, strategy="same_task")
+    assert [len(batch) for batch in mixed] == [12, 6]
+    assert max(len(batch) for batch in same_task) == 6
+    assert [item.ordinal for batch in mixed for item in batch] == list(range(18))
+    assert {item.ordinal for batch in same_task for item in batch} == set(range(18))
 
 
 def test_generated_worker_notebooks_are_thin_and_parse():

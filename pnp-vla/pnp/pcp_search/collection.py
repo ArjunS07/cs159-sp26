@@ -1,10 +1,9 @@
 """Package-owned Colab worker for PCP-search training-data collection."""
 from __future__ import annotations
 
-import collections
 import contextlib
 import io
-from typing import Iterable
+from typing import Iterable, Literal
 
 from ..config import Method, RolloutConfig
 from ..store import SupabaseStore, gather_provenance
@@ -48,6 +47,35 @@ def manifest_shard(items: Iterable[ManifestItem], shard_count: int,
         raise ValueError(f"invalid shard {shard_index}/{shard_count}")
     return [item for item in sorted(items, key=lambda value: value.ordinal)
             if item.ordinal % shard_count == shard_index]
+
+
+BatchStrategy = Literal["mixed_task", "same_task"]
+
+
+def rollout_batches(items: Iterable[ManifestItem], batch_size: int, *,
+                    strategy: BatchStrategy = "mixed_task") -> list[list[ManifestItem]]:
+    """Return deterministic batches for independent-env VLA rollout collection.
+
+    ``run_episode_batch`` owns a separate MuJoCo environment per lane and only
+    stacks PI05 tensor inputs, so BDDLs need not match.  The older same-task
+    scheduler was safe but left most of a nominal batch of 16 empty: the PRO
+    manifest has only 6--10 states per task.  ``mixed_task`` fills each VLA
+    call across tasks while preserving every item's rollout seed and identity.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    ordered = sorted(items, key=lambda value: value.ordinal)
+    if strategy == "mixed_task":
+        return [ordered[start:start + batch_size] for start in range(0, len(ordered), batch_size)]
+    if strategy != "same_task":
+        raise ValueError(f"unknown PCP-search batch strategy {strategy!r}")
+    grouped: dict[tuple[str, int], list[ManifestItem]] = {}
+    for item in ordered:
+        grouped.setdefault(item.task_key, []).append(item)
+    return [task_items[start:start + batch_size]
+            for task_key in sorted(grouped)
+            for task_items in (grouped[task_key],)
+            for start in range(0, len(task_items), batch_size)]
 
 
 def resolve_manifest_episodes(manifest: RolloutManifest) -> dict[int, dict]:
@@ -134,7 +162,8 @@ def _resolve_libero_pro_manifest_episodes(manifest: RolloutManifest) -> dict[int
 
 def run_pcp_search_worker(*, manifest_id: str, shard_count: int = 4,
                           shard_index: int = 0,
-                          rollout_batch_size: int = 2,
+                          rollout_batch_size: int = 24,
+                          batch_strategy: BatchStrategy = "mixed_task",
                           experiment: str = EXPERIMENT) -> None:
     """Collect one resumable shard of a frozen PCP-search manifest.
 
@@ -146,8 +175,8 @@ def run_pcp_search_worker(*, manifest_id: str, shard_count: int = 4,
     from ..libero_env import make_env
     from ..rollout import run_episode_batch
 
-    if rollout_batch_size < 1:
-        raise ValueError("rollout_batch_size must be positive")
+    # Validate before any model/asset load, so a notebook typo costs no GPU time.
+    rollout_batches([], rollout_batch_size, strategy=batch_strategy)
 
     store = SupabaseStore()
     registry = ManifestRegistry(store)
@@ -200,6 +229,7 @@ def run_pcp_search_worker(*, manifest_id: str, shard_count: int = 4,
             "shard_count": shard_count,
             "shard_index": shard_index,
             "rollout_batch_size": rollout_batch_size,
+            "batch_strategy": batch_strategy,
             "n_action_steps": 10,
             "generated_chunk_size": manifest.collection_config["generated_chunk_size"],
             "pnp_steps": list(config.pnp_steps),
@@ -210,46 +240,36 @@ def run_pcp_search_worker(*, manifest_id: str, shard_count: int = 4,
         })
     logged = 0
     try:
-        grouped = collections.defaultdict(list)
-        for item in pending:
-            grouped[item.task_key].append(item)
         with tqdm(total=len(pending), desc=f"pcp-search[{shard_index}]", unit="rollout",
                   dynamic_ncols=True) as progress:
-            for task_key in sorted(grouped):
-                task_items = sorted(grouped[task_key], key=lambda value: value.ordinal)
-                # LIBERO environments share a task BDDL within this group, so independent
-                # initial states can be advanced concurrently through one batched VLA call.
-                # Keep the tail as a singleton: run_episode_batch preserves the serial path
-                # there, avoiding padding/shape surprises for the final item.
-                for offset in range(0, len(task_items), rollout_batch_size):
-                    item_batch = task_items[offset:offset + rollout_batch_size]
-                    episode_batch = [episodes[item.ordinal] for item in item_batch]
-                    envs = [make_env(episode["bddl_path"]) for episode in episode_batch]
-                    try:
-                        results = run_episode_batch(
-                            envs, episode_batch, policy, preprocess, postprocess, device, config)
-                        for item, episode, result in zip(item_batch, episode_batch, results):
-                            rollout_id = store.rollout_id(
-                                experiment, episode, Method.PCP_SEARCH_COLLECT, config)
-                            store.log_result(
-                                rollout_id, episode, Method.PCP_SEARCH_COLLECT, config, result)
-                            if result.get("status") == "completed" and result.get("training_data"):
-                                validation = validate_training_artifact(result["training_data"])
-                                registry.record_result(
-                                    manifest_id, item.ordinal, rollout_id,
-                                    status="training_ready", validation=validation)
-                            else:
-                                registry.record_result(
-                                    manifest_id, item.ordinal, rollout_id, status="errored",
-                                    reason=result.get("error_msg") or "missing training artifact")
-                            logged += 1
-                            progress.update()
-                            progress.set_postfix_str(
-                                f"{item.suite.removeprefix('libero_')}/{item.task_idx} "
-                                f"success={int(bool(result.get('success')))}", refresh=False)
-                    finally:
-                        for env in envs:
-                            env.close()
+            for item_batch in rollout_batches(pending, rollout_batch_size, strategy=batch_strategy):
+                episode_batch = [episodes[item.ordinal] for item in item_batch]
+                envs = [make_env(episode["bddl_path"]) for episode in episode_batch]
+                try:
+                    results = run_episode_batch(
+                        envs, episode_batch, policy, preprocess, postprocess, device, config)
+                    for item, episode, result in zip(item_batch, episode_batch, results):
+                        rollout_id = store.rollout_id(
+                            experiment, episode, Method.PCP_SEARCH_COLLECT, config)
+                        store.log_result(
+                            rollout_id, episode, Method.PCP_SEARCH_COLLECT, config, result)
+                        if result.get("status") == "completed" and result.get("training_data"):
+                            validation = validate_training_artifact(result["training_data"])
+                            registry.record_result(
+                                manifest_id, item.ordinal, rollout_id,
+                                status="training_ready", validation=validation)
+                        else:
+                            registry.record_result(
+                                manifest_id, item.ordinal, rollout_id, status="errored",
+                                reason=result.get("error_msg") or "missing training artifact")
+                        logged += 1
+                        progress.update()
+                        progress.set_postfix_str(
+                            f"{item.suite.removeprefix('libero_')}/{item.task_idx} "
+                            f"success={int(bool(result.get('success')))}", refresh=False)
+                finally:
+                    for env in envs:
+                        env.close()
     except BaseException:
         store.finish_run(status="failed", n_rollouts=logged)
         raise

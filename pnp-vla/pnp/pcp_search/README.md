@@ -17,10 +17,12 @@ legacy Q-corrector architecture, loaders, checkpoints, or datasets.
    it is frozen. Worker progress lives in a separate table.
 
 3. Paste the resulting `pcps-...` ID into the four `52_pcp_search_worker_*.ipynb` launchers. The
-   notebooks only bootstrap the repo and invoke `run_pcp_search_worker`. Each exposes one runtime
-   throughput knob, `ROLLOUT_BATCH_SIZE` (default: 8), for independent same-task LIBERO
-   environments per GPU policy call. It does not alter rollout semantics, lane-specific seeds, or
-   saved artifacts; lower it only if a particular Colab GPU runs out of memory.
+   notebooks only bootstrap the repo and invoke `run_pcp_search_worker`. Set
+   `ROLLOUT_BATCH_SIZE=24` and use the default `mixed_task` scheduler on an L4; it fills a VLA
+   batch across independent BDDLs while preserving per-rollout seeds and manifest identities. It
+   does not alter rollout semantics, lane-specific seeds, or saved artifacts; lower it only if a
+   particular Colab GPU runs out of memory. Pass `batch_strategy='same_task'` only as a diagnostic
+   fallback if a future preprocessor cannot stack mixed-task tensor inputs.
 
 4. After the first 400 are audited, call `build_next_tranche_manifest` for each 200-rollout
    adaptive tranche. It allocates five-rollout blocks using failure-probability UCB90, expected
