@@ -13,7 +13,8 @@ from .task_selection import (
     initial_task_allocation,
 )
 from .collection import run_pcp_search_worker
-from .pro import build_pro_manifest, pro_partition_summary
+from .pro import (build_fresh_pro_train_manifest, build_fresh_pro_train_sentinel_manifest,
+                  build_pro_manifest, pro_partition_summary)
 from .survey import collect_initial_survey, render_initial_survey
 
 __all__ = [
@@ -24,6 +25,8 @@ __all__ = [
     "build_next_tranche_manifest",
     "initial_task_allocation",
     "run_pcp_search_worker",
+    "build_fresh_pro_train_manifest",
+    "build_fresh_pro_train_sentinel_manifest",
     "build_pro_manifest",
     "pro_partition_summary",
     "collect_initial_survey",

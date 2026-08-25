@@ -43,3 +43,10 @@ approved 640 train / 160 heldout **position-perturbation category** partition.
 freezes the train and heldout PRO manifests and each standard adaptive tranche. The four
 `53_pcp_search_pro_worker_*.ipynb` launchers accept either frozen PRO manifest ID. Heldout rows
 are fully collected but have `pcp_train_eligible=false`; loaders must never fit on them.
+
+## Fresh-state PRO second tranche
+
+`build_fresh_pro_train_manifest()` creates a separate, train-eligible 640-row round. It mirrors
+the initial train-suite quotas, uses state indices 10+ for suites with 50 states/task, and uses
+behavior seed 1 on the two ten-state milk suites. The complete teammate runbook is
+[`libero_collection_plan.md`](../../libero_collection_plan.md).
