@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from collections import OrderedDict
 import copy
 import hashlib
 import io
@@ -13,7 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from .config import PCPCriticTrainConfig
-from .data import PCPCriticTransition
+from .data import CompactCacheIndex, PCPCriticTransition
 from .model import PCPCritic
 from .objectives import calibrated_conservative_loss, expectile_loss, td_target
 
@@ -28,6 +29,46 @@ class TransitionDataset(Dataset):
     def __getitem__(self, index):
         item = self.transitions[index]
         return item
+
+
+class CompactTransitionDataset(Dataset):
+    """Lazy, bounded-LRU dataset backed by compact per-rollout cache files."""
+    def __init__(self, cache: CompactCacheIndex, rollout_ids: set[str], *, max_open_rollouts: int = 2):
+        self.cache_dir = cache.cache_dir
+        self.max_open_rollouts = max_open_rollouts
+        self.entries = [item for item in cache.rollouts if item["rollout_id"] in rollout_ids]
+        self.index = [(entry, chunk) for entry in self.entries for chunk in range(entry["n_transitions"])]
+        self._open: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
+
+    def __len__(self):
+        return len(self.index)
+
+    def _arrays(self, entry: dict) -> dict[str, np.ndarray]:
+        path = entry["path"]
+        values = self._open.pop(path, None)
+        if values is None:
+            # Arrays are only held for the small LRU, so a shuffled epoch cannot
+            # grow process memory with the number of collected rollouts.
+            with np.load(f"{self.cache_dir}/{path}", allow_pickle=False) as archive:
+                values = {name: archive[name] for name in archive.files}
+            if len(self._open) >= self.max_open_rollouts:
+                self._open.popitem(last=False)
+        self._open[path] = values
+        return values
+
+    def __getitem__(self, index):
+        entry, chunk = self.index[index]
+        values = self._arrays(entry)
+        return PCPCriticTransition(
+            rollout_id=entry["rollout_id"], group_id=entry["group_id"],
+            benchmark=entry["benchmark"], suite=entry["suite"], task_idx=entry["task_idx"], chunk_idx=chunk,
+            prefix_embeddings=values["prefix"][chunk], prefix_pad_mask=values["pad"][chunk],
+            robot_state=values["robot"][chunk], proprio=values["proprio"][chunk], action=values["action"][chunk],
+            next_prefix_embeddings=values["next_prefix"][chunk], next_prefix_pad_mask=values["next_pad"][chunk],
+            next_robot_state=values["next_robot"][chunk], next_proprio=values["next_proprio"][chunk],
+            next_action=values["next_action"][chunk], reward=float(values["reward"][chunk]),
+            discount=float(values["discount"][chunk]), mc_return=float(values["mc_return"][chunk]),
+            terminal=bool(values["discount"][chunk] == 0.0))
 
 
 def _pad_prefix(items, attr: str, mask_attr: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -64,7 +105,8 @@ def collate_transitions(items: list[PCPCriticTransition]) -> dict[str, torch.Ten
 
 
 def _loader(transitions, cfg, *, shuffle: bool) -> DataLoader:
-    return DataLoader(TransitionDataset(transitions), batch_size=cfg.batch_size, shuffle=shuffle,
+    dataset = transitions if isinstance(transitions, Dataset) else TransitionDataset(transitions)
+    return DataLoader(dataset, batch_size=cfg.batch_size, shuffle=shuffle,
                       drop_last=False, num_workers=0, collate_fn=collate_transitions)
 
 

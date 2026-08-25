@@ -2,10 +2,10 @@ import numpy as np
 import torch
 
 from pnp.pcp_critic.config import PCPCriticModelConfig, PCPCriticTrainConfig, PCPSearchAdapterConfig
-from pnp.pcp_critic.data import transitions_from_artifact
+from pnp.pcp_critic.data import _stream_action_statistics, _write_compact_rollout, transitions_from_artifact
 from pnp.pcp_critic.deploy import PCPSearchAdapter
 from pnp.pcp_critic.model import PCPCritic
-from pnp.pcp_critic.train import collate_transitions, train_critic
+from pnp.pcp_critic.train import CompactTransitionDataset, collate_transitions, train_critic
 from pnp.pcp_search.data import build_training_artifact
 
 
@@ -75,3 +75,23 @@ def test_pcp_critic_smoke_training_supports_both_objectives():
             n_local_actions=1, n_broad_actions=1))
         assert report["objective"] == objective
         assert report["updates_ran"] >= 1
+
+
+def test_preflight_statistics_stream_artifacts_and_compact_cache_is_lazy(tmp_path):
+    artifact = _artifact()
+    row = {"rollout_id": "r", "benchmark": "libero", "suite": "s", "task_idx": 0,
+           "init_state_hash": "i", "training_data_path": "artifact/r"}
+
+    class Store:
+        def load_training_data(self, path):
+            assert path == "artifact/r"
+            return artifact
+
+    mean, std, n_transitions = _stream_action_statistics(Store(), [row])
+    assert n_transitions == 2 and mean.shape == std.shape == (7,)
+    entry = _write_compact_rollout(tmp_path / "r.npz", row, artifact, gamma=.99)
+    from pnp.pcp_critic.data import CompactCacheIndex
+    cache = CompactCacheIndex("snapshot", str(tmp_path), (entry,), 8, 3, 2, 2)
+    dataset = CompactTransitionDataset(cache, {"r"}, max_open_rollouts=1)
+    assert len(dataset) == 2
+    assert dataset[0].prefix_embeddings.dtype == np.float16
