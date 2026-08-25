@@ -65,8 +65,19 @@ def publish_fresh_pro_train_sentinel(*, store: SupabaseStore | None = None) -> s
 
 
 def publish_fresh_pro_train(*, store: SupabaseStore | None = None) -> str:
-    """Freeze the approved second 640-row, train-eligible PRO tranche."""
+    """Freeze the approved second 640-row tranche after its sentinel validates."""
     store = store or SupabaseStore()
+    sentinel = build_fresh_pro_train_sentinel_manifest()
+    statuses = store.fetch_all(
+        "pcp_search_manifest_results", "ordinal,status",
+        configure=lambda query: query.eq("manifest_id", sentinel.manifest_id),
+        order_by=("ordinal",))
+    if (len(statuses) != len(sentinel.items)
+            or any(row.get("status") != "training_ready" for row in statuses)):
+        ready = sum(row.get("status") == "training_ready" for row in statuses)
+        raise RuntimeError(
+            f"fresh PRO sentinel {sentinel.manifest_id} is not validated: "
+            f"{ready}/{len(sentinel.items)} training_ready")
     manifest = build_fresh_pro_train_manifest()
     validate_pro_manifest(manifest)
     return ManifestRegistry(store).publish(manifest)

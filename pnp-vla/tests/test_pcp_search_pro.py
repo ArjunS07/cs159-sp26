@@ -16,6 +16,7 @@ from pnp.pcp_search.pro import (
     pro_partition_summary,
     validate_pro_manifest,
 )
+from pnp.pcp_search.control import publish_fresh_pro_train
 
 
 def test_pro_partition_is_exact_whole_suite_and_disjoint():
@@ -79,3 +80,12 @@ def test_fresh_pro_sentinel_is_a_recoverable_member_of_full_manifest():
     full_identity = {(i.suite, i.task_idx, i.init_state_index, i.behavior_seed_index) for i in full.items}
     assert {(i.suite, i.task_idx, i.init_state_index, i.behavior_seed_index) for i in sentinel.items} <= full_identity
     validate_pro_manifest(sentinel)
+
+
+def test_full_fresh_pro_publish_requires_validated_sentinel():
+    class Store:
+        def fetch_all(self, *_args, **_kwargs):
+            return [{"ordinal": 0, "status": "training_ready"}]
+
+    with pytest.raises(RuntimeError, match="fresh PRO sentinel"):
+        publish_fresh_pro_train(store=Store())
