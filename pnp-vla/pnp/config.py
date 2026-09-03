@@ -100,6 +100,9 @@ class Method:
     FIVE_STEP_SINGLE_QUERY = "five_step_single_query"
     FIVE_STEP_LOWEST_U20 = "five_step_x3_lowest_u20"
     FIVE_STEP_LOWEST_U20_REFINE = "five_step_x3_lowest_u20_then_refine"
+    FIVE_STEP_SINGLE_REFINE = "five_step_single_refine"
+    THREE_STEP_SINGLE_REFINE = "three_step_single_refine"
+    THREE_STEP_SINGLE_QUERY = "three_step_single_query"
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
@@ -116,6 +119,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
                Method.CHUNK_SOURCE_M1, Method.FIVE_STEP_SINGLE_QUERY,
                Method.FIVE_STEP_LOWEST_U20, Method.FIVE_STEP_LOWEST_U20_REFINE,
+               Method.FIVE_STEP_SINGLE_REFINE, Method.THREE_STEP_SINGLE_REFINE,
+               Method.THREE_STEP_SINGLE_QUERY,
                Method.PNP_ONLY, Method.PCP, Method.COLLECT, Method.PCP_SEARCH_COLLECT)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 

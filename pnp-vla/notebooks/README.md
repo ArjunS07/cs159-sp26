@@ -29,6 +29,10 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
 - `61_analyze_five_step_diversity_pro220.ipynb` — exact matched SR and per-suite deltas
   versus historical 10-step stock, plus all three candidate-pair cosine/L2 diagnostics
   for the first 10 and full 50 actions; supports interim previews and strict final analysis.
+- `workers/62_coarse_single_refinement_pro220_worker_{0,1}.ipynb` — single-query follow-up:
+  five-step refine `(2,3)`, three-step refine `(2,)`, and three-step no refinement, all K=5
+  and 10 executed actions. Two 110-identity/330-rollout shards; exact matched historical
+  comparisons every 25 completed three-arm identities and at the end.
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 

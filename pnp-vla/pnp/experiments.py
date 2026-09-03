@@ -257,7 +257,10 @@ _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
                    Method.CHUNK_SOURCE_M1: "source + m1",
                    Method.FIVE_STEP_SINGLE_QUERY: "5-step x1",
                    Method.FIVE_STEP_LOWEST_U20: "5-step x3 low U20",
-                   Method.FIVE_STEP_LOWEST_U20_REFINE: "5-step x3 + refine"}
+                   Method.FIVE_STEP_LOWEST_U20_REFINE: "5-step x3 + refine",
+                   Method.FIVE_STEP_SINGLE_REFINE: "5-step x1 refine",
+                   Method.THREE_STEP_SINGLE_REFINE: "3-step x1 refine",
+                   Method.THREE_STEP_SINGLE_QUERY: "3-step x1"}
 
 
 def format_progress_table(tally, method_names, historical_sr=None, *, include_overall=False,
@@ -305,6 +308,33 @@ def format_progress_table(tally, method_names, historical_sr=None, *, include_ov
             cells += f"{'-':>18}" if reference is None else f"{reference:>17.0%} "
         lines.append(f"{'OVERALL':<32}{cells}")
     return "\n".join(lines)
+
+
+def format_matched_progress_table(identity_outcomes, method_names, references) -> str:
+    """Count every new/historical arm on exactly the same completed identities.
+
+    Outcomes map a four-field identity to {method: success}; each reference maps that
+    same identity to success. Partial identities are excluded, not counted as failures.
+    Historical OVERALL is identity-weighted, including on partial-suite previews.
+    """
+    complete = {key: outcomes for key, outcomes in identity_outcomes.items()
+                if set(method_names).issubset(outcomes)}
+    tally = collections.defaultdict(lambda: [0, 0])
+    for key, outcomes in complete.items():
+        for label, reference in references.items():
+            if key not in reference:
+                raise ValueError(f"{label}: missing completed identity {key}")
+        for name in method_names:
+            tally[(key[0], name)][0] += 1
+            tally[(key[0], name)][1] += int(outcomes[name])
+        for label, reference in references.items():
+            tally[(key[0], label)][0] += 1
+            tally[(key[0], label)][1] += int(reference[key])
+    return format_progress_table(
+        tally, [*method_names, *references], historical_sr=False, include_overall=True,
+        count_label=(f"Exact matched table: {len(complete)} identities completed in THIS shard; "
+                     "every column uses these identities. Cells = SR (successes/identities); "
+                     "hist = reused rollouts."))
 
 
 def format_probe_diagnostic_table(tally, method_names) -> str:
@@ -409,7 +439,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                     candidate_bundles_by_method=None, historical_sr=None,
                     rollout_batch_size: int = 2, report_every_identities=None,
                     initial_identity_methods=None, progress_include_overall=False,
-                    progress_count_label=None, resume_completed_only=False):
+                    progress_count_label=None, resume_completed_only=False,
+                    matched_reference_outcomes=None, initial_identity_outcomes=None):
     from tqdm.auto import tqdm
     from .libero_env import make_env
     from .rollout import run_episode_batch
@@ -443,6 +474,19 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     identity_methods = collections.defaultdict(set)
     for value in initial_identity_methods or ():
         identity_methods[tuple(value[:4])].add(value[4])
+    identity_outcomes = {tuple(key): dict(value)
+                         for key, value in (initial_identity_outcomes or {}).items()}
+    for key, outcomes in identity_outcomes.items():
+        identity_methods[key].update(outcomes)
+
+    def progress_table():
+        if matched_reference_outcomes is not None:
+            return format_matched_progress_table(
+                identity_outcomes, method_names, matched_reference_outcomes)
+        return format_progress_table(
+            tally, method_names, historical_sr=historical_sr,
+            include_overall=progress_include_overall, count_label=progress_count_label)
+
     completed_identities = sum(
         set(method_names).issubset(names) for names in identity_methods.values())
     next_identity_report = None
@@ -484,6 +528,7 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                             ep.get("init_state_hash", ""))
                 was_complete = set(method_names).issubset(identity_methods[identity])
                 identity_methods[identity].add(name)
+                identity_outcomes.setdefault(identity, {})[name] = bool(result["success"])
                 is_complete = set(method_names).issubset(identity_methods[identity])
                 if is_complete and not was_complete:
                     completed_identities += 1
@@ -506,19 +551,13 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                     tqdm.write(
                         f"\n--- {cohort}[{shard_index}] after {completed_identities} "
                         f"identities completed in this shard; {completed} new rollouts logged ---")
-                    tqdm.write(format_progress_table(
-                        tally, method_names, historical_sr=historical_sr,
-                        include_overall=progress_include_overall,
-                        count_label=progress_count_label))
+                    tqdm.write(progress_table())
                     if probe_tally:
                         tqdm.write(format_probe_diagnostic_table(probe_tally, method_names))
                 elif report_every and completed % report_every == 0:
                     tqdm.write(f"\n--- {cohort}[{shard_index}] after {completed} rollouts "
                                f"({completed}/{pending}) ---")
-                    tqdm.write(format_progress_table(
-                        tally, method_names, historical_sr=historical_sr,
-                        include_overall=progress_include_overall,
-                        count_label=progress_count_label))
+                    tqdm.write(progress_table())
                     if probe_tally:
                         tqdm.write(format_probe_diagnostic_table(probe_tally, method_names))
 
@@ -564,10 +603,7 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     print(f"{cohort}: logged {completed} new rollouts; "
           f"{completed_identities} identities complete in this shard")
     if tally:
-        print(format_progress_table(
-            tally, method_names, historical_sr=historical_sr,
-            include_overall=progress_include_overall,
-            count_label=progress_count_label))
+        print(progress_table())
     if probe_tally:
         print(format_probe_diagnostic_table(probe_tally, method_names))
     peak_gb = 0.0
