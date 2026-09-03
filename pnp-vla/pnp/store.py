@@ -532,6 +532,13 @@ class SupabaseStore:
                     s.get("candidate_profiles") for s in sels]
                 row["ms_candidate_u"]["selection_uncertainty_horizon"] = [
                     s.get("selection_uncertainty_horizon") for s in sels]
+            for field in ("candidate_noise_seeds", "selected_noise_seed",
+                          "selected_perturb_seed", "u_spread",
+                          "executed_prefix_disagreement", "inference_ms",
+                          "n_vf_evals", "selected_refinement"):
+                if any(selection.get(field) is not None for selection in sels):
+                    row["ms_candidate_u"][field] = [
+                        selection.get(field) for selection in sels]
         blobs = {}
         if result.get("trajectory"):
             blobs["trajectory"] = result["trajectory"]

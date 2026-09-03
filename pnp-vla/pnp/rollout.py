@@ -110,7 +110,7 @@ def compute_instability(executed_actions, chunk_boundary_actions=None, gripper_d
 
 
 def candidate_action_disagreement(actions, action_dim: int = ADIM,
-                                  gripper_dim: int = 6) -> dict:
+                                  gripper_dim: int = 6, horizon: int | None = None) -> dict:
     """Pairwise diversity metrics for clean, non-perturbed candidate action chunks.
 
     Two-candidate outputs preserve the original definitions exactly. With three or more
@@ -120,8 +120,12 @@ def candidate_action_disagreement(actions, action_dim: int = ADIM,
     if len(actions) < 2:
         raise ValueError("candidate disagreement requires at least two actions")
     arrays = [action.squeeze(0).detach().float().cpu().numpy() for action in actions]
-    horizon = min(len(array) for array in arrays)
-    arrays = [array[:horizon, :action_dim] for array in arrays]
+    available_horizon = min(len(array) for array in arrays)
+    if horizon is not None:
+        if isinstance(horizon, bool) or int(horizon) != horizon or horizon < 1:
+            raise ValueError("horizon must be a positive integer or None")
+        available_horizon = min(available_horizon, int(horizon))
+    arrays = [array[:available_horizon, :action_dim] for array in arrays]
     pair_metrics = []
     for left in range(len(arrays)):
         for right in range(left + 1, len(arrays)):
@@ -138,6 +142,7 @@ def candidate_action_disagreement(actions, action_dim: int = ADIM,
                 gripper_disagreement = float(np.mean(
                     (a0[:, gripper_dim] > 0) != (a1[:, gripper_dim] > 0)))
             pair_metrics.append({
+                "left": left, "right": right,
                 "action_l2_mean": float(per_action_l2.mean()),
                 "action_l2_max": float(per_action_l2.max()),
                 "first_action_l2": float(per_action_l2[0]),
@@ -154,6 +159,7 @@ def candidate_action_disagreement(actions, action_dim: int = ADIM,
     return {
         "n_candidates": len(arrays),
         "n_candidate_pairs": len(pair_metrics),
+        "actions_compared": available_horizon,
         "action_l2_mean": _mean("action_l2_mean"),
         "action_l2_max": float(max(item["action_l2_max"] for item in pair_metrics)),
         "first_action_l2": _mean("first_action_l2"),
@@ -161,6 +167,7 @@ def candidate_action_disagreement(actions, action_dim: int = ADIM,
         "action_l2_normalized": _mean("action_l2_normalized"),
         "action_cosine": _mean("action_cosine"),
         "gripper_sign_disagreement": _mean("gripper_sign_disagreement"),
+        "pairs": pair_metrics,
     }
 
 
@@ -226,6 +233,9 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
         if any(len(bundle) != 4 for bundle in candidate_bundles):
             raise ValueError(
                 "each candidate bundle must be (label, policy, preprocess, postprocess)")
+        if config.multi_sample_refine_selected:
+            raise ValueError(
+                "multi_sample_refine_selected currently supports same-policy candidates only")
 
     recorder = PnPRecorder()
     tap = build_tap(config, recorder, device, adim, action_postprocess=postprocess)
@@ -271,7 +281,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
     terminal_noise_seed = None
     generated_chunks = [] if config.save_generated_chunks else None
     candidate_generated_chunks = (
-        [] if config.save_generated_chunks and candidate_bundles is not None else None)
+        [] if config.save_generated_chunks and multisample else None)
     ms_selections = [] if multisample else None
     # capture agentview frames when either sink wants them (obs_frames OR a video)
     frames = [] if (config.save_observations or config.video != "off") else None
@@ -321,15 +331,20 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                 for runtime_policy in unique_policies:
                     runtime_policy.model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
                 cns = chunk_noise_seed(ep_seed, ci)
-                chunk_noise_seeds.append(cns)
+                executed_chunk_noise_seed = cns
                 noise = _draw_chunk_noise(policy, device, cns)
                 policy_observation = obs_to_policy(obs, task_desc)
                 if training_decisions is not None:
                     training_decisions.append(_training_decision(
                         obs, env, task_desc, step, policy_observation))
                 inference_t0 = time.perf_counter()
+                vf_evals_before = sum(
+                    int(runtime_policy.model._pnp.vf_evals)
+                    for runtime_policy in unique_policies)
+                selection_record = None
                 if candidate_bundles is not None:
-                    candidate_inputs, candidate_noises, perturb_seeds = [], [], []
+                    candidate_inputs, candidate_noises = [], []
+                    candidate_noise_seeds, perturb_seeds = [], []
                     for candidate_index, (_, candidate_policy, candidate_preprocess,
                                           _) in enumerate(candidate_bundles):
                         candidate_inputs.append((
@@ -337,6 +352,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                             candidate_preprocess(policy_observation)))
                         candidate_seed = candidate_chunk_noise_seed(
                             ep_seed, ci, candidate_index)
+                        candidate_noise_seeds.append(candidate_seed)
                         candidate_noises.append(
                             _draw_chunk_noise(candidate_policy, device, candidate_seed))
                         perturb_seeds.append(candidate_seed)
@@ -349,15 +365,24 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                     chunk, chosen, cand_u, candidate_actions = selection[:4]
                     candidate_profiles = selection[4] if detailed_selection else None
                     labels = [str(bundle[0]) for bundle in candidate_bundles]
-                    ms_selections.append({
+                    executed_chunk_noise_seed = candidate_noise_seeds[chosen]
+                    selection_record = {
                         "chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u,
                         "labels": labels, "chosen_label": labels[chosen],
+                        "candidate_noise_seeds": candidate_noise_seeds,
+                        "selected_noise_seed": int(executed_chunk_noise_seed),
+                        "selected_perturb_seed": int(perturb_seeds[chosen]),
+                        "u_spread": float(max(cand_u) - min(cand_u)),
                         "action_disagreement": candidate_action_disagreement(
                             candidate_actions, action_dim=adim),
+                        "executed_prefix_disagreement": candidate_action_disagreement(
+                            candidate_actions, action_dim=adim,
+                            horizon=config.n_action_steps),
                         **({"candidate_profiles": candidate_profiles,
                             "selection_uncertainty_horizon":
                                 int(config.selection_uncertainty_horizon)}
-                           if candidate_profiles is not None else {})})
+                           if candidate_profiles is not None else {})}
+                    ms_selections.append(selection_record)
                     if candidate_generated_chunks is not None:
                         candidate_generated_chunks.append(np.stack([
                             action.squeeze(0).detach().float().cpu().numpy()
@@ -365,30 +390,82 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                     queue_postprocess = candidate_bundles[chosen][3]
                 elif multisample:
                     batch = preprocess(policy_observation)
-                    def _noise_of(si, _ci=ci):
-                        return _draw_chunk_noise(policy, device,
-                                                 chunk_noise_seed(ep_seed, _ci * 1000 + si))
+                    def _candidate_seed(si, _ci=ci):
+                        if config.candidate_seed_scheme == "stock_slot0_v1":
+                            return candidate_chunk_noise_seed(ep_seed, _ci, si)
+                        return chunk_noise_seed(ep_seed, _ci * 1000 + si)
+
+                    def _noise_of(si):
+                        return _draw_chunk_noise(policy, device, _candidate_seed(si))
+
+                    candidate_noise_seeds = [
+                        _candidate_seed(index) for index in range(config.num_samples)]
                     detailed_selection = config.selection_uncertainty_horizon is not None
+                    selection_kwargs = ({"perturb_seed_of": _candidate_seed}
+                                        if config.candidate_seed_scheme == "stock_slot0_v1"
+                                        else {})
                     selection = multi_sample_select(
                         policy, batch, ep_seed, ci, config.num_samples,
                         tuple(config.ms_probe_steps), _noise_of,
                         num_iterations=config.pnp_k,
                         uncertainty_horizon=config.selection_uncertainty_horizon,
-                        return_details=detailed_selection)
-                    chunk, chosen, cand_u = selection[:3]
-                    candidate_profiles = selection[3] if detailed_selection else None
-                    ms_selections.append({
+                        return_details=detailed_selection, return_actions=True,
+                        **selection_kwargs)
+                    chunk, chosen, cand_u, candidate_actions = selection[:4]
+                    candidate_profiles = selection[4] if detailed_selection else None
+                    executed_chunk_noise_seed = candidate_noise_seeds[chosen]
+                    selection_record = {
                         "chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u,
+                        "candidate_noise_seeds": candidate_noise_seeds,
+                        "selected_noise_seed": int(executed_chunk_noise_seed),
+                        "selected_perturb_seed": int(
+                            executed_chunk_noise_seed
+                            if config.candidate_seed_scheme == "stock_slot0_v1"
+                            else ep_seed + ci * 1000 + chosen),
+                        "u_spread": float(max(cand_u) - min(cand_u)),
+                        "action_disagreement": candidate_action_disagreement(
+                            candidate_actions, action_dim=adim),
+                        "executed_prefix_disagreement": candidate_action_disagreement(
+                            candidate_actions, action_dim=adim,
+                            horizon=config.n_action_steps),
                         **({"candidate_profiles": candidate_profiles,
                             "selection_uncertainty_horizon":
                                 int(config.selection_uncertainty_horizon)}
-                           if candidate_profiles is not None else {})})
+                           if candidate_profiles is not None else {})}
+                    if config.multi_sample_refine_selected:
+                        selected_unrefined = chunk
+                        selected_seed = _candidate_seed(chosen)
+                        _pnp_seed_perturb(selected_seed)
+                        chunk, refined_score, refined_profile = _sampler.refine_action_chunk(
+                            policy, batch, noise=_noise_of(chosen),
+                            probe_steps=tuple(config.ms_probe_steps),
+                            num_iterations=config.pnp_k,
+                            uncertainty_horizon=config.selection_uncertainty_horizon,
+                            n_action_steps=config.n_action_steps)
+                        pre_score = float(cand_u[chosen])
+                        selection_record["selected_refinement"] = {
+                            "pre_u": pre_score, "refined_path_u": float(refined_score),
+                            "delta_u": float(refined_score - pre_score),
+                            "lowered_u": bool(refined_score < pre_score),
+                            "initial_noise_seed": int(selected_seed),
+                            "perturb_seed": int(selected_seed),
+                            "refined_path_profile": refined_profile,
+                            "selected_prefix_movement": candidate_action_disagreement(
+                                [selected_unrefined, chunk], action_dim=adim,
+                                horizon=config.n_action_steps),
+                        }
+                    ms_selections.append(selection_record)
+                    if candidate_generated_chunks is not None:
+                        candidate_generated_chunks.append(np.stack([
+                            action.squeeze(0).detach().float().cpu().numpy()
+                            for action in candidate_actions]))
                     queue_postprocess = postprocess
                 else:
                     batch = preprocess(policy_observation)
                     with torch.no_grad():
                         chunk = policy.predict_action_chunk(batch, noise=noise)
                     queue_postprocess = postprocess
+                chunk_noise_seeds.append(int(executed_chunk_noise_seed))
                 full_arr = chunk.squeeze(0).detach().cpu().numpy()
                 if generated_chunks is not None:
                     generated_chunks.append(full_arr.copy())
@@ -402,7 +479,13 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                     raise ValueError(
                         f"policy returned only {len(full_arr)} actions, cannot execute "
                         f"n_action_steps={execution_horizon}")
-                inference_ms_total += (time.perf_counter() - inference_t0) * 1000.0
+                boundary_inference_ms = (time.perf_counter() - inference_t0) * 1000.0
+                inference_ms_total += boundary_inference_ms
+                if selection_record is not None:
+                    selection_record["inference_ms"] = float(boundary_inference_ms)
+                    selection_record["n_vf_evals"] = int(sum(
+                        int(runtime_policy.model._pnp.vf_evals)
+                        for runtime_policy in unique_policies) - vf_evals_before)
                 queue = [arr[i].copy() for i in range(arr.shape[0])]
                 chunk_boundary_actions.append(np.asarray(queue[0]).flatten()[:ADIM].copy())
                 ci += 1
@@ -562,6 +645,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
         ) if config.save_trajectory else None,
         generated_chunks=(dict(
             chunks=np.asarray(generated_chunks, dtype=np.float32),
+            chunk_noise_seeds=np.asarray(chunk_noise_seeds, dtype=np.int64),
             **({"candidate_chunks": np.asarray(
                 candidate_generated_chunks, dtype=np.float32)}
                if candidate_generated_chunks is not None else {}))

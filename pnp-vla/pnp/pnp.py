@@ -392,7 +392,8 @@ class PnPRecorder:
 # ─────────────────────────────────────────────────────────────────────────────
 def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_steps,
                         noise_of, num_iterations=3, uncertainty_horizon=None,
-                        return_details=False):
+                        return_details=False, return_actions=False,
+                        perturb_seed_of=None):
     """Return (chosen_action_chunk, chosen_idx, per_candidate_u).
 
     `noise_of(si)` yields the initial noise for candidate si (from the rollout's per-episode
@@ -402,7 +403,9 @@ def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_
     cand_u, cand_actions, candidate_profiles = [], [], []
     for si in range(num_samples):
         noise = noise_of(si)
-        _pnp_seed_perturb(base_seed + chunk_idx * 1000 + si)
+        perturb_seed = (base_seed + chunk_idx * 1000 + si
+                        if perturb_seed_of is None else perturb_seed_of(si))
+        _pnp_seed_perturb(int(perturb_seed))
         measured = measure_chunk_uncertainty(
             policy, batch, noise=noise, probe_steps=probe_steps,
             num_iterations=num_iterations, uncertainty_horizon=uncertainty_horizon,
@@ -414,6 +417,8 @@ def multi_sample_select(policy, batch, base_seed, chunk_idx, num_samples, probe_
             candidate_profiles.append(measured[2])
     chosen = int(np.argmin(cand_u))
     output = (cand_actions[chosen], chosen, cand_u)
+    if return_actions:
+        output = (*output, cand_actions)
     return (*output, candidate_profiles) if return_details else output
 
 

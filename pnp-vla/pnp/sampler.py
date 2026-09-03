@@ -162,6 +162,9 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
         baseline_action = self._orig_sample_actions(
             images, img_masks, tokens, masks, noise=noise.clone(), num_steps=num_steps, **kwargs
         ).clone()
+        # The saved original sampler performs one velocity-field evaluation per Euler step.
+        # Count it alongside the instrumented loop and P&P probes for honest compute telemetry.
+        self._pnp.vf_evals += int(num_steps)
 
     begin_chunk = getattr(strat, "begin_chunk", None)
     if begin_chunk is not None:
@@ -247,46 +250,13 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
     return x_t
 
 
-def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3,
-                              uncertainty_horizon=None, return_details=False,
-                              return_features=False):
-    """Run one measurement-only probe pass and score a selectable action horizon.
-
-    Historical callers receive ``(action_chunk, full_chunk_u)``. Diagnostic callers may
-    request a leading action horizon and U10/U20/Ufull plus contraction summaries.
-    """
-    from .config import RolloutConfig
-    from .pnp import PnPRecorder
-    from .tap import RolloutTap
-    model = policy.model
-    cfg = RolloutConfig(
-        pnp_steps=tuple(probe_steps), pnp_k=num_iterations,
-        save_trajectory=False, save_pcp_features=bool(return_features),
-        save_ahats=bool(return_features))
-    rec = PnPRecorder(); rec.new_episode()
-    tap = RolloutTap(cfg, rec, device=None, adim=model._pnp.action_dim)
-    with _temp_strategy(model, tap):
-        action = policy.predict_action_chunk(batch, noise=noise)
-    records = [st for c in rec.current_chunks() for st in c["steps"]]
+def _summarize_uncertainty_records(records, uncertainty_horizon=None):
+    """Return U10/U20/Ufull, contractions, and the requested selection score."""
     if not records:
         details = {"u10": 0.0, "u20": 0.0, "u_full": 0.0,
                    "contraction10": 0.0, "contraction20": 0.0,
                    "contraction_full": 0.0}
-        output = (action, 0.0, details) if return_details else (action, 0.0)
-        if return_features:
-            return (*output, {
-                "obs_enc": np.empty((0,), dtype=np.float32),
-                "step_indices": np.empty((0,), dtype=np.int64),
-                "s": np.empty((0,), dtype=np.float32),
-                "z_hat": np.empty((0, 0, model._pnp.action_dim), dtype=np.float32),
-                "first_a_hat": np.empty(
-                    (0, 0, model._pnp.action_dim), dtype=np.float32),
-                "last_a_hat": np.empty(
-                    (0, 0, model._pnp.action_dim), dtype=np.float32),
-                "u_time": np.empty((0, 0), dtype=np.float32),
-                "u_iter_time": np.empty((0, 0, 0), dtype=np.float32),
-            })
-        return output
+        return details, 0.0
     u_time = torch.as_tensor(
         np.stack([np.asarray(st["u_time"], dtype=float) for st in records]),
         dtype=torch.float32).mean(dim=0)
@@ -315,7 +285,48 @@ def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iter
     if uncertainty_horizon is not None and int(uncertainty_horizon) > len(u_time):
         raise ValueError(
             f"uncertainty_horizon={uncertainty_horizon} exceeds chunk length {len(u_time)}")
-    score = prefix_mean(uncertainty_horizon)
+    return details, prefix_mean(uncertainty_horizon)
+
+
+def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iterations=3,
+                              uncertainty_horizon=None, return_details=False,
+                              return_features=False):
+    """Run one measurement-only probe pass and score a selectable action horizon.
+
+    Historical callers receive ``(action_chunk, full_chunk_u)``. Diagnostic callers may
+    request a leading action horizon and U10/U20/Ufull plus contraction summaries.
+    """
+    from .config import RolloutConfig
+    from .pnp import PnPRecorder
+    from .tap import RolloutTap
+    model = policy.model
+    cfg = RolloutConfig(
+        pnp_steps=tuple(probe_steps), pnp_k=num_iterations,
+        save_trajectory=False, save_pcp_features=bool(return_features),
+        save_ahats=bool(return_features))
+    rec = PnPRecorder(); rec.new_episode()
+    tap = RolloutTap(cfg, rec, device=None, adim=model._pnp.action_dim)
+    with _temp_strategy(model, tap):
+        action = policy.predict_action_chunk(batch, noise=noise)
+    records = [st for c in rec.current_chunks() for st in c["steps"]]
+    if not records:
+        details, _ = _summarize_uncertainty_records(records, uncertainty_horizon)
+        output = (action, 0.0, details) if return_details else (action, 0.0)
+        if return_features:
+            return (*output, {
+                "obs_enc": np.empty((0,), dtype=np.float32),
+                "step_indices": np.empty((0,), dtype=np.int64),
+                "s": np.empty((0,), dtype=np.float32),
+                "z_hat": np.empty((0, 0, model._pnp.action_dim), dtype=np.float32),
+                "first_a_hat": np.empty(
+                    (0, 0, model._pnp.action_dim), dtype=np.float32),
+                "last_a_hat": np.empty(
+                    (0, 0, model._pnp.action_dim), dtype=np.float32),
+                "u_time": np.empty((0, 0), dtype=np.float32),
+                "u_iter_time": np.empty((0, 0, 0), dtype=np.float32),
+            })
+        return output
+    details, score = _summarize_uncertainty_records(records, uncertainty_horizon)
     output = (action, score, details) if return_details else (action, score)
     if return_features:
         if not tap.pcp_chunks or len(tap.pcp_chunks) != 1:
@@ -346,3 +357,28 @@ def measure_chunk_uncertainty(policy, batch, noise, probe_steps=(1, 2), num_iter
         }
         return (*output, features)
     return output
+
+
+def refine_action_chunk(policy, batch, noise, probe_steps=(1, 2), num_iterations=3,
+                        uncertainty_horizon=None, n_action_steps=None):
+    """Rerun one selected initial noise with refine-last P&P feedback.
+
+    Selection happens before this function is called. The returned profile describes the
+    uncertainty encountered along the invasive refined solve, so callers can compare it with the
+    selected candidate's measurement without conflating selection and refinement.
+    """
+    from .config import RolloutConfig
+    from .pnp import PnPRecorder
+    from .tap import RolloutTap
+
+    model = policy.model
+    cfg = RolloutConfig(
+        pnp_steps=tuple(probe_steps), pnp_k=int(num_iterations), refine=True,
+        refine_average=False, n_action_steps=n_action_steps, save_trajectory=False)
+    rec = PnPRecorder(); rec.new_episode()
+    tap = RolloutTap(cfg, rec, device=None, adim=model._pnp.action_dim)
+    with _temp_strategy(model, tap):
+        action = policy.predict_action_chunk(batch, noise=noise)
+    records = [st for chunk in rec.current_chunks() for st in chunk["steps"]]
+    details, score = _summarize_uncertainty_records(records, uncertainty_horizon)
+    return action, score, details

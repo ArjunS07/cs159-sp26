@@ -97,6 +97,9 @@ class Method:
     CHUNK_SOURCE_SOURCE = "chunk_select_source_source"
     CHUNK_SOURCE_MULTI_QUERY = "chunk_select_source_multi_query"
     CHUNK_SOURCE_M1 = "chunk_select_source_m1"
+    FIVE_STEP_SINGLE_QUERY = "five_step_single_query"
+    FIVE_STEP_LOWEST_U20 = "five_step_x3_lowest_u20"
+    FIVE_STEP_LOWEST_U20_REFINE = "five_step_x3_lowest_u20_then_refine"
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
@@ -111,7 +114,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.U20_GRADIENT_GATE_015, Method.U20_GRADIENT_GATE_020,
                Method.THRESHOLD_REFINEMENT, Method.DELAYED_REFINEMENT,
                Method.MULTI_SAMPLE, Method.CHUNK_SOURCE_SOURCE, Method.CHUNK_SOURCE_MULTI_QUERY,
-               Method.CHUNK_SOURCE_M1,
+               Method.CHUNK_SOURCE_M1, Method.FIVE_STEP_SINGLE_QUERY,
+               Method.FIVE_STEP_LOWEST_U20, Method.FIVE_STEP_LOWEST_U20_REFINE,
                Method.PNP_ONLY, Method.PCP, Method.COLLECT, Method.PCP_SEARCH_COLLECT)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 
@@ -180,6 +184,15 @@ class RolloutConfig:
     # None preserves the historical full-generated-chunk score.
     selection_uncertainty_horizon: Optional[int] = None
     candidate_set_id: Optional[str] = None       # immutable model/revision set for online selection
+    # Immutable policy/checkpoint source for any arm, including single-query controls.
+    policy_source_id: Optional[str] = None
+    # New same-policy experiments opt into a resume-safe candidate seed scheme. None retains
+    # historical rollout IDs and their legacy sample-slot mapping; stock_slot0_v1 makes
+    # candidate 0 exactly reuse the ordinary per-(episode, chunk) policy-noise seed.
+    candidate_seed_scheme: Optional[str] = None
+    # Explicit two-stage action: measure all ordinary candidates, choose the lowest-uncertainty
+    # one, then rerun only that same initial noise under refine-last P&P feedback.
+    multi_sample_refine_selected: bool = False
     # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
     # None intentionally preserves the legacy full-generated-chunk behavior. Production drivers
@@ -257,6 +270,21 @@ class RolloutConfig:
                     or int(self.selection_uncertainty_horizon) != self.selection_uncertainty_horizon
                     or self.selection_uncertainty_horizon < 1):
                 raise ValueError("selection_uncertainty_horizon must be a positive integer")
+        if self.candidate_seed_scheme not in {None, "stock_slot0_v1"}:
+            raise ValueError("candidate_seed_scheme must be None or 'stock_slot0_v1'")
+        if self.policy_source_id is not None and not str(self.policy_source_id).strip():
+            raise ValueError("policy_source_id must be a non-empty string or None")
+        if self.candidate_seed_scheme is not None and self.num_samples is None:
+            raise ValueError("candidate_seed_scheme requires num_samples")
+        if self.multi_sample_refine_selected:
+            if self.num_samples is None:
+                raise ValueError("multi_sample_refine_selected requires num_samples")
+            if self.selection_uncertainty_horizon is None:
+                raise ValueError(
+                    "multi_sample_refine_selected requires selection_uncertainty_horizon")
+            if self.candidate_seed_scheme != "stock_slot0_v1":
+                raise ValueError(
+                    "multi_sample_refine_selected requires candidate_seed_scheme='stock_slot0_v1'")
         if self.refine_average and not self.refine:
             raise ValueError("refine_average=True requires refine=True")
         if self.refine_horizon_m is not None:
@@ -374,6 +402,12 @@ class RolloutConfig:
         # bound in their IDs.
         if logical.get("candidate_set_id") is None:
             logical.pop("candidate_set_id")
+        if logical.get("policy_source_id") is None:
+            logical.pop("policy_source_id")
+        if logical.get("candidate_seed_scheme") is None:
+            logical.pop("candidate_seed_scheme")
+        if not logical.get("multi_sample_refine_selected"):
+            logical.pop("multi_sample_refine_selected")
         if logical.get("selection_uncertainty_horizon") is None:
             logical.pop("selection_uncertainty_horizon")
         if logical.get("refine_threshold") is None:
@@ -413,7 +447,9 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "uncertainty_gradient_action_rms_max",
                   "correction_lambda", "q_gate", "q_ckpt_id",
                   "num_samples", "ms_probe_steps", "selection_uncertainty_horizon",
-                  "candidate_set_id", "num_inference_steps",
+                  "candidate_set_id", "policy_source_id", "candidate_seed_scheme",
+                  "multi_sample_refine_selected",
+                  "num_inference_steps",
                   "n_action_steps", "suffix_probe_samples")
 
 

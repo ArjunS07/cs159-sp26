@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 
 from pnp.config import RolloutConfig
@@ -172,6 +173,112 @@ def test_dual_policy_episode_selects_and_logs_clean_candidate_diversity():
     assert result["generated_chunks"]["candidate_chunks"].shape == (1, 2, 2, 7)
     assert candidate_chunk_noise_seed(123, 4, 0) == chunk_noise_seed(123, 4)
     assert candidate_chunk_noise_seed(123, 4, 1) != chunk_noise_seed(123, 4)
+
+
+def test_same_policy_candidates_preserve_stock_slot_zero_and_log_all_chunks():
+    env = _Env()
+    ep = {
+        "task_desc": "test task", "max_steps": 2,
+        "init_state": np.zeros(3), "ep_idx": 0,
+        "suite": "test", "task_idx": 0,
+    }
+    policy = _Policy()
+    drawn_seeds = []
+
+    def draw(_policy, _device, seed):
+        drawn_seeds.append(seed)
+        return torch.zeros((1, 2, 7))
+
+    def select(_policy, _batch, _base_seed, _chunk_idx, num_samples, _probe_steps,
+               noise_of, **kwargs):
+        assert kwargs["return_actions"] is True
+        assert kwargs["return_details"] is True
+        assert "perturb_seed_of" in kwargs
+        for index in range(num_samples):
+            noise_of(index)
+        actions = [torch.full((1, 2, 7), float(index + 1))
+                   for index in range(num_samples)]
+        profiles = [
+            {"u10": .3 - index * .1, "u20": .3 - index * .1,
+             "u_full": .3 - index * .1, "contraction10": 0.0,
+             "contraction20": 0.0, "contraction_full": 0.0}
+            for index in range(num_samples)]
+        return actions[2], 2, [.3, .2, .1], actions, profiles
+
+    config = RolloutConfig(
+        num_samples=3, pnp_k=5, ms_probe_steps=(2, 3),
+        selection_uncertainty_horizon=2, candidate_seed_scheme="stock_slot0_v1",
+        candidate_set_id="source|source|source", num_inference_steps=5,
+        n_action_steps=1, save_generated_chunks=True)
+    with (patch("pnp.rollout.obs_to_policy", return_value={}),
+          patch("pnp.rollout._draw_chunk_noise", side_effect=draw),
+          patch("pnp.rollout.multi_sample_select", side_effect=select)):
+        result = run_episode(
+            env, ep, policy, lambda obs: obs, lambda action: action,
+            torch.device("cpu"), config)
+
+    # Per chunk: ordinary seed draw, followed by candidate slots 0, 1, 2.
+    assert drawn_seeds[0] == drawn_seeds[1]
+    assert drawn_seeds[4] == drawn_seeds[5]
+    assert result["generated_chunks"]["candidate_chunks"].shape == (2, 3, 2, 7)
+    assert result["chunk_noise_seeds"] == [
+        candidate_chunk_noise_seed(result["episode_seed"], 0, 2),
+        candidate_chunk_noise_seed(result["episode_seed"], 1, 2),
+    ]
+    np.testing.assert_array_equal(
+        result["generated_chunks"]["chunk_noise_seeds"],
+        result["chunk_noise_seeds"])
+    assert len(result["ms_selections"]) == 2
+    for selection in result["ms_selections"]:
+        assert selection["chosen"] == 2
+        assert selection["u_spread"] == pytest.approx(.2)
+        assert selection["action_disagreement"]["n_candidate_pairs"] == 3
+        assert selection["executed_prefix_disagreement"]["actions_compared"] == 1
+        assert selection["inference_ms"] >= 0
+        assert selection["n_vf_evals"] >= 0
+        assert selection["selected_noise_seed"] == selection["candidate_noise_seeds"][2]
+
+
+def test_same_policy_select_then_refine_is_an_explicit_second_stage():
+    env = _Env()
+    ep = {
+        "task_desc": "test task", "max_steps": 1,
+        "init_state": np.zeros(3), "ep_idx": 0,
+        "suite": "test", "task_idx": 0,
+    }
+    candidates = [torch.ones((1, 2, 7)), torch.full((1, 2, 7), 2.0),
+                  torch.full((1, 2, 7), 3.0)]
+    profiles = [
+        {"u10": value, "u20": value, "u_full": value,
+         "contraction10": 0.0, "contraction20": 0.0, "contraction_full": 0.0}
+        for value in (.3, .2, .4)]
+    refined = torch.full((1, 2, 7), 4.0)
+    config = RolloutConfig(
+        num_samples=3, pnp_k=5, ms_probe_steps=(2, 3),
+        selection_uncertainty_horizon=2, candidate_seed_scheme="stock_slot0_v1",
+        multi_sample_refine_selected=True, candidate_set_id="source|source|source",
+        num_inference_steps=5, n_action_steps=1, save_generated_chunks=True)
+    with (patch("pnp.rollout.obs_to_policy", return_value={}),
+          patch("pnp.rollout.multi_sample_select", return_value=(
+              candidates[1], 1, [.3, .2, .4], candidates, profiles)),
+          patch("pnp.sampler.refine_action_chunk", return_value=(
+              refined, .1, {**profiles[1], "u20": .1})) as refine):
+        result = run_episode(
+            env, ep, _Policy(), lambda obs: obs, lambda action: action,
+            torch.device("cpu"), config)
+
+    assert refine.call_count == 1
+    assert np.allclose(env.actions[-1], 4.0)
+    telemetry = result["ms_selections"][0]["selected_refinement"]
+    assert telemetry["pre_u"] == pytest.approx(.2)
+    assert telemetry["refined_path_u"] == pytest.approx(.1)
+    assert telemetry["delta_u"] == pytest.approx(-.1)
+    assert telemetry["lowered_u"] is True
+    assert telemetry["initial_noise_seed"] == result["ms_selections"][0][
+        "selected_noise_seed"]
+    assert result["chunk_noise_seeds"] == [
+        result["ms_selections"][0]["selected_noise_seed"]]
+    assert telemetry["selected_prefix_movement"]["action_l2_mean"] > 0
 
 
 def test_candidate_action_disagreement_is_zero_for_identical_chunks():

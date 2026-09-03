@@ -251,13 +251,17 @@ _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
                   Method.U20_GRADIENT_GATE_020: "gate <=.020",
                   Method.THRESHOLD_REFINEMENT: "U-gated refine",
                   Method.DELAYED_REFINEMENT: "delayed refine",
-                  Method.EXTRA_STEPS: "control",
-                  Method.CHUNK_SOURCE_SOURCE: "source x2",
-                  Method.CHUNK_SOURCE_MULTI_QUERY: "source multi-query",
-                  Method.CHUNK_SOURCE_M1: "source + m1"}
+                   Method.EXTRA_STEPS: "control",
+                   Method.CHUNK_SOURCE_SOURCE: "source x2",
+                   Method.CHUNK_SOURCE_MULTI_QUERY: "source multi-query",
+                   Method.CHUNK_SOURCE_M1: "source + m1",
+                   Method.FIVE_STEP_SINGLE_QUERY: "5-step x1",
+                   Method.FIVE_STEP_LOWEST_U20: "5-step x3 low U20",
+                   Method.FIVE_STEP_LOWEST_U20_REFINE: "5-step x3 + refine"}
 
 
-def format_progress_table(tally, method_names, historical_sr=None) -> str:
+def format_progress_table(tally, method_names, historical_sr=None, *, include_overall=False,
+                          count_label=None) -> str:
     """Running success rate per (suite, method), optionally against a historical baseline.
 
     `tally` maps (suite, method) -> [n_rollouts, n_successes]. ``historical_sr`` may be one
@@ -275,7 +279,7 @@ def format_progress_table(tally, method_names, historical_sr=None) -> str:
     else:
         references = [("historical", historical_sr)]
     labels = [(name, _METHOD_LABELS.get(name, name)) for name in method_names]
-    lines = ["n = rollouts done in THIS shard, summed over the suite's tasks "
+    lines = [count_label or "n = rollouts done in THIS shard, summed over the suite's tasks "
              "(not episodes per task)",
              f"{'suite':<32}" + "".join(f"{label:>16}" for _, label in labels)
              + "".join(f"{label:>18}" for label, _ in references)]
@@ -288,6 +292,18 @@ def format_progress_table(tally, method_names, historical_sr=None) -> str:
             reference = rates.get(suite)
             cells += f"{'-':>18}" if reference is None else f"{reference:>17.0%} "
         lines.append(f"{suite:<32}{cells}")
+    if include_overall:
+        cells = ""
+        for name, _ in labels:
+            counts = [tally.get((suite, name), (0, 0))
+                      for suite in sorted({key[0] for key in tally})]
+            n, wins = sum(item[0] for item in counts), sum(item[1] for item in counts)
+            cells += f"{'-':>16}" if not n else f"{f'{wins / n:.0%} ({wins}/{n})':>16}"
+        for _, rates in references:
+            values = [float(value) for value in rates.values() if value is not None]
+            reference = sum(values) / len(values) if values else None
+            cells += f"{'-':>18}" if reference is None else f"{reference:>17.0%} "
+        lines.append(f"{'OVERALL':<32}{cells}")
     return "\n".join(lines)
 
 
@@ -391,7 +407,9 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                     benchmark="libero", driver="hybrid_schedules", run_metadata=None,
                     report_every=50, provenance=None, initial_tally=None,
                     candidate_bundles_by_method=None, historical_sr=None,
-                    rollout_batch_size: int = 2):
+                    rollout_batch_size: int = 2, report_every_identities=None,
+                    initial_identity_methods=None, progress_include_overall=False,
+                    progress_count_label=None, resume_completed_only=False):
     from tqdm.auto import tqdm
     from .libero_env import make_env
     from .rollout import run_episode_batch
@@ -399,7 +417,8 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
         raise ValueError("rollout_batch_size must be at least 1")
 
     expected = len(episodes) * len(methods)
-    done = store.existing_keys(experiment)
+    done = store.existing_keys(
+        experiment, **({"status": "completed"} if resume_completed_only else {}))
     pending = sum(
         store.rollout_id(experiment, ep, name, cfg) not in done
         for ep in episodes for name, cfg in methods
@@ -421,6 +440,20 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
     probe_tally = collections.defaultdict(lambda: [0.0, 0])
     for key, counts in (initial_tally or {}).items():
         tally[key] = [int(counts[0]), int(counts[1])]
+    identity_methods = collections.defaultdict(set)
+    for value in initial_identity_methods or ():
+        identity_methods[tuple(value[:4])].add(value[4])
+    completed_identities = sum(
+        set(method_names).issubset(names) for names in identity_methods.values())
+    next_identity_report = None
+    if report_every_identities:
+        if (isinstance(report_every_identities, bool)
+                or int(report_every_identities) != report_every_identities
+                or report_every_identities < 1):
+            raise ValueError("report_every_identities must be a positive integer or None")
+        report_every_identities = int(report_every_identities)
+        next_identity_report = (
+            completed_identities // report_every_identities + 1) * report_every_identities
     occupied_lanes = batch_slots = 0
     inference_ms_total = 0.0
     collection_t0 = time.time()
@@ -428,7 +461,7 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
         with tqdm(total=pending, desc=f"{cohort}[{shard_index}]", unit="rollout",
                   dynamic_ncols=True) as progress:
             def _record(ep, name, cfg, rid, result):
-                nonlocal completed
+                nonlocal completed, completed_identities, next_identity_report
                 store.log_result(rid, ep, name, cfg, result)
                 if result.get("status") != "completed":
                     tqdm.write(
@@ -436,25 +469,56 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
                         f"episode={ep.get('ep_idx', ep.get('episode_idx'))} "
                         f"method={name}: {result.get('error_msg')}")
                 completed += 1
+                progress.update()
+                if result.get("status") != "completed":
+                    progress.set_postfix_str(
+                        f"{ep['suite'].removeprefix('libero_')} "
+                        f"{_METHOD_LABELS.get(name, name)} ERROR (retry on resume)",
+                        refresh=False)
+                    return
                 counts = tally[(ep["suite"], name)]
                 counts[0] += 1
                 counts[1] += int(result["success"])
+                identity = (ep["suite"], int(ep["task_idx"]),
+                            int(ep.get("ep_idx", ep.get("episode_idx", 0))),
+                            ep.get("init_state_hash", ""))
+                was_complete = set(method_names).issubset(identity_methods[identity])
+                identity_methods[identity].add(name)
+                is_complete = set(method_names).issubset(identity_methods[identity])
+                if is_complete and not was_complete:
+                    completed_identities += 1
                 for metric, value in (result.get("probe_diagnostics") or {}).items():
                     if value is not None and math.isfinite(value):
                         probe_tally[(name, metric)][0] += float(value)
                         probe_tally[(name, metric)][1] += 1
-                progress.update()
                 # Running SR for this suite/arm, not just the last rollout's outcome.
                 progress.set_postfix_str(
                     f"{ep['suite'].removeprefix('libero_')} "
                     f"{_METHOD_LABELS.get(name, name)} "
                     f"sr={counts[1] / counts[0]:.0%} ({counts[1]}/{counts[0]})",
                     refresh=False)
-                if report_every and completed % report_every == 0:
+                identity_report = bool(
+                    next_identity_report is not None
+                    and completed_identities >= next_identity_report)
+                if identity_report:
+                    while completed_identities >= next_identity_report:
+                        next_identity_report += report_every_identities
+                    tqdm.write(
+                        f"\n--- {cohort}[{shard_index}] after {completed_identities} "
+                        f"identities completed in this shard; {completed} new rollouts logged ---")
+                    tqdm.write(format_progress_table(
+                        tally, method_names, historical_sr=historical_sr,
+                        include_overall=progress_include_overall,
+                        count_label=progress_count_label))
+                    if probe_tally:
+                        tqdm.write(format_probe_diagnostic_table(probe_tally, method_names))
+                elif report_every and completed % report_every == 0:
                     tqdm.write(f"\n--- {cohort}[{shard_index}] after {completed} rollouts "
                                f"({completed}/{pending}) ---")
                     tqdm.write(format_progress_table(
-                        tally, method_names, historical_sr=historical_sr))
+                        tally, method_names, historical_sr=historical_sr,
+                        include_overall=progress_include_overall,
+                        count_label=progress_count_label))
                     if probe_tally:
                         tqdm.write(format_probe_diagnostic_table(probe_tally, method_names))
 
@@ -497,9 +561,13 @@ def _run_collection(*, store, policy, preprocess, postprocess, device, experimen
         store.finish_run(status="failed", n_rollouts=completed)
         raise
     store.finish_run(n_rollouts=completed)
-    print(f"{cohort}: logged {completed} new rollouts")
+    print(f"{cohort}: logged {completed} new rollouts; "
+          f"{completed_identities} identities complete in this shard")
     if tally:
-        print(format_progress_table(tally, method_names, historical_sr=historical_sr))
+        print(format_progress_table(
+            tally, method_names, historical_sr=historical_sr,
+            include_overall=progress_include_overall,
+            count_label=progress_count_label))
     if probe_tally:
         print(format_probe_diagnostic_table(probe_tally, method_names))
     peak_gb = 0.0

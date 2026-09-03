@@ -23,6 +23,9 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
 - `57_train_pcp_critic.ipynb` — trains a new Cal-QL or IQL PCP critic checkpoint.
 - `58_pcp_critic_offline_eval.ipynb` — reads a registered checkpoint for offline diagnostics.
 - `59_pcp_search_adapter_smoke.ipynb` — verifies the guarded, offline-only adapter contract.
+- `workers/60_five_step_diversity_pro220_worker_{0,1}.ipynb` — paired three-arm pilot on the
+  frozen 220-identity PRO cohort: five-step x1, five-step x3 lowest-U20, and explicit
+  select-then-refine with 10 executed actions per 50-action prediction.
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 
