@@ -33,6 +33,10 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
   five-step refine `(2,3)`, three-step refine `(2,)`, and three-step no refinement, all K=5
   and 10 executed actions. Two 110-identity/330-rollout shards; exact matched historical
   comparisons every 25 completed three-arm identities and at the end.
+- `63_analyze_coarse_single_refinement_pro220.ipynb` analyzes the exact seven-arm matched
+  cohort for workers 62, including
+  paired/per-suite SR, U10/U20/U50, PnP contraction, failure detection, and new-arm compute.
+  It downloads uncertainty-profile blobs only and needs no GPU or simulator.
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 
