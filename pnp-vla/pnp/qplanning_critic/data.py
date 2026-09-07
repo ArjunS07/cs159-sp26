@@ -14,10 +14,35 @@ import torch
 from torch.utils.data import Dataset
 
 from ..pcp_critic.data import DatasetSnapshot, eligible_rollout_rows
-from ..pcp_search.data import validate_training_artifact
+from ..pcp_critic.resumable_snapshot import load_training_fields_with_retry
 
 
 CACHE_SCHEMA_VERSION = 1
+QPLANNING_ARTIFACT_FIELDS = (
+    "actions_normalized", "rewards", "terminated", "truncated", "step_success",
+    "boundary/step", "boundary/raw_robot_state", "boundary/policy_proprio",
+    "prefix/prefix_embeddings", "prefix/prefix_pad_masks",
+    "bellman/action", "bellman/executed_normalized", "bellman/validity_mask",
+)
+
+
+def _validate_qplanning_fields(arrays: dict[str, np.ndarray]) -> None:
+    missing = sorted(set(QPLANNING_ARTIFACT_FIELDS) - set(arrays))
+    if missing:
+        raise ValueError(f"Q-planning artifact is missing {missing}")
+    n_steps = len(arrays["actions_normalized"])
+    for name in ("rewards", "terminated", "truncated", "step_success"):
+        if len(arrays[name]) != n_steps:
+            raise ValueError(f"{name} does not align with executed actions")
+    boundaries = len(arrays["boundary/step"])
+    for name in ("boundary/raw_robot_state", "boundary/policy_proprio",
+                 "prefix/prefix_embeddings", "prefix/prefix_pad_masks"):
+        if len(arrays[name]) != boundaries:
+            raise ValueError(f"{name} does not align with planning boundaries")
+    transitions = boundaries - 1
+    for name in ("bellman/action", "bellman/executed_normalized", "bellman/validity_mask"):
+        if len(arrays[name]) != transitions:
+            raise ValueError(f"{name} does not align with planning transitions")
 
 
 @dataclass(frozen=True)
@@ -85,7 +110,7 @@ def qplanning_windows_from_artifact(row: dict, arrays: dict[str, np.ndarray], *,
     """
     if horizon not in (10, 50):
         raise ValueError("horizon must be 10 or 50")
-    validate_training_artifact(arrays)
+    _validate_qplanning_fields(arrays)
     actions = np.asarray(arrays["actions_normalized"], np.float32)
     rewards = np.asarray(arrays["rewards"], np.float32)
     terminated = np.asarray(arrays["terminated"], bool)
@@ -222,7 +247,8 @@ def prepare_qplanning_cache(store, snapshot: DatasetSnapshot, *, horizon: int,
         path = cache_dir / f"{row['rollout_id']}.npz"
         entry = old.get(row["rollout_id"])
         need_arrays = entry is None or not path.exists() or row["rollout_id"] in train_ids
-        arrays = store.load_training_data(row["training_data_path"]) if need_arrays else None
+        arrays = load_training_fields_with_retry(
+            store, row["training_data_path"], QPLANNING_ARTIFACT_FIELDS) if need_arrays else None
         try:
             if entry is None or not path.exists():
                 entry, actions, _ = _write_rollout(
