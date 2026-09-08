@@ -9,7 +9,8 @@ import torch
 from ..pcp_critic.registry import PCPCriticRegistry
 from ..store import SupabaseStore
 from .config import QPlanningModelConfig, QPlanningTrainConfig
-from .data import QPlanningWindowDataset, prepare_qplanning_cache
+from .data import (
+    QPlanningWindowDataset, prepare_qplanning_cache, prepare_qplanning_streaming_cache)
 from .model import QPlanningCritic
 from .train import train_qplanning_critic
 
@@ -32,6 +33,7 @@ def _print_preflight(snapshot, cache) -> None:
     print(f"  nonterminal bootstrap windows: {cache.n_bootstrap_windows}/{cache.n_windows} "
           f"({cache.n_bootstrap_windows/cache.n_windows:.1%})")
     print("  normalization: train executed actions only")
+    print(f"  window storage: {cache.storage_mode}")
     print("  uncertainty in model/loss/sampling: NO")
     print("  first-10 generated/executed check: "
           f"MAE={cache.generated_executed_first10_mae:.3g}, "
@@ -50,6 +52,7 @@ def run_qplanning_training_test(*, snapshot_id: str, horizon: int,
                                 output_root: str | Path = "/content/qplanning_checkpoints",
                                 micro_batch_size: int = 16,
                                 cache_download_workers: int = 4,
+                                stream_windows: bool = True,
                                 device=None, resume: bool = True,
                                 store: SupabaseStore | None = None) -> dict:
     """Validate/cache data and run either a short pipeline test or fixed full run."""
@@ -61,7 +64,8 @@ def run_qplanning_training_test(*, snapshot_id: str, horizon: int,
         raise ValueError("paste the immutable pcpcds-* snapshot ID produced by notebook 56")
     store = store or SupabaseStore()
     snapshot = PCPCriticRegistry(store).load_snapshot(snapshot_id)
-    cache = prepare_qplanning_cache(
+    prepare = prepare_qplanning_streaming_cache if stream_windows else prepare_qplanning_cache
+    cache = prepare(
         store, snapshot, horizon=horizon, gamma=.99, cache_root=cache_root,
         download_workers=cache_download_workers)
     _print_preflight(snapshot, cache)

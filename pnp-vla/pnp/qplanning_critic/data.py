@@ -68,6 +68,8 @@ class QPlanningCacheIndex:
     n_bootstrap_windows: int
     generated_executed_first10_mae: float
     generated_executed_first10_max_abs: float
+    storage_mode: str = "materialized"
+    gamma: float = .99
 
     @property
     def digest(self) -> str:
@@ -418,6 +420,8 @@ def _cache_from_payload(payload: dict, cache_dir: Path) -> QPlanningCacheIndex:
             payload["generated_executed_first10_mae"]),
         generated_executed_first10_max_abs=float(
             payload["generated_executed_first10_max_abs"]),
+        storage_mode=str(payload.get("storage_mode", "materialized")),
+        gamma=float(payload.get("gamma", .99)),
     )
 
 
@@ -551,12 +555,95 @@ def prepare_qplanning_cache(store, snapshot: DatasetSnapshot, *, horizon: int,
         generated_executed_first10_mae=(
             sum(e["generated_executed_abs_sum"] for e in entries) / count if count else float("nan")),
         generated_executed_first10_max_abs=max(
-            (e["generated_executed_max_abs"] for e in entries), default=float("nan")))
+            (e["generated_executed_max_abs"] for e in entries), default=float("nan")),
+        gamma=gamma)
     payload = {
         "cache_schema_version": CACHE_SCHEMA_VERSION, "gamma": gamma,
         "complete": True, **asdict(result),
     }
     _atomic_json(manifest_path, payload)
+    return result
+
+
+def _streaming_bootstrap_count(n_steps: int, horizon: int) -> int:
+    # Collected trajectories replan every ten actions and mark success/truncation on the final
+    # executed action. A target exactly at the terminal boundary must therefore not bootstrap.
+    return sum(start + horizon < n_steps for start in range(0, n_steps, 10))
+
+
+def prepare_qplanning_streaming_cache(
+        store, snapshot: DatasetSnapshot, *, horizon: int, gamma: float,
+        cache_root: str | Path,
+        download_workers: int = DEFAULT_DOWNLOAD_WORKERS) -> QPlanningCacheIndex:
+    """Index Q10/Q50 windows directly over the shared source cache.
+
+    This avoids a second horizon-specific copy of the large saved prefix embeddings. Windows are
+    materialized in RAM one rollout at a time by ``QPlanningWindowDataset``.
+    """
+    if horizon not in (10, 50):
+        raise ValueError("horizon must be 10 or 50")
+    if not 1 <= download_workers <= 8:
+        raise ValueError("download_workers must be in [1, 8]")
+    root = Path(cache_root).expanduser()
+    source_dir, source_entries = _prepare_source_cache(
+        store, snapshot, cache_root=root, download_workers=download_workers)
+    train_ids = set(snapshot.train_rollout_ids)
+    val_ids = set(snapshot.val_rollout_ids)
+    train_sources = [entry for entry in source_entries if entry["rollout_id"] in train_ids]
+    action_count = sum(entry["action_count"] for entry in train_sources)
+    if not action_count:
+        raise ValueError("snapshot has no train actions")
+    action_sum = np.sum([entry["action_sum"] for entry in train_sources], axis=0)
+    action_sumsq = np.sum([entry["action_sumsq"] for entry in train_sources], axis=0)
+    mean = action_sum / action_count
+    variance = np.maximum(action_sumsq / action_count - mean ** 2, 1e-12)
+
+    first = source_entries[0]
+    with np.load(source_dir / first["path"], allow_pickle=False) as archive:
+        prefix_dim = int(archive["prefix/prefix_embeddings"].shape[-1])
+        robot_dim = int(archive["boundary/raw_robot_state"].shape[-1])
+        proprio_dim = int(archive["boundary/policy_proprio"].shape[-1])
+        action_dim = int(archive["actions_normalized"].shape[-1])
+
+    entries = []
+    for source in source_entries:
+        n_steps = int(source["action_count"])
+        entries.append({
+            **source,
+            "n_windows": (n_steps + 9) // 10,
+            "n_bootstrap": _streaming_bootstrap_count(n_steps, horizon),
+            "prefix_dim": prefix_dim,
+            "robot_dim": robot_dim,
+            "proprio_dim": proprio_dim,
+            "action_dim": action_dim,
+        })
+    difference_count = sum(entry["generated_executed_count"] for entry in entries)
+    result = QPlanningCacheIndex(
+        snapshot_id=snapshot.snapshot_id, horizon=horizon, cache_dir=str(source_dir),
+        rollouts=tuple(entries), prefix_dim=prefix_dim, robot_dim=robot_dim,
+        proprio_dim=proprio_dim, action_dim=action_dim,
+        action_mean=tuple(float(value) for value in mean),
+        action_std=tuple(float(value) for value in np.sqrt(variance)),
+        n_windows=sum(entry["n_windows"] for entry in entries),
+        n_train_windows=sum(
+            entry["n_windows"] for entry in entries if entry["rollout_id"] in train_ids),
+        n_val_windows=sum(
+            entry["n_windows"] for entry in entries if entry["rollout_id"] in val_ids),
+        n_bootstrap_windows=sum(entry["n_bootstrap"] for entry in entries),
+        generated_executed_first10_mae=(
+            sum(entry["generated_executed_abs_sum"] for entry in entries) / difference_count
+            if difference_count else float("nan")),
+        generated_executed_first10_max_abs=max(
+            (entry["generated_executed_max_abs"] for entry in entries),
+            default=float("nan")),
+        storage_mode="source_stream",
+        gamma=gamma,
+    )
+    print(
+        f"[qplanning] Q{horizon} windows will stream from source_v1; "
+        "no horizon-specific disk cache will be created",
+        flush=True,
+    )
     return result
 
 
@@ -572,7 +659,11 @@ class QPlanningWindowDataset(Dataset):
             indices.sort(key=lambda pair: hashlib.sha256(
                 f"{pair[0]['rollout_id']}|{pair[1]}".encode()).hexdigest())
             indices = indices[:max_windows]
+            indices.sort(key=lambda pair: (pair[0]["rollout_id"], pair[1]))
         self.cache_dir = cache.cache_dir
+        self.horizon = cache.horizon
+        self.gamma = cache.gamma
+        self.storage_mode = cache.storage_mode
         self.indices = indices
         self.max_open_rollouts = max_open_rollouts
         self._open: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
@@ -585,7 +676,12 @@ class QPlanningWindowDataset(Dataset):
         arrays = self._open.pop(name, None)
         if arrays is None:
             with np.load(Path(self.cache_dir) / name, allow_pickle=False) as archive:
-                arrays = {key: archive[key] for key in archive.files}
+                if self.storage_mode == "source_stream":
+                    source = {key: archive[key] for key in QPLANNING_ARTIFACT_FIELDS}
+                    arrays = qplanning_windows_from_artifact(
+                        entry, source, horizon=self.horizon, gamma=self.gamma)
+                else:
+                    arrays = {key: archive[key] for key in archive.files}
             if len(self._open) >= self.max_open_rollouts:
                 self._open.popitem(last=False)
         self._open[name] = arrays

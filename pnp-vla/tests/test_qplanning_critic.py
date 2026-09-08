@@ -5,7 +5,8 @@ from pnp.pcp_critic.data import DatasetSnapshot
 from pnp.pcp_search.data import build_training_artifact
 from pnp.qplanning_critic.config import QPlanningModelConfig
 from pnp.qplanning_critic.data import (
-    QPLANNING_ARTIFACT_FIELDS, collate_windows, prepare_qplanning_cache,
+    QPLANNING_ARTIFACT_FIELDS, QPlanningWindowDataset, collate_windows,
+    prepare_qplanning_cache, prepare_qplanning_streaming_cache,
     qplanning_windows_from_artifact)
 from pnp.qplanning_critic.model import QPlanningCritic
 
@@ -191,3 +192,43 @@ def test_source_cache_checkpoints_completed_rollouts_after_failure(tmp_path, mon
         object(), snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
         download_workers=1)
     assert downloads.count("r0") == 1
+
+
+def test_streaming_windows_use_only_shared_source_disk_cache(tmp_path, monkeypatch):
+    artifact = _artifact(60)
+    rows = [{
+        "rollout_id": "r0", "training_data_path": "remote/r0",
+        "benchmark": "libero", "suite": "libero_goal", "task_idx": 0,
+        "run_id": "run",
+    }]
+    snapshot = DatasetSnapshot(
+        snapshot_id="pcpcds-stream", rollout_ids=("r0",),
+        train_rollout_ids=("r0",), val_rollout_ids=(),
+        policy_repo_id="pi", policy_revision="revision", artifact_schema_version=1,
+        action_mean=tuple(np.zeros(7)), action_std=tuple(np.ones(7)), provenance={})
+    downloads = []
+    monkeypatch.setattr(
+        "pnp.qplanning_critic.data.eligible_rollout_rows",
+        lambda _store, rollout_ids: rows)
+
+    def load(_store, path, fields):
+        downloads.append(path)
+        return {name: np.asarray(artifact[name]).copy() for name in fields}
+
+    monkeypatch.setattr("pnp.qplanning_critic.data.load_training_fields_with_retry", load)
+    q50 = prepare_qplanning_streaming_cache(
+        object(), snapshot, horizon=50, gamma=.97, cache_root=tmp_path,
+        download_workers=1)
+    dataset = QPlanningWindowDataset(q50, snapshot.train_rollout_ids)
+    expected = qplanning_windows_from_artifact(
+        rows[0], artifact, horizon=50, gamma=.97)
+    np.testing.assert_allclose(dataset[0]["action"], expected["action"][0])
+    assert dataset[0]["reward"] == expected["reward"][0]
+
+    q10 = prepare_qplanning_streaming_cache(
+        object(), snapshot, horizon=10, gamma=.97, cache_root=tmp_path,
+        download_workers=1)
+    assert q10.storage_mode == "source_stream"
+    assert downloads == ["remote/r0"]
+    assert not (tmp_path / snapshot.snapshot_id / "q50_v2").exists()
+    assert not (tmp_path / snapshot.snapshot_id / "q10_v2").exists()
