@@ -49,6 +49,7 @@ def run_qplanning_training_test(*, snapshot_id: str, horizon: int,
                                 cache_root: str | Path = "/content/qplanning_cache",
                                 output_root: str | Path = "/content/qplanning_checkpoints",
                                 micro_batch_size: int = 16,
+                                cache_download_workers: int = 4,
                                 device=None, resume: bool = True,
                                 store: SupabaseStore | None = None) -> dict:
     """Validate/cache data and run either a short pipeline test or fixed full run."""
@@ -61,7 +62,8 @@ def run_qplanning_training_test(*, snapshot_id: str, horizon: int,
     store = store or SupabaseStore()
     snapshot = PCPCriticRegistry(store).load_snapshot(snapshot_id)
     cache = prepare_qplanning_cache(
-        store, snapshot, horizon=horizon, gamma=.99, cache_root=cache_root)
+        store, snapshot, horizon=horizon, gamma=.99, cache_root=cache_root,
+        download_workers=cache_download_workers)
     _print_preflight(snapshot, cache)
     train = QPlanningWindowDataset(cache, snapshot.train_rollout_ids)
     validation_limit = 512 if run_mode == "smoke" else 4096

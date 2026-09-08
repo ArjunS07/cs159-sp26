@@ -1,7 +1,8 @@
 """Executed-trajectory Q10/Q50 windows backed by a bounded local cache."""
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -17,7 +18,10 @@ from ..pcp_critic.data import DatasetSnapshot, eligible_rollout_rows
 from ..pcp_critic.resumable_snapshot import load_training_fields_with_retry
 
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
+SOURCE_CACHE_SCHEMA_VERSION = 1
+DEFAULT_DOWNLOAD_WORKERS = 4
+PROGRESS_INTERVAL = 10
 QPLANNING_ARTIFACT_FIELDS = (
     "actions_normalized", "rewards", "terminated", "truncated", "step_success",
     "boundary/step", "boundary/raw_robot_state", "boundary/policy_proprio",
@@ -68,6 +72,40 @@ class QPlanningCacheIndex:
     def digest(self) -> str:
         payload = {key: value for key, value in asdict(self).items() if key != "cache_dir"}
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True, indent=2))
+    os.replace(temporary, path)
+
+
+def _rollout_digest(rollout_ids: Iterable[str]) -> str:
+    value = "\n".join(sorted(rollout_ids))
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _bounded_parallel_map(function, items: Iterable, *, max_workers: int):
+    """Yield ordered results without queueing an unbounded number of large jobs."""
+    iterator = iter(items)
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    pending = deque()
+    try:
+        for _ in range(max_workers * 2):
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                break
+        while pending:
+            yield pending.popleft().result()
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                pass
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _prefix(value: np.ndarray) -> np.ndarray:
@@ -186,9 +224,7 @@ def qplanning_windows_from_artifact(row: dict, arrays: dict[str, np.ndarray], *,
     return {key: np.stack([record[key] for record in records]) for key in records[0]}
 
 
-def _write_rollout(path: Path, row: dict, arrays: dict[str, np.ndarray], *,
-                   horizon: int, gamma: float) -> tuple[dict, np.ndarray, np.ndarray]:
-    packed = qplanning_windows_from_artifact(row, arrays, horizon=horizon, gamma=gamma)
+def _generated_executed_statistics(arrays: dict[str, np.ndarray]) -> tuple[float, int, float]:
     generated = np.asarray(arrays["bellman/action"], np.float32)
     executed = np.asarray(arrays["bellman/executed_normalized"], np.float32)
     valid = np.asarray(arrays["bellman/validity_mask"], bool)
@@ -198,11 +234,146 @@ def _write_rollout(path: Path, row: dict, arrays: dict[str, np.ndarray], *,
         if width:
             differences.append(np.abs(generated[index, :width] - executed[index, :width]))
     differences = np.concatenate(differences) if differences else np.empty((0,), np.float32)
+    return (
+        float(differences.sum()) if len(differences) else 0.0,
+        int(differences.size),
+        float(differences.max()) if len(differences) else 0.0,
+    )
+
+
+def _write_source_rollout(path: Path, row: dict,
+                          arrays: dict[str, np.ndarray]) -> dict:
+    """Persist the expensive remote fields once for both Q10 and Q50."""
+    _validate_qplanning_fields(arrays)
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(handle, **{
+            name: arrays[name] for name in QPLANNING_ARTIFACT_FIELDS})
+    os.replace(temporary, path)
+    actions = np.asarray(arrays["actions_normalized"], np.float64)
+    abs_sum, difference_count, max_abs = _generated_executed_statistics(arrays)
+    return {
+        "rollout_id": row["rollout_id"], "path": path.name,
+        "benchmark": str(row.get("benchmark") or ""),
+        "suite": str(row.get("suite") or ""),
+        "task_idx": int(row.get("task_idx") or 0),
+        "run_id": str(row.get("run_id") or ""),
+        "action_count": int(len(actions)),
+        "action_sum": [float(value) for value in actions.sum(0)],
+        "action_sumsq": [float(value) for value in np.square(actions).sum(0)],
+        "generated_executed_abs_sum": abs_sum,
+        "generated_executed_count": difference_count,
+        "generated_executed_max_abs": max_abs,
+    }
+
+
+def _download_source_rollout(store, source_dir: Path, row: dict) -> dict:
+    arrays = load_training_fields_with_retry(
+        store, row["training_data_path"], QPLANNING_ARTIFACT_FIELDS)
+    try:
+        return _write_source_rollout(
+            source_dir / f"{row['rollout_id']}.npz", row, arrays)
+    finally:
+        del arrays
+
+
+def _source_progress_payload(snapshot: DatasetSnapshot, entries: list[dict], *,
+                             complete: bool) -> dict:
+    return {
+        "source_cache_schema_version": SOURCE_CACHE_SCHEMA_VERSION,
+        "snapshot_id": snapshot.snapshot_id,
+        "rollout_digest": _rollout_digest(snapshot.rollout_ids),
+        "complete": complete,
+        "rollouts": entries,
+    }
+
+
+def _load_source_entries(index_path: Path, source_dir: Path,
+                         snapshot: DatasetSnapshot) -> dict[str, dict]:
+    if not index_path.exists():
+        return {}
+    try:
+        payload = json.loads(index_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if (payload.get("source_cache_schema_version") != SOURCE_CACHE_SCHEMA_VERSION
+            or payload.get("snapshot_id") != snapshot.snapshot_id
+            or payload.get("rollout_digest") != _rollout_digest(snapshot.rollout_ids)):
+        return {}
+    wanted = set(snapshot.rollout_ids)
+    return {
+        entry["rollout_id"]: entry for entry in payload.get("rollouts", [])
+        if entry.get("rollout_id") in wanted
+        and (source_dir / entry.get("path", "")).is_file()
+    }
+
+
+def _prepare_source_cache(store, snapshot: DatasetSnapshot, *, cache_root: Path,
+                          download_workers: int) -> tuple[Path, tuple[dict, ...]]:
+    """Create/resume the shared remote-artifact cache with bounded parallelism."""
+    source_dir = cache_root / snapshot.snapshot_id / "source_v1"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    index_path = source_dir / "index.json"
+    entries_by_id = _load_source_entries(index_path, source_dir, snapshot)
+    wanted_ids = tuple(snapshot.rollout_ids)
+    if len(entries_by_id) == len(wanted_ids):
+        print(
+            f"[qplanning] shared source cache: reused {len(wanted_ids)}/{len(wanted_ids)} rollouts",
+            flush=True)
+        return source_dir, tuple(entries_by_id[rollout_id] for rollout_id in wanted_ids)
+
+    rows = eligible_rollout_rows(store, rollout_ids=wanted_ids)
+    rows_by_id = {row["rollout_id"]: row for row in rows}
+    missing_ids = [rollout_id for rollout_id in wanted_ids if rollout_id not in entries_by_id]
+    print(
+        f"[qplanning] shared source cache: {len(entries_by_id)}/{len(wanted_ids)} ready; "
+        f"downloading {len(missing_ids)} with {download_workers} workers",
+        flush=True,
+    )
+    completed_since_save = 0
+    try:
+        results = _bounded_parallel_map(
+            lambda rollout_id: _download_source_rollout(
+                store, source_dir, rows_by_id[rollout_id]),
+            missing_ids, max_workers=download_workers)
+        for entry in results:
+            entries_by_id[entry["rollout_id"]] = entry
+            completed_since_save += 1
+            completed = len(entries_by_id)
+            if completed_since_save >= PROGRESS_INTERVAL:
+                ordered = [entries_by_id[rid] for rid in wanted_ids if rid in entries_by_id]
+                _atomic_json(index_path, _source_progress_payload(
+                    snapshot, ordered, complete=False))
+                completed_since_save = 0
+            if completed % PROGRESS_INTERVAL == 0 or completed == len(wanted_ids):
+                print(
+                    f"[qplanning] shared source cache: {completed}/{len(wanted_ids)} rollouts",
+                    flush=True,
+                )
+    finally:
+        ordered = [entries_by_id[rid] for rid in wanted_ids if rid in entries_by_id]
+        _atomic_json(index_path, _source_progress_payload(
+            snapshot, ordered, complete=len(ordered) == len(wanted_ids)))
+    if len(entries_by_id) != len(wanted_ids):
+        raise RuntimeError(
+            f"shared source cache is incomplete: {len(entries_by_id)}/{len(wanted_ids)}")
+    return source_dir, tuple(entries_by_id[rollout_id] for rollout_id in wanted_ids)
+
+
+def _load_source_arrays(source_dir: Path, entry: dict) -> dict[str, np.ndarray]:
+    with np.load(source_dir / entry["path"], allow_pickle=False) as archive:
+        return {name: archive[name] for name in QPLANNING_ARTIFACT_FIELDS}
+
+
+def _write_rollout(path: Path, row: dict, arrays: dict[str, np.ndarray], *,
+                   horizon: int, gamma: float, source_entry: dict | None = None) -> dict:
+    packed = qplanning_windows_from_artifact(row, arrays, horizon=horizon, gamma=gamma)
     temporary = path.with_suffix(".tmp")
     with temporary.open("wb") as handle:
         np.savez_compressed(handle, **packed)
     os.replace(temporary, path)
-    entry = {
+    source_entry = source_entry or {}
+    return {
         "rollout_id": row["rollout_id"], "path": path.name,
         "n_windows": len(packed["reward"]),
         "n_bootstrap": int(np.count_nonzero(packed["discount"])),
@@ -214,61 +385,140 @@ def _write_rollout(path: Path, row: dict, arrays: dict[str, np.ndarray], *,
         "robot_dim": int(packed["robot"].shape[-1]),
         "proprio_dim": int(packed["proprio"].shape[-1]),
         "action_dim": int(packed["action"].shape[-1]),
-        "generated_executed_abs_sum": float(differences.sum()) if len(differences) else 0.0,
-        "generated_executed_count": int(differences.size),
-        "generated_executed_max_abs": float(differences.max()) if len(differences) else 0.0,
+        "generated_executed_abs_sum": float(
+            source_entry.get("generated_executed_abs_sum", 0.0)),
+        "generated_executed_count": int(
+            source_entry.get("generated_executed_count", 0)),
+        "generated_executed_max_abs": float(
+            source_entry.get("generated_executed_max_abs", 0.0)),
     }
-    return entry, np.asarray(arrays["actions_normalized"], np.float64), differences
+
+
+def _cache_from_payload(payload: dict, cache_dir: Path) -> QPlanningCacheIndex:
+    return QPlanningCacheIndex(
+        snapshot_id=payload["snapshot_id"], horizon=int(payload["horizon"]),
+        cache_dir=str(cache_dir), rollouts=tuple(payload["rollouts"]),
+        prefix_dim=int(payload["prefix_dim"]), robot_dim=int(payload["robot_dim"]),
+        proprio_dim=int(payload["proprio_dim"]), action_dim=int(payload["action_dim"]),
+        action_mean=tuple(payload["action_mean"]), action_std=tuple(payload["action_std"]),
+        n_windows=int(payload["n_windows"]), n_train_windows=int(payload["n_train_windows"]),
+        n_val_windows=int(payload["n_val_windows"]),
+        n_bootstrap_windows=int(payload["n_bootstrap_windows"]),
+        generated_executed_first10_mae=float(
+            payload["generated_executed_first10_mae"]),
+        generated_executed_first10_max_abs=float(
+            payload["generated_executed_first10_max_abs"]),
+    )
+
+
+def _load_finished_cache(manifest_path: Path, cache_dir: Path, snapshot: DatasetSnapshot,
+                         *, horizon: int, gamma: float) -> QPlanningCacheIndex | None:
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (payload.get("cache_schema_version") != CACHE_SCHEMA_VERSION
+            or payload.get("snapshot_id") != snapshot.snapshot_id
+            or payload.get("horizon") != horizon or payload.get("gamma") != gamma
+            or not payload.get("complete")):
+        return None
+    entries = payload.get("rollouts", [])
+    if ({entry.get("rollout_id") for entry in entries} != set(snapshot.rollout_ids)
+            or any(not (cache_dir / entry.get("path", "")).is_file() for entry in entries)):
+        return None
+    return _cache_from_payload(payload, cache_dir)
 
 
 def prepare_qplanning_cache(store, snapshot: DatasetSnapshot, *, horizon: int,
-                            gamma: float, cache_root: str | Path) -> QPlanningCacheIndex:
-    """Create/resume a local, horizon-specific cache without loading all prefixes into RAM."""
-    cache_dir = Path(cache_root).expanduser() / snapshot.snapshot_id / f"q{horizon}"
+                            gamma: float, cache_root: str | Path,
+                            download_workers: int = DEFAULT_DOWNLOAD_WORKERS) -> QPlanningCacheIndex:
+    """Create/resume a shared download cache and local horizon-specific windows."""
+    if not 1 <= download_workers <= 8:
+        raise ValueError("download_workers must be in [1, 8]")
+    root = Path(cache_root).expanduser()
+    cache_dir = root / snapshot.snapshot_id / f"q{horizon}_v2"
     cache_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = cache_dir / "index.json"
-    rows = eligible_rollout_rows(store, rollout_ids=snapshot.rollout_ids)
+    finished = _load_finished_cache(
+        manifest_path, cache_dir, snapshot, horizon=horizon, gamma=gamma)
+    if finished is not None:
+        print(
+            f"[qplanning] Q{horizon} window cache: reused {len(finished.rollouts)} rollouts",
+            flush=True)
+        return finished
+
+    source_dir, source_entries = _prepare_source_cache(
+        store, snapshot, cache_root=root, download_workers=download_workers)
+    source_by_id = {entry["rollout_id"]: entry for entry in source_entries}
+    progress_path = cache_dir / "progress.json"
     old = {}
-    if manifest_path.exists():
+    if progress_path.exists():
         try:
-            payload = json.loads(manifest_path.read_text())
-            if (payload.get("cache_schema_version") == CACHE_SCHEMA_VERSION
-                    and payload.get("snapshot_id") == snapshot.snapshot_id
-                    and payload.get("horizon") == horizon
-                    and payload.get("gamma") == gamma):
-                old = {entry["rollout_id"]: entry for entry in payload.get("rollouts", [])}
+            progress = json.loads(progress_path.read_text())
+            if (progress.get("cache_schema_version") == CACHE_SCHEMA_VERSION
+                    and progress.get("snapshot_id") == snapshot.snapshot_id
+                    and progress.get("horizon") == horizon and progress.get("gamma") == gamma):
+                old = {
+                    entry["rollout_id"]: entry for entry in progress.get("rollouts", [])
+                    if (cache_dir / entry.get("path", "")).is_file()
+                }
         except (OSError, json.JSONDecodeError):
             pass
-    entries = []
-    train_ids = set(snapshot.train_rollout_ids)
-    action_count = 0
-    action_sum = action_sumsq = None
-    for position, row in enumerate(rows, 1):
-        path = cache_dir / f"{row['rollout_id']}.npz"
-        entry = old.get(row["rollout_id"])
-        need_arrays = entry is None or not path.exists() or row["rollout_id"] in train_ids
-        arrays = load_training_fields_with_retry(
-            store, row["training_data_path"], QPLANNING_ARTIFACT_FIELDS) if need_arrays else None
-        try:
-            if entry is None or not path.exists():
-                entry, actions, _ = _write_rollout(
-                    path, row, arrays, horizon=horizon, gamma=gamma)
-            elif row["rollout_id"] in train_ids:
-                actions = np.asarray(arrays["actions_normalized"], np.float64)
-            if row["rollout_id"] in train_ids:
-                batch_sum = actions.sum(0)
-                batch_sumsq = np.square(actions).sum(0)
-                action_sum = batch_sum if action_sum is None else action_sum + batch_sum
-                action_sumsq = batch_sumsq if action_sumsq is None else action_sumsq + batch_sumsq
-                action_count += len(actions)
-            entries.append(entry)
-        finally:
-            if arrays is not None:
+    entries_by_id = old
+    wanted_ids = tuple(snapshot.rollout_ids)
+    missing_ids = [rollout_id for rollout_id in wanted_ids if rollout_id not in entries_by_id]
+    print(
+        f"[qplanning] Q{horizon} local windows: {len(entries_by_id)}/{len(wanted_ids)} ready; "
+        f"building {len(missing_ids)} with 2 workers",
+        flush=True,
+    )
+    completed_since_save = 0
+    try:
+        def convert(rollout_id: str) -> dict:
+            source_entry = source_by_id[rollout_id]
+            arrays = _load_source_arrays(source_dir, source_entry)
+            try:
+                return _write_rollout(
+                    cache_dir / f"{rollout_id}.npz", source_entry, arrays,
+                    horizon=horizon, gamma=gamma, source_entry=source_entry)
+            finally:
                 del arrays
-        if position % 25 == 0 or position == len(rows):
-            print(f"[qplanning] q{horizon} cache: {position}/{len(rows)} rollouts")
+
+        for entry in _bounded_parallel_map(convert, missing_ids, max_workers=2):
+            entries_by_id[entry["rollout_id"]] = entry
+            completed_since_save += 1
+            completed = len(entries_by_id)
+            if completed_since_save >= PROGRESS_INTERVAL:
+                ordered = [entries_by_id[rid] for rid in wanted_ids if rid in entries_by_id]
+                _atomic_json(progress_path, {
+                    "cache_schema_version": CACHE_SCHEMA_VERSION,
+                    "snapshot_id": snapshot.snapshot_id, "horizon": horizon,
+                    "gamma": gamma, "rollouts": ordered,
+                })
+                completed_since_save = 0
+            if completed % PROGRESS_INTERVAL == 0 or completed == len(wanted_ids):
+                print(
+                    f"[qplanning] Q{horizon} local windows: "
+                    f"{completed}/{len(wanted_ids)} rollouts",
+                    flush=True,
+                )
+    finally:
+        ordered = [entries_by_id[rid] for rid in wanted_ids if rid in entries_by_id]
+        _atomic_json(progress_path, {
+            "cache_schema_version": CACHE_SCHEMA_VERSION,
+            "snapshot_id": snapshot.snapshot_id, "horizon": horizon,
+            "gamma": gamma, "rollouts": ordered,
+        })
+    entries = [entries_by_id[rollout_id] for rollout_id in wanted_ids]
+    train_ids = set(snapshot.train_rollout_ids)
+    train_sources = [source_by_id[rollout_id] for rollout_id in snapshot.train_rollout_ids]
+    action_count = sum(entry["action_count"] for entry in train_sources)
     if not action_count:
         raise ValueError("snapshot has no train actions")
+    action_sum = np.sum([entry["action_sum"] for entry in train_sources], axis=0)
+    action_sumsq = np.sum([entry["action_sumsq"] for entry in train_sources], axis=0)
     dimensions = {(e["prefix_dim"], e["robot_dim"], e["proprio_dim"], e["action_dim"])
                   for e in entries}
     if len(dimensions) != 1:
@@ -292,10 +542,11 @@ def prepare_qplanning_cache(store, snapshot: DatasetSnapshot, *, horizon: int,
             sum(e["generated_executed_abs_sum"] for e in entries) / count if count else float("nan")),
         generated_executed_first10_max_abs=max(
             (e["generated_executed_max_abs"] for e in entries), default=float("nan")))
-    payload = {"cache_schema_version": CACHE_SCHEMA_VERSION, "gamma": gamma, **asdict(result)}
-    temporary = manifest_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, sort_keys=True, indent=2))
-    os.replace(temporary, manifest_path)
+    payload = {
+        "cache_schema_version": CACHE_SCHEMA_VERSION, "gamma": gamma,
+        "complete": True, **asdict(result),
+    }
+    _atomic_json(manifest_path, payload)
     return result
 
 

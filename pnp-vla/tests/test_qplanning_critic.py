@@ -1,9 +1,12 @@
 import numpy as np
 import torch
 
+from pnp.pcp_critic.data import DatasetSnapshot
 from pnp.pcp_search.data import build_training_artifact
 from pnp.qplanning_critic.config import QPlanningModelConfig
-from pnp.qplanning_critic.data import collate_windows, qplanning_windows_from_artifact
+from pnp.qplanning_critic.data import (
+    QPLANNING_ARTIFACT_FIELDS, collate_windows, prepare_qplanning_cache,
+    qplanning_windows_from_artifact)
 from pnp.qplanning_critic.model import QPlanningCritic
 
 
@@ -90,3 +93,91 @@ def test_single_q_rl_token_decoder_and_hl_gauss_head():
     assert len(model.value_head.weight) == 11
     assert torch.allclose(targets.sum(-1), torch.ones(2), atol=1e-6)
     assert model.categorical_loss(logits, torch.tensor([0.0, 1.0])).isfinite()
+
+
+def test_parallel_source_cache_is_reused_across_horizons_and_repeated_runs(
+        tmp_path, monkeypatch):
+    artifact = _artifact(60)
+    rows = [{
+        "rollout_id": rollout_id, "training_data_path": f"remote/{rollout_id}",
+        "benchmark": "libero", "suite": "libero_goal", "task_idx": index,
+        "run_id": "run",
+    } for index, rollout_id in enumerate(("r0", "r1"))]
+    snapshot = DatasetSnapshot(
+        snapshot_id="pcpcds-test", rollout_ids=("r0", "r1"),
+        train_rollout_ids=("r0",), val_rollout_ids=("r1",),
+        policy_repo_id="pi", policy_revision="revision", artifact_schema_version=1,
+        action_mean=tuple(np.zeros(7)), action_std=tuple(np.ones(7)), provenance={})
+    downloads = []
+
+    monkeypatch.setattr(
+        "pnp.qplanning_critic.data.eligible_rollout_rows",
+        lambda _store, rollout_ids: rows)
+
+    def load(_store, path, fields):
+        downloads.append(path)
+        assert tuple(fields) == QPLANNING_ARTIFACT_FIELDS
+        return {name: np.asarray(artifact[name]).copy() for name in fields}
+
+    monkeypatch.setattr("pnp.qplanning_critic.data.load_training_fields_with_retry", load)
+    q50 = prepare_qplanning_cache(
+        object(), snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
+        download_workers=2)
+    assert sorted(downloads) == ["remote/r0", "remote/r1"]
+    assert len(q50.rollouts) == 2
+
+    repeated_q50 = prepare_qplanning_cache(
+        object(), snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
+        download_workers=2)
+    q10 = prepare_qplanning_cache(
+        object(), snapshot, horizon=10, gamma=.99, cache_root=tmp_path,
+        download_workers=2)
+    assert downloads == ["remote/r0", "remote/r1"]
+    assert repeated_q50.digest == q50.digest
+    assert len(q10.rollouts) == 2
+    assert (tmp_path / snapshot.snapshot_id / "source_v1" / "index.json").is_file()
+    assert (tmp_path / snapshot.snapshot_id / "q50_v2" / "index.json").is_file()
+    assert (tmp_path / snapshot.snapshot_id / "q10_v2" / "index.json").is_file()
+
+
+def test_source_cache_checkpoints_completed_rollouts_after_failure(tmp_path, monkeypatch):
+    artifact = _artifact(60)
+    rollout_ids = ("r0", "r1", "r2")
+    rows = [{
+        "rollout_id": rollout_id, "training_data_path": f"remote/{rollout_id}",
+        "benchmark": "libero", "suite": "libero_goal", "task_idx": index,
+        "run_id": "run",
+    } for index, rollout_id in enumerate(rollout_ids)]
+    snapshot = DatasetSnapshot(
+        snapshot_id="pcpcds-resume", rollout_ids=rollout_ids,
+        train_rollout_ids=("r0", "r1"), val_rollout_ids=("r2",),
+        policy_repo_id="pi", policy_revision="revision", artifact_schema_version=1,
+        action_mean=tuple(np.zeros(7)), action_std=tuple(np.ones(7)), provenance={})
+    monkeypatch.setattr(
+        "pnp.qplanning_critic.data.eligible_rollout_rows",
+        lambda _store, rollout_ids: rows)
+    downloads = []
+    should_fail = {"r1": True}
+
+    def load(_store, path, fields):
+        rollout_id = path.rsplit("/", 1)[-1]
+        downloads.append(rollout_id)
+        if should_fail.get(rollout_id):
+            raise RuntimeError("simulated transport exhaustion")
+        return {name: np.asarray(artifact[name]).copy() for name in fields}
+
+    monkeypatch.setattr("pnp.qplanning_critic.data.load_training_fields_with_retry", load)
+    try:
+        prepare_qplanning_cache(
+            object(), snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
+            download_workers=1)
+    except RuntimeError as error:
+        assert "simulated transport exhaustion" in str(error)
+    else:
+        raise AssertionError("the simulated first pass should fail")
+
+    should_fail["r1"] = False
+    prepare_qplanning_cache(
+        object(), snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
+        download_workers=1)
+    assert downloads.count("r0") == 1
