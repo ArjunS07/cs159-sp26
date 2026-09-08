@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Iterable
 
 import numpy as np
@@ -331,11 +332,20 @@ def _prepare_source_cache(store, snapshot: DatasetSnapshot, *, cache_root: Path,
         flush=True,
     )
     completed_since_save = 0
+    worker_state = threading.local()
+
+    def download(rollout_id: str) -> dict:
+        worker_store = getattr(worker_state, "store", None)
+        if worker_store is None:
+            fork = getattr(store, "fork_for_thread", None)
+            worker_store = fork() if fork is not None else store
+            worker_state.store = worker_store
+        return _download_source_rollout(
+            worker_store, source_dir, rows_by_id[rollout_id])
+
     try:
         results = _bounded_parallel_map(
-            lambda rollout_id: _download_source_rollout(
-                store, source_dir, rows_by_id[rollout_id]),
-            missing_ids, max_workers=download_workers)
+            download, missing_ids, max_workers=download_workers)
         for entry in results:
             entries_by_id[entry["rollout_id"]] = entry
             completed_since_save += 1

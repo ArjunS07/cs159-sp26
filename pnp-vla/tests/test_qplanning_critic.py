@@ -110,27 +110,37 @@ def test_parallel_source_cache_is_reused_across_horizons_and_repeated_runs(
         action_mean=tuple(np.zeros(7)), action_std=tuple(np.ones(7)), provenance={})
     downloads = []
 
+    class Store:
+        def __init__(self, parent=False):
+            self.parent = parent
+
+        def fork_for_thread(self):
+            return Store()
+
+    parent_store = Store(parent=True)
+
     monkeypatch.setattr(
         "pnp.qplanning_critic.data.eligible_rollout_rows",
         lambda _store, rollout_ids: rows)
 
     def load(_store, path, fields):
+        assert not _store.parent
         downloads.append(path)
         assert tuple(fields) == QPLANNING_ARTIFACT_FIELDS
         return {name: np.asarray(artifact[name]).copy() for name in fields}
 
     monkeypatch.setattr("pnp.qplanning_critic.data.load_training_fields_with_retry", load)
     q50 = prepare_qplanning_cache(
-        object(), snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
+        parent_store, snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
         download_workers=2)
     assert sorted(downloads) == ["remote/r0", "remote/r1"]
     assert len(q50.rollouts) == 2
 
     repeated_q50 = prepare_qplanning_cache(
-        object(), snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
+        parent_store, snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
         download_workers=2)
     q10 = prepare_qplanning_cache(
-        object(), snapshot, horizon=10, gamma=.99, cache_root=tmp_path,
+        parent_store, snapshot, horizon=10, gamma=.99, cache_root=tmp_path,
         download_workers=2)
     assert downloads == ["remote/r0", "remote/r1"]
     assert repeated_q50.digest == q50.digest

@@ -1,6 +1,6 @@
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import httpx
 import numpy as np
@@ -10,6 +10,22 @@ from pnp.store import (SupabaseStore, TRAINING_DATA_MULTIPART_FORMAT,
 
 
 class StoreSerializationTests(unittest.TestCase):
+    def test_thread_fork_uses_an_independent_client_with_the_same_contract(self):
+        store = object.__new__(SupabaseStore)
+        store._url = "https://example.supabase.co"
+        store._key = "service-key"
+        store.bucket = "artifacts"
+        store._enc_lru_size = 17
+        module = ModuleType("supabase")
+        create_client = Mock(return_value=object())
+        module.create_client = create_client
+        with patch.dict("sys.modules", {"supabase": module}):
+            fork = store.fork_for_thread()
+        create_client.assert_called_once_with(store._url, store._key)
+        self.assertIsNot(fork, store)
+        self.assertEqual(fork.bucket, store.bucket)
+        self.assertEqual(fork._enc_lru_size, store._enc_lru_size)
+
     def test_dim_cols_accepts_numpy_array(self):
         cols = SupabaseStore._dim_cols(np.array([1.25, 2.5]), "u_d")
 

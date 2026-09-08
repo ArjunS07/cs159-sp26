@@ -203,6 +203,8 @@ class SupabaseStore:
         from supabase import create_client
         url = url or os.environ["SUPABASE_URL"]
         key = key or os.environ["SUPABASE_SERVICE_KEY"]
+        self._url = url
+        self._key = key
         self.client = create_client(url, key)
         self.bucket = bucket
         self.run_id: str | None = None
@@ -210,6 +212,16 @@ class SupabaseStore:
         self._bytes_written = 0
         self._enc_lru: "OrderedDict[str, np.lib.npyio.NpzFile]" = OrderedDict()
         self._enc_lru_size = encoding_cache_size
+
+    def fork_for_thread(self) -> "SupabaseStore":
+        """Return an independent HTTP client for one worker thread.
+
+        The Supabase storage client's HTTP/2 HPACK state is not safe to share across concurrent
+        threads. Keep credentials and bucket identical while isolating transport state.
+        """
+        return SupabaseStore(
+            url=self._url, key=self._key, bucket=self.bucket,
+            encoding_cache_size=self._enc_lru_size)
 
     # ── paginated reads ────────────────────────────────────────────────────
     def fetch_all(self, table: str, columns: str = "*", *, configure=None,
