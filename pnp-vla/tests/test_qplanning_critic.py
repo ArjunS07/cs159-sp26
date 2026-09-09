@@ -1,3 +1,6 @@
+import io
+import json
+
 import numpy as np
 import torch
 
@@ -9,6 +12,7 @@ from pnp.qplanning_critic.data import (
     prepare_qplanning_cache, prepare_qplanning_streaming_cache,
     qplanning_windows_from_artifact)
 from pnp.qplanning_critic.model import QPlanningCritic
+from pnp.store import TRAINING_DATA_MULTIPART_FORMAT
 
 
 def _prefix(value):
@@ -146,7 +150,7 @@ def test_parallel_source_cache_is_reused_across_horizons_and_repeated_runs(
     assert downloads == ["remote/r0", "remote/r1"]
     assert repeated_q50.digest == q50.digest
     assert len(q10.rollouts) == 2
-    assert (tmp_path / snapshot.snapshot_id / "source_v1" / "index.json").is_file()
+    assert (tmp_path / snapshot.snapshot_id / "source_parts_v2" / "index.json").is_file()
     assert (tmp_path / snapshot.snapshot_id / "q50_v2" / "index.json").is_file()
     assert (tmp_path / snapshot.snapshot_id / "q10_v2" / "index.json").is_file()
 
@@ -232,3 +236,97 @@ def test_streaming_windows_use_only_shared_source_disk_cache(tmp_path, monkeypat
     assert downloads == ["remote/r0"]
     assert not (tmp_path / snapshot.snapshot_id / "q50_v2").exists()
     assert not (tmp_path / snapshot.snapshot_id / "q10_v2").exists()
+
+
+def test_multipart_source_cache_mirrors_clean_parts_and_filters_contaminated_parts(
+        tmp_path, monkeypatch):
+    artifact = _artifact(60)
+    rollout_id = "r0"
+    manifest_path = "pcp_search/training_data/r0/manifest.json"
+    clean_path = "pcp_search/training_data/r0/parts/0000.npz"
+    contaminated_path = "pcp_search/training_data/r0/parts/0001.npz"
+    clean_buffer = io.BytesIO()
+    np.savez_compressed(clean_buffer, **{
+        name: np.asarray(artifact[name])
+        for name in QPLANNING_ARTIFACT_FIELDS if name != "rewards"})
+    contaminated_buffer = io.BytesIO()
+    np.savez_compressed(
+        contaminated_buffer, rewards=np.asarray(artifact["rewards"]),
+        unrelated_camera=np.zeros((20, 20, 3), np.uint8))
+    manifest = {
+        "format": TRAINING_DATA_MULTIPART_FORMAT,
+        "arrays": {
+            name: {
+                "dtype": np.asarray(artifact[name]).dtype.str,
+                "shape": list(np.asarray(artifact[name]).shape),
+                "parts": [{
+                    "path": contaminated_path if name == "rewards" else clean_path,
+                    "start": None, "stop": None,
+                }],
+            }
+            for name in QPLANNING_ARTIFACT_FIELDS
+        },
+    }
+    manifest["arrays"]["unrelated_camera"] = {
+        "dtype": np.dtype(np.uint8).str, "shape": [20, 20, 3],
+        "parts": [{"path": contaminated_path, "start": None, "stop": None}],
+    }
+    payloads = {
+        manifest_path: json.dumps(manifest).encode(),
+        clean_path: clean_buffer.getvalue(),
+        contaminated_path: contaminated_buffer.getvalue(),
+    }
+    downloads = []
+
+    class Store:
+        def fork_for_thread(self):
+            return Store()
+
+        def _download(self, path):
+            downloads.append(path)
+            return payloads[path]
+
+    rows = [{
+        "rollout_id": rollout_id, "training_data_path": manifest_path,
+        "benchmark": "libero", "suite": "libero_goal", "task_idx": 0,
+        "run_id": "run",
+    }]
+    snapshot = DatasetSnapshot(
+        snapshot_id="pcpcds-parts", rollout_ids=(rollout_id,),
+        train_rollout_ids=(rollout_id,), val_rollout_ids=(),
+        policy_repo_id="pi", policy_revision="revision", artifact_schema_version=1,
+        action_mean=tuple(np.zeros(7)), action_std=tuple(np.ones(7)), provenance={})
+    monkeypatch.setattr(
+        "pnp.qplanning_critic.data.eligible_rollout_rows",
+        lambda _store, rollout_ids: rows)
+
+    q10 = prepare_qplanning_streaming_cache(
+        Store(), snapshot, horizon=10, gamma=.99, cache_root=tmp_path,
+        download_workers=1)
+    entry = q10.rollouts[0]
+    assert entry["storage_format"] == "multipart_mirror"
+    assert downloads.count(manifest_path) == 1
+    assert downloads.count(clean_path) == 1
+    assert downloads.count(contaminated_path) == 1
+    local_manifest = (
+        tmp_path / snapshot.snapshot_id / "source_parts_v2" / entry["path"])
+    assert local_manifest.is_file()
+    local = json.loads(local_manifest.read_text())
+    mirrored_clean = local_manifest.parent / local["local_parts"][clean_path]
+    assert mirrored_clean.read_bytes() == payloads[clean_path]
+    mirrored_filtered = local_manifest.parent / local["local_parts"][contaminated_path]
+    with np.load(mirrored_filtered, allow_pickle=False) as archive:
+        assert archive.files == ["rewards"]
+
+    dataset = QPlanningWindowDataset(q10, snapshot.train_rollout_ids)
+    expected = qplanning_windows_from_artifact(
+        rows[0], artifact, horizon=10, gamma=.99)
+    np.testing.assert_allclose(dataset[0]["action"], expected["action"][0])
+
+    q50 = prepare_qplanning_streaming_cache(
+        Store(), snapshot, horizon=50, gamma=.99, cache_root=tmp_path,
+        download_workers=1)
+    assert q50.rollouts[0]["storage_format"] == "multipart_mirror"
+    assert downloads.count(manifest_path) == 1
+    assert downloads.count(clean_path) == 1
+    assert downloads.count(contaminated_path) == 1

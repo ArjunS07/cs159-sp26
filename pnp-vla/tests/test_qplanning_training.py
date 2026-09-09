@@ -52,3 +52,5 @@ def test_qplanning_trainer_saves_resumable_single_q_checkpoint(tmp_path):
     assert checkpoint["source_policy"] == {"repo_id": "pi", "revision": "rev"}
     assert checkpoint["update"] == 2
     assert "target" in checkpoint and "optimizer" in checkpoint
+    assert [path.name for path in (tmp_path / "checkpoints").glob("checkpoint_step_*.pt")] == [
+        "checkpoint_step_000002.pt"]

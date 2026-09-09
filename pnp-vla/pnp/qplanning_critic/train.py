@@ -175,6 +175,13 @@ def _latest_checkpoint(directory: Path) -> Path | None:
     return max(checkpoints, key=lambda path: int(path.stem.rsplit("_", 1)[-1]))
 
 
+def _keep_only_checkpoint(path: Path) -> None:
+    """Keep one resumable checkpoint per critic so periodic Drive saves stay bounded."""
+    for candidate in path.parent.glob("checkpoint_step_*.pt"):
+        if candidate != path:
+            candidate.unlink()
+
+
 def train_qplanning_critic(model: QPlanningCritic,
                            train_dataset: QPlanningWindowDataset,
                            val_dataset: QPlanningWindowDataset, device, *,
@@ -268,6 +275,7 @@ def train_qplanning_critic(model: QPlanningCritic,
                 snapshot_id=snapshot_id, cache_digest=cache_digest,
                 source_policy=source_policy,
                 train_config=config, history=history)
+            _keep_only_checkpoint(path)
             print(f"[qplanning] saved {path}")
     final_validation = evaluate_qplanning_critic(
         model, target, val_dataset, device, batch_size=config.micro_batch_size)

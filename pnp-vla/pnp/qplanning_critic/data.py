@@ -5,10 +5,13 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import threading
+import time
 from typing import Iterable
 
 import numpy as np
@@ -16,13 +19,18 @@ import torch
 from torch.utils.data import Dataset
 
 from ..pcp_critic.data import DatasetSnapshot, eligible_rollout_rows
-from ..pcp_critic.resumable_snapshot import load_training_fields_with_retry
+from ..pcp_critic.resumable_snapshot import (
+    _download_with_retry, load_training_fields_with_retry)
+from ..store import TRAINING_DATA_MULTIPART_FORMAT
 
 
 CACHE_SCHEMA_VERSION = 2
-SOURCE_CACHE_SCHEMA_VERSION = 1
+SOURCE_CACHE_SCHEMA_VERSION = 2
+SOURCE_CACHE_DIRECTORY = "source_parts_v2"
+LOCAL_MULTIPART_FORMAT = "qplanning-source-part-mirror-v1"
 DEFAULT_DOWNLOAD_WORKERS = 4
 PROGRESS_INTERVAL = 10
+MIN_FREE_DISK_BYTES = 8 * 2**30
 QPLANNING_ARTIFACT_FIELDS = (
     "actions_normalized", "rewards", "terminated", "truncated", "step_success",
     "boundary/step", "boundary/raw_robot_state", "boundary/policy_proprio",
@@ -257,6 +265,8 @@ def _write_source_rollout(path: Path, row: dict,
     abs_sum, difference_count, max_abs = _generated_executed_statistics(arrays)
     return {
         "rollout_id": row["rollout_id"], "path": path.name,
+        "storage_format": "consolidated_npz",
+        "cached_bytes": int(path.stat().st_size),
         "benchmark": str(row.get("benchmark") or ""),
         "suite": str(row.get("suite") or ""),
         "task_idx": int(row.get("task_idx") or 0),
@@ -270,7 +280,152 @@ def _write_source_rollout(path: Path, row: dict,
     }
 
 
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(payload)
+    os.replace(temporary, path)
+
+
+def _part_filename(remote_path: str) -> str:
+    return hashlib.sha256(remote_path.encode()).hexdigest() + ".npz"
+
+
+def _load_multipart_mirror(path: Path) -> dict[str, np.ndarray]:
+    metadata = json.loads(path.read_text())
+    if metadata.get("format") != LOCAL_MULTIPART_FORMAT:
+        raise ValueError(f"unsupported local Q-planning source manifest at {path}")
+    fields = metadata.get("arrays", {})
+    missing = sorted(set(QPLANNING_ARTIFACT_FIELDS) - set(fields))
+    if missing:
+        raise ValueError(f"local Q-planning source manifest is missing {missing}")
+
+    # One remote transport part can contain fragments for several requested arrays. Load only
+    # requested names; unrelated image/simulator arrays in that part stay compressed on disk.
+    names_by_part: dict[str, set[str]] = {}
+    for name in QPLANNING_ARTIFACT_FIELDS:
+        for part in fields[name]["parts"]:
+            names_by_part.setdefault(part["path"], set()).add(name)
+    part_arrays: dict[str, dict[str, np.ndarray]] = {}
+    for remote_path, names in names_by_part.items():
+        local_relative = metadata["local_parts"][remote_path]
+        with np.load(path.parent / local_relative, allow_pickle=False) as archive:
+            absent = sorted(names - set(archive.files))
+            if absent:
+                raise ValueError(f"cached part {local_relative} is missing {absent}")
+            part_arrays[remote_path] = {name: archive[name] for name in names}
+
+    result = {}
+    for name in QPLANNING_ARTIFACT_FIELDS:
+        spec = fields[name]
+        shape, dtype = tuple(spec["shape"]), np.dtype(spec["dtype"])
+        value = np.empty(shape, dtype=dtype)
+        for part in spec["parts"]:
+            start, stop = part["start"], part["stop"]
+            fragment = part_arrays[part["path"]][name]
+            if not shape or start is None or stop is None:
+                value[...] = fragment
+            else:
+                value[start:stop] = fragment
+        result[name] = value
+    return result
+
+
+def _source_entry(path: Path, source_dir: Path, row: dict,
+                  arrays: dict[str, np.ndarray], *, storage_format: str,
+                  cached_bytes: int) -> dict:
+    _validate_qplanning_fields(arrays)
+    actions = np.asarray(arrays["actions_normalized"], np.float64)
+    abs_sum, difference_count, max_abs = _generated_executed_statistics(arrays)
+    return {
+        "rollout_id": row["rollout_id"],
+        "path": path.relative_to(source_dir).as_posix(),
+        "storage_format": storage_format,
+        "cached_bytes": int(cached_bytes),
+        "benchmark": str(row.get("benchmark") or ""),
+        "suite": str(row.get("suite") or ""),
+        "task_idx": int(row.get("task_idx") or 0),
+        "run_id": str(row.get("run_id") or ""),
+        "action_count": int(len(actions)),
+        "action_sum": [float(value) for value in actions.sum(0)],
+        "action_sumsq": [float(value) for value in np.square(actions).sum(0)],
+        "generated_executed_abs_sum": abs_sum,
+        "generated_executed_count": difference_count,
+        "generated_executed_max_abs": max_abs,
+    }
+
+
+def _mirror_multipart_source_rollout(store, source_dir: Path, row: dict) -> dict:
+    """Mirror already-compressed remote parts without recompressing prefix embeddings."""
+    manifest_payload = _download_with_retry(store, row["training_data_path"])
+    remote = json.loads(manifest_payload)
+    if remote.get("format") != TRAINING_DATA_MULTIPART_FORMAT:
+        raise ValueError(
+            f"unsupported training-data manifest at {row['training_data_path']}")
+    missing = sorted(set(QPLANNING_ARTIFACT_FIELDS) - set(remote.get("arrays", {})))
+    if missing:
+        raise ValueError(f"Q-planning artifact is missing {missing}")
+
+    rollout_key = hashlib.sha256(row["rollout_id"].encode()).hexdigest()[:24]
+    rollout_dir = source_dir / "rollouts" / rollout_key
+    parts_dir = rollout_dir / "parts"
+    selected = {name: remote["arrays"][name] for name in QPLANNING_ARTIFACT_FIELDS}
+    all_names_by_part: dict[str, set[str]] = {}
+    for name, spec in remote["arrays"].items():
+        for part in spec["parts"]:
+            all_names_by_part.setdefault(part["path"], set()).add(name)
+    selected_names_by_part: dict[str, set[str]] = {}
+    for name, spec in selected.items():
+        for part in spec["parts"]:
+            selected_names_by_part.setdefault(part["path"], set()).add(name)
+    remote_parts = sorted({
+        part["path"] for spec in selected.values() for part in spec["parts"]
+    })
+    local_parts = {}
+    for remote_path in remote_parts:
+        local_path = parts_dir / _part_filename(remote_path)
+        local_parts[remote_path] = local_path.relative_to(rollout_dir).as_posix()
+        if local_path.is_file() and local_path.stat().st_size:
+            continue
+        payload = _download_with_retry(store, remote_path)
+        # Validate the ZIP directory before accepting an interrupted HTTP response.
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+            if not archive.files:
+                raise ValueError(f"empty remote NPZ part {remote_path}")
+            selected_names = selected_names_by_part[remote_path]
+            if all_names_by_part[remote_path] == selected_names:
+                filtered_payload = payload
+            else:
+                # A transport part can co-pack a required robot-state array with an unrelated
+                # camera fragment. Repack only these contaminated parts; the large clean prefix
+                # embedding parts, which dominate cache time, remain byte-for-byte mirrors.
+                filtered = {name: archive[name] for name in selected_names}
+                buffer = io.BytesIO()
+                np.savez_compressed(buffer, **filtered)
+                filtered_payload = buffer.getvalue()
+        _atomic_bytes(local_path, filtered_payload)
+
+    local_manifest = rollout_dir / "source_manifest.json"
+    _atomic_json(local_manifest, {
+        "format": LOCAL_MULTIPART_FORMAT,
+        "remote_manifest": row["training_data_path"],
+        "arrays": selected,
+        "local_parts": local_parts,
+    })
+    arrays = _load_multipart_mirror(local_manifest)
+    try:
+        cached_bytes = local_manifest.stat().st_size + sum(
+            (rollout_dir / relative).stat().st_size for relative in local_parts.values())
+        return _source_entry(
+            local_manifest, source_dir, row, arrays,
+            storage_format="multipart_mirror", cached_bytes=cached_bytes)
+    finally:
+        del arrays
+
+
 def _download_source_rollout(store, source_dir: Path, row: dict) -> dict:
+    if str(row["training_data_path"]).endswith(".json"):
+        return _mirror_multipart_source_rollout(store, source_dir, row)
     arrays = load_training_fields_with_retry(
         store, row["training_data_path"], QPLANNING_ARTIFACT_FIELDS)
     try:
@@ -304,24 +459,37 @@ def _load_source_entries(index_path: Path, source_dir: Path,
             or payload.get("rollout_digest") != _rollout_digest(snapshot.rollout_ids)):
         return {}
     wanted = set(snapshot.rollout_ids)
-    return {
-        entry["rollout_id"]: entry for entry in payload.get("rollouts", [])
-        if entry.get("rollout_id") in wanted
-        and (source_dir / entry.get("path", "")).is_file()
-    }
+
+    def complete(entry: dict) -> bool:
+        path = source_dir / entry.get("path", "")
+        if not path.is_file():
+            return False
+        if entry.get("storage_format") != "multipart_mirror":
+            return True
+        try:
+            metadata = json.loads(path.read_text())
+            return (metadata.get("format") == LOCAL_MULTIPART_FORMAT
+                    and all((path.parent / relative).is_file()
+                            for relative in metadata.get("local_parts", {}).values()))
+        except (OSError, json.JSONDecodeError):
+            return False
+
+    return {entry["rollout_id"]: entry for entry in payload.get("rollouts", [])
+            if entry.get("rollout_id") in wanted and complete(entry)}
 
 
 def _prepare_source_cache(store, snapshot: DatasetSnapshot, *, cache_root: Path,
                           download_workers: int) -> tuple[Path, tuple[dict, ...]]:
     """Create/resume the shared remote-artifact cache with bounded parallelism."""
-    source_dir = cache_root / snapshot.snapshot_id / "source_v1"
+    source_dir = cache_root / snapshot.snapshot_id / SOURCE_CACHE_DIRECTORY
     source_dir.mkdir(parents=True, exist_ok=True)
     index_path = source_dir / "index.json"
     entries_by_id = _load_source_entries(index_path, source_dir, snapshot)
     wanted_ids = tuple(snapshot.rollout_ids)
     if len(entries_by_id) == len(wanted_ids):
         print(
-            f"[qplanning] shared source cache: reused {len(wanted_ids)}/{len(wanted_ids)} rollouts",
+            f"[qplanning] compressed-part cache: reused "
+            f"{len(wanted_ids)}/{len(wanted_ids)} rollouts",
             flush=True)
         return source_dir, tuple(entries_by_id[rollout_id] for rollout_id in wanted_ids)
 
@@ -329,11 +497,13 @@ def _prepare_source_cache(store, snapshot: DatasetSnapshot, *, cache_root: Path,
     rows_by_id = {row["rollout_id"]: row for row in rows}
     missing_ids = [rollout_id for rollout_id in wanted_ids if rollout_id not in entries_by_id]
     print(
-        f"[qplanning] shared source cache: {len(entries_by_id)}/{len(wanted_ids)} ready; "
+        f"[qplanning] compressed-part cache: {len(entries_by_id)}/{len(wanted_ids)} ready; "
         f"downloading {len(missing_ids)} with {download_workers} workers",
         flush=True,
     )
+    initial_count = len(entries_by_id)
     completed_since_save = 0
+    started = time.perf_counter()
     worker_state = threading.local()
 
     def download(rollout_id: str) -> dict:
@@ -358,10 +528,24 @@ def _prepare_source_cache(store, snapshot: DatasetSnapshot, *, cache_root: Path,
                     snapshot, ordered, complete=False))
                 completed_since_save = 0
             if completed % PROGRESS_INTERVAL == 0 or completed == len(wanted_ids):
+                elapsed = time.perf_counter() - started
+                rate = (completed - initial_count) / max(elapsed, 1e-9)
+                cached_gib = sum(
+                    int(item.get("cached_bytes", 0)) for item in entries_by_id.values()) / 2**30
+                projected_gib = cached_gib / completed * len(wanted_ids)
+                eta_minutes = (len(wanted_ids) - completed) / max(rate, 1e-9) / 60
+                free_gib = shutil.disk_usage(source_dir).free / 2**30
                 print(
-                    f"[qplanning] shared source cache: {completed}/{len(wanted_ids)} rollouts",
+                    f"[qplanning] compressed-part cache: {completed}/{len(wanted_ids)} rollouts | "
+                    f"{cached_gib:.1f} GiB cached | projected {projected_gib:.1f} GiB | "
+                    f"{free_gib:.1f} GiB free | {rate:.2f} rollout/s | ETA {eta_minutes:.1f}m",
                     flush=True,
                 )
+                if (completed < len(wanted_ids)
+                        and shutil.disk_usage(source_dir).free < MIN_FREE_DISK_BYTES):
+                    raise RuntimeError(
+                        "Q-planning cache stopped with less than 8 GiB free. Completed parts are "
+                        "intact, but this runtime does not have enough local disk for the snapshot.")
     finally:
         ordered = [entries_by_id[rid] for rid in wanted_ids if rid in entries_by_id]
         _atomic_json(index_path, _source_progress_payload(
@@ -373,6 +557,8 @@ def _prepare_source_cache(store, snapshot: DatasetSnapshot, *, cache_root: Path,
 
 
 def _load_source_arrays(source_dir: Path, entry: dict) -> dict[str, np.ndarray]:
+    if entry.get("storage_format") == "multipart_mirror":
+        return _load_multipart_mirror(source_dir / entry["path"])
     with np.load(source_dir / entry["path"], allow_pickle=False) as archive:
         return {name: archive[name] for name in QPLANNING_ARTIFACT_FIELDS}
 
@@ -599,11 +785,14 @@ def prepare_qplanning_streaming_cache(
     variance = np.maximum(action_sumsq / action_count - mean ** 2, 1e-12)
 
     first = source_entries[0]
-    with np.load(source_dir / first["path"], allow_pickle=False) as archive:
-        prefix_dim = int(archive["prefix/prefix_embeddings"].shape[-1])
-        robot_dim = int(archive["boundary/raw_robot_state"].shape[-1])
-        proprio_dim = int(archive["boundary/policy_proprio"].shape[-1])
-        action_dim = int(archive["actions_normalized"].shape[-1])
+    first_arrays = _load_source_arrays(source_dir, first)
+    try:
+        prefix_dim = int(first_arrays["prefix/prefix_embeddings"].shape[-1])
+        robot_dim = int(first_arrays["boundary/raw_robot_state"].shape[-1])
+        proprio_dim = int(first_arrays["boundary/policy_proprio"].shape[-1])
+        action_dim = int(first_arrays["actions_normalized"].shape[-1])
+    finally:
+        del first_arrays
 
     entries = []
     for source in source_entries:
@@ -640,7 +829,7 @@ def prepare_qplanning_streaming_cache(
         gamma=gamma,
     )
     print(
-        f"[qplanning] Q{horizon} windows will stream from source_v1; "
+        f"[qplanning] Q{horizon} windows will stream from {SOURCE_CACHE_DIRECTORY}; "
         "no horizon-specific disk cache will be created",
         flush=True,
     )
@@ -675,12 +864,12 @@ class QPlanningWindowDataset(Dataset):
         name = entry["path"]
         arrays = self._open.pop(name, None)
         if arrays is None:
-            with np.load(Path(self.cache_dir) / name, allow_pickle=False) as archive:
-                if self.storage_mode == "source_stream":
-                    source = {key: archive[key] for key in QPLANNING_ARTIFACT_FIELDS}
-                    arrays = qplanning_windows_from_artifact(
-                        entry, source, horizon=self.horizon, gamma=self.gamma)
-                else:
+            if self.storage_mode == "source_stream":
+                source = _load_source_arrays(Path(self.cache_dir), entry)
+                arrays = qplanning_windows_from_artifact(
+                    entry, source, horizon=self.horizon, gamma=self.gamma)
+            else:
+                with np.load(Path(self.cache_dir) / name, allow_pickle=False) as archive:
                     arrays = {key: archive[key] for key in archive.files}
             if len(self._open) >= self.max_open_rollouts:
                 self._open.popitem(last=False)
