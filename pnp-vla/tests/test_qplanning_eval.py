@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from pnp import experiments, libero_pro
 from pnp.config import Method, RolloutConfig
 from pnp.qplanning_critic.config import QPlanningModelConfig
 from pnp.qplanning_critic.inference import (
@@ -101,6 +102,35 @@ def test_heldout_stock_method_is_exact_ordinary_ten_step_policy():
     assert config.save_trajectory
     assert QPLANNING_HELDOUT_IDENTITIES == 160
     assert QPLANNING_HELDOUT_SHARDS == 4
+
+
+def test_explicit_heldout_loader_can_include_historical_zero_sr_suite():
+    suite = "libero_object_temp_x0.3"
+    assert suite in libero_pro.ZERO_SR_PRO_SUITES
+    episode = {
+        "suite": suite, "task_idx": 0, "ep_idx": 0,
+        "init_state_hash": "state", "expanded_member": True, "max_steps": 100}
+    patches = (
+        patch.object(libero_pro, "clone_libero_pro", return_value="repo"),
+        patch.object(libero_pro, "install_assets"),
+        patch.object(libero_pro, "apply_env_patches"),
+        patch.object(libero_pro, "patch_torch_load"),
+        patch.object(libero_pro, "reload_benchmark", return_value={}),
+        patch.object(libero_pro, "build_libero_pro_episodes",
+                     return_value=[episode]),
+    )
+    for active in patches:
+        active.start()
+    try:
+        with pytest.raises(AssertionError, match="0%-SR suites"):
+            experiments._prepare_libero_pro_expanded_episodes(
+                suites=[suite], episode_idxs=(0,))
+        rows = experiments._prepare_libero_pro_expanded_episodes(
+            suites=[suite], episode_idxs=(0,), allow_zero_sr_suites=True)
+        assert rows == [episode]
+    finally:
+        for active in reversed(patches):
+            active.stop()
 
 
 def test_store_persists_compact_qplanning_boundary_telemetry():

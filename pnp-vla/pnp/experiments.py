@@ -371,7 +371,8 @@ def expanded_pro_suites():
 
 
 def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODES,
-                                          suites=None, episode_idxs=None):
+                                          suites=None, episode_idxs=None,
+                                          allow_zero_sr_suites=False):
     """Install the expanded-cohort PRO suites and build their episode manifest.
 
     Unlike the canonical path this asserts no fixed identity count: `_with_milk` suites ship 10
@@ -418,9 +419,10 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
     if len(collected) != len(suites):
         missing = sorted(set(suites) - set(collected))
         raise AssertionError(f"expanded PRO manifest is missing suites: {missing}")
-    excluded = sorted(set(collected) & set(libero_pro.ZERO_SR_PRO_SUITES))
-    if excluded:
-        raise AssertionError(f"0%-SR suites must not be collected: {excluded}")
+    zero_sr_in_cohort = sorted(set(collected) & set(libero_pro.ZERO_SR_PRO_SUITES))
+    if zero_sr_in_cohort and not allow_zero_sr_suites:
+        raise AssertionError(
+            f"0%-SR suites must not be collected: {zero_sr_in_cohort}")
     if not all(ep["expanded_member"] for ep in episodes):
         raise AssertionError("expanded PRO manifest contains a non-expanded identity")
 
@@ -429,8 +431,12 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
     for suite in suites:
         steps = sorted({ep["max_steps"] for ep in episodes if ep["suite"] == suite})
         print(f"{suite:<36}{per_suite[suite]:>9}{str(steps[0] if steps else '-'):>11}")
-    print(f"excluded (0% SR, no F->S transitions to learn from): "
-          f"{', '.join(libero_pro.ZERO_SR_PRO_SUITES)}")
+    if zero_sr_in_cohort:
+        print("explicit frozen cohort includes historically 0%-SR suites: "
+              f"{', '.join(zero_sr_in_cohort)}")
+    else:
+        print(f"excluded (0% SR, no F->S transitions to learn from): "
+              f"{', '.join(libero_pro.ZERO_SR_PRO_SUITES)}")
     print(f"LIBERO-PRO expanded manifest: {len(episodes)} identities "
           f"across {len(suites)} suites")
     return episodes

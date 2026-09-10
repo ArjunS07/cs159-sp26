@@ -141,7 +141,7 @@ def _qplanning_heldout_episodes():
     suites = list(PRO_HELDOUT_QUOTAS)
     # The 30-row suites use states 0--2/task; the 20-row suites use 0--1/task.
     installed = _prepare_libero_pro_expanded_episodes(
-        suites=suites, episode_idxs=(0, 1, 2))
+        suites=suites, episode_idxs=(0, 1, 2), allow_zero_sr_suites=True)
     by_key = {
         (episode["suite"], int(episode["task_idx"]), int(episode["ep_idx"])): episode
         for episode in installed}
