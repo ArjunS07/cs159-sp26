@@ -16,7 +16,8 @@ from pnp.qplanning_eval_experiment import (
     QPLANNING_EVAL_ACTION_STEPS, QPLANNING_EVAL_DENOISE_STEPS,
     QPLANNING_EVAL_IDENTITIES, QPLANNING_EVAL_NUM_CANDIDATES,
     QPLANNING_EVAL_NUM_ELITES, QPLANNING_EVAL_TEMPERATURE,
-    build_qplanning_eval_method)
+    QPLANNING_HELDOUT_IDENTITIES, QPLANNING_HELDOUT_SHARDS,
+    build_qplanning_eval_method, build_qplanning_stock_method)
 from pnp.store import SupabaseStore
 
 
@@ -87,6 +88,21 @@ def test_eval_method_has_fixed_paper_style_search_and_ten_step_execution():
         build_qplanning_eval_method(10, "repo@revision", scorer)
 
 
+def test_heldout_stock_method_is_exact_ordinary_ten_step_policy():
+    method, config = build_qplanning_stock_method("repo@revision")
+    assert method == Method.VANILLA
+    assert config.num_samples is None
+    assert config.num_inference_steps == 10
+    assert config.n_action_steps == 10
+    assert config.policy_source_id == "repo@revision"
+    assert config.video == "off"
+    assert not config.save_observations
+    assert not config.save_generated_chunks
+    assert config.save_trajectory
+    assert QPLANNING_HELDOUT_IDENTITIES == 160
+    assert QPLANNING_HELDOUT_SHARDS == 4
+
+
 def test_store_persists_compact_qplanning_boundary_telemetry():
     store = SupabaseStore.__new__(SupabaseStore)
     store.log_episode = Mock(return_value="rid")
@@ -135,6 +151,31 @@ def test_two_generated_eval_workers_are_clean_single_arm_launchers():
         assert "validate_qplanning_eval_sentinel(" in source
         assert "checkpoint_step_008000.pt" in source
         assert "video" in source.lower()
+        for index, cell in enumerate(notebook["cells"]):
+            if cell["cell_type"] == "code":
+                assert cell["execution_count"] is None
+                assert cell["outputs"] == []
+                ast.parse("".join(cell["source"]), filename=f"{path.name}:cell{index}")
+
+
+def test_four_generated_heldout_workers_are_fixed_three_arm_shards():
+    for shard_index in range(4):
+        path = ROOT / "notebooks" / "workers" / (
+            f"68_eval_qplanning_heldout160_worker_{shard_index}.ipynb")
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        source = chr(10).join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"])
+        assert "SHARD_COUNT = 4" in source
+        assert f"SHARD_INDEX = {shard_index}" in source
+        assert "EPISODE_LIMIT = None" in source
+        assert "CANDIDATE_BATCH_SIZE = 8" in source
+        assert "run_qplanning_heldout_worker(" in source
+        assert "validate_qplanning_heldout_sentinel(" in source
+        assert "Q10_CHECKPOINT_PATH" in source
+        assert "Q50_CHECKPOINT_PATH" in source
+        assert "checkpoint_step_008000.pt" in source
+        assert "online learning" in source.lower()
+        assert "video" in source.lower() and "frames" in source.lower()
         for index, cell in enumerate(notebook["cells"]):
             if cell["cell_type"] == "code":
                 assert cell["execution_count"] is None

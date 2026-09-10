@@ -79,7 +79,19 @@ Each uses 64 candidates, top 16 Q-weighted averaging, 3 decode steps, and 10 exe
 The workers print exact episode-matched historical stock comparisons every 25 completions.
 Run them independently on two GPU runtimes.
 
-All six workers use `SHARD_COUNT=6` and distinct indices. Running only a subset is safe but does
+### Untouched position-perturbation confirmation
+
+- 68_eval_qplanning_heldout160_worker_0.ipynb
+- 68_eval_qplanning_heldout160_worker_1.ipynb
+- 68_eval_qplanning_heldout160_worker_2.ipynb
+- 68_eval_qplanning_heldout160_worker_3.ipynb
+
+These four fixed shards cover the reserved 160-row position-perturbation PRO manifest. Each
+worker runs 40 identities under three newly collected, exactly matched arms: stock PI0.5, Q10,
+and Q50 (120 rollouts/worker). The critics stay frozen; this is not continual learning. Progress
+prints every 10 complete three-arm identities. Videos, frames, and generated chunks are off.
+
+The older six-worker launchers use `SHARD_COUNT=6` and distinct indices. Running only a subset is safe but does
 not reassign the absent workers' identities. If a runtime terminates, reopen the same worker and
 Run all; deterministic rollout IDs skip completed work. Never change `SHARD_COUNT` after collection
 starts unless the database is flushed and the experiment is restarted.

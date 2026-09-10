@@ -1,4 +1,4 @@
-"""Q10/Q50 candidate-planning evaluation on the frozen 220-identity PRO pilot."""
+"""Q10/Q50 candidate-planning evaluation on frozen LIBERO-PRO cohorts."""
 from __future__ import annotations
 
 import json
@@ -27,6 +27,11 @@ QPLANNING_EVAL_EXPERIMENTS = {
     10: "pi05-qplanning-q10-pro220-v1",
     50: "pi05-qplanning-q50-pro220-v1",
 }
+
+QPLANNING_HELDOUT_EXPERIMENT = "pi05-qplanning-q10-q50-pro-heldout160-v1"
+QPLANNING_HELDOUT_IDENTITIES = 160
+QPLANNING_HELDOUT_SHARDS = 4
+QPLANNING_HELDOUT_REPORT_EVERY = 10
 
 
 def build_qplanning_eval_method(
@@ -62,6 +67,20 @@ def build_qplanning_eval_method(
     return method, config
 
 
+def build_qplanning_stock_method(source_id: str):
+    """Build the ordinary source-policy baseline used beside both planners."""
+    return Method.VANILLA, RolloutConfig(
+        policy_source_id=source_id,
+        num_inference_steps=10,
+        n_action_steps=QPLANNING_EVAL_ACTION_STEPS,
+        save_trajectory=True,
+        save_generated_chunks=False,
+        save_observations=False,
+        video="off",
+        skip_unused_renders=True,
+        render_lead=2)
+
+
 def _completed_existing(store, *, experiment, method, config_hash, identity_keys):
     rows = store.fetch_all(
         "rollouts",
@@ -83,6 +102,64 @@ def _completed_existing(store, *, experiment, method, config_hash, identity_keys
         counts[0] += 1
         counts[1] += int(row["success"])
     return initial_tally, initial_outcomes
+
+
+def _completed_existing_methods(store, *, experiment, method_config_hashes,
+                                identity_keys):
+    """Restore completed rows for an exact multi-arm, same-identity comparison."""
+    rows = store.fetch_all(
+        "rollouts",
+        "suite,task_idx,episode_idx,init_state_hash,status,success,method,config_hash",
+        configure=lambda query: query.eq("experiment", experiment),
+        order_by=("rollout_id",))
+    initial_tally, initial_outcomes = {}, {}
+    for row in rows:
+        method = row.get("method")
+        key = _identity_key(row)
+        if (method not in method_config_hashes or key not in identity_keys
+                or row.get("status") != "completed"
+                or row.get("config_hash") != method_config_hashes[method]):
+            continue
+        if row.get("success") not in (True, False, 0, 1):
+            raise ValueError("completed held-out rollout has an invalid success outcome")
+        outcomes = initial_outcomes.setdefault(key, {})
+        if method in outcomes:
+            raise ValueError("duplicate completed held-out identity/method/config")
+        outcomes[method] = bool(row["success"])
+        counts = initial_tally.setdefault((key[0], method), [0, 0])
+        counts[0] += 1
+        counts[1] += int(row["success"])
+    return initial_tally, initial_outcomes
+
+
+def _qplanning_heldout_episodes():
+    """Materialize the exact category-held-out 160-row PRO manifest as episodes."""
+    from .experiments import _prepare_libero_pro_expanded_episodes
+    from .pcp_search.pro import PRO_HELDOUT_QUOTAS, build_pro_manifest
+
+    frozen = build_pro_manifest(split="heldout")
+    suites = list(PRO_HELDOUT_QUOTAS)
+    # The 30-row suites use states 0--2/task; the 20-row suites use 0--1/task.
+    installed = _prepare_libero_pro_expanded_episodes(
+        suites=suites, episode_idxs=(0, 1, 2))
+    by_key = {
+        (episode["suite"], int(episode["task_idx"]), int(episode["ep_idx"])): episode
+        for episode in installed}
+    episodes = []
+    for item in frozen.items:
+        if item.behavior_seed_index != 0:
+            raise AssertionError("held-out evaluation requires behavior_seed_index=0")
+        key = (item.suite, int(item.task_idx), int(item.init_state_index))
+        if key not in by_key:
+            raise ValueError(f"installed LIBERO-PRO assets are missing held-out identity {key}")
+        episodes.append(by_key[key])
+    if len(episodes) != QPLANNING_HELDOUT_IDENTITIES:
+        raise AssertionError(
+            f"expected {QPLANNING_HELDOUT_IDENTITIES} held-out identities, "
+            f"found {len(episodes)}")
+    if len({_identity_key(episode) for episode in episodes}) != len(episodes):
+        raise AssertionError("held-out manifest contains duplicate physical identities")
+    return frozen, episodes
 
 
 def run_qplanning_eval_worker(
@@ -224,6 +301,175 @@ def run_qplanning_eval_worker(
         "identities_requested": len(episodes)}
 
 
+def run_qplanning_heldout_worker(
+        *, q10_checkpoint_path: str | Path, q50_checkpoint_path: str | Path,
+        shard_count: int = QPLANNING_HELDOUT_SHARDS, shard_index: int,
+        episode_limit: int | None = None,
+        candidate_batch_size: int = QPLANNING_EVAL_CANDIDATE_BATCH_SIZE,
+        experiment: str = QPLANNING_HELDOUT_EXPERIMENT):
+    """Run stock, Q10, and Q50 on one shard of the untouched PRO160 split."""
+    from . import models, sampler
+    from .experiments import _run_collection
+    from .pcp_search.collection import manifest_shard
+    from .store import SupabaseStore, gather_provenance
+
+    if (isinstance(shard_count, bool) or int(shard_count) != shard_count
+            or int(shard_count) != QPLANNING_HELDOUT_SHARDS):
+        raise ValueError(
+            f"held-out evaluation is frozen to {QPLANNING_HELDOUT_SHARDS} shards")
+    shard_count = int(shard_count)
+    if (isinstance(shard_index, bool) or int(shard_index) != shard_index
+            or not 0 <= int(shard_index) < shard_count):
+        raise ValueError(f"shard_index must lie in [0, {shard_count})")
+    shard_index = int(shard_index)
+    if episode_limit is not None:
+        if (isinstance(episode_limit, bool) or int(episode_limit) != episode_limit
+                or int(episode_limit) < 1):
+            raise ValueError("episode_limit must be a positive integer or None")
+        episode_limit = int(episode_limit)
+    if (isinstance(candidate_batch_size, bool)
+            or int(candidate_batch_size) != candidate_batch_size
+            or not 1 <= int(candidate_batch_size) <= QPLANNING_EVAL_NUM_CANDIDATES):
+        raise ValueError("candidate_batch_size must lie in [1, 64]")
+    candidate_batch_size = int(candidate_batch_size)
+
+    frozen, all_episodes = _qplanning_heldout_episodes()
+    expected_source = {
+        "repo_id": frozen.policy_repo_id, "revision": frozen.policy_revision}
+    if expected_source != {
+            "repo_id": "lerobot/pi05_libero_finetuned",
+            "revision": "8e174154ef5f6c60a8da12ae99c303d8963138c1"}:
+        raise ValueError("held-out manifest is not pinned to the expected source checkpoint")
+    by_item_key = {
+        (episode["suite"], int(episode["task_idx"]), int(episode["ep_idx"])): episode
+        for episode in all_episodes}
+    shard_items = manifest_shard(frozen.items, shard_count, shard_index)
+    episodes = [
+        by_item_key[(item.suite, int(item.task_idx), int(item.init_state_index))]
+        for item in shard_items]
+    if len(episodes) != QPLANNING_HELDOUT_IDENTITIES // shard_count:
+        raise AssertionError("held-out shard does not contain exactly 40 identities")
+    if episode_limit is not None:
+        episodes = episodes[:episode_limit]
+
+    device = models.default_device()
+    q10_scorer = load_qplanning_scorer(
+        q10_checkpoint_path, device=device, expected_horizon=10,
+        expected_source_revision=frozen.policy_revision)
+    q50_scorer = load_qplanning_scorer(
+        q50_checkpoint_path, device=device, expected_horizon=50,
+        expected_source_revision=frozen.policy_revision)
+    if q10_scorer.source_policy != expected_source:
+        raise ValueError("Q10 critic was not trained for the frozen source checkpoint")
+    if q50_scorer.source_policy != expected_source:
+        raise ValueError("Q50 critic was not trained for the frozen source checkpoint")
+    if q10_scorer.snapshot_id != q50_scorer.snapshot_id:
+        raise ValueError("Q10 and Q50 critics must use the same dataset snapshot")
+    if q10_scorer.update != 8000 or q50_scorer.update != 8000:
+        raise ValueError("held-out confirmation requires both final step-8000 checkpoints")
+
+    source_id = f"{frozen.policy_repo_id}@{frozen.policy_revision}"
+    methods = [
+        build_qplanning_stock_method(source_id),
+        build_qplanning_eval_method(
+            10, source_id, q10_scorer,
+            candidate_batch_size=candidate_batch_size),
+        build_qplanning_eval_method(
+            50, source_id, q50_scorer,
+            candidate_batch_size=candidate_batch_size),
+    ]
+    store = SupabaseStore()
+    config_hashes = {
+        method: store.config_hash(store._logical_key(method, config))
+        for method, config in methods}
+    identity_keys = {_identity_key(episode) for episode in episodes}
+    initial_tally, initial_outcomes = _completed_existing_methods(
+        store, experiment=experiment, method_config_hashes=config_hashes,
+        identity_keys=identity_keys)
+    metadata = {
+        "source_model_repo_id": frozen.policy_repo_id,
+        "source_model_revision": frozen.policy_revision,
+        "frozen_collection_manifest_id": frozen.manifest_id,
+        "frozen_identity_manifest_hash": identity_manifest_hash(all_episodes),
+        "frozen_identity_manifest": identity_manifest_payload(all_episodes),
+        "data_split": "heldout",
+        "heldout_category": "position_perturb",
+        "target_identities": QPLANNING_HELDOUT_IDENTITIES,
+        "shard_identities": len(episodes),
+        "q10_checkpoint_id": q10_scorer.checkpoint_id,
+        "q50_checkpoint_id": q50_scorer.checkpoint_id,
+        "q10_checkpoint_path": str(Path(q10_checkpoint_path).expanduser()),
+        "q50_checkpoint_path": str(Path(q50_checkpoint_path).expanduser()),
+        "num_candidates": QPLANNING_EVAL_NUM_CANDIDATES,
+        "num_elites": QPLANNING_EVAL_NUM_ELITES,
+        "temperature": QPLANNING_EVAL_TEMPERATURE,
+        "planner_num_inference_steps": QPLANNING_EVAL_DENOISE_STEPS,
+        "stock_num_inference_steps": 10,
+        "generated_chunk_size": 50,
+        "n_action_steps": QPLANNING_EVAL_ACTION_STEPS,
+        "candidate_batch_size": candidate_batch_size,
+        "candidate_seed_scheme": "stock_slot0_v1",
+        "config_hashes": config_hashes,
+        "video": "off",
+        "online_learning": False,
+    }
+    print({
+        "experiment": experiment,
+        "split": "untouched position-perturbation PRO160",
+        "manifest_id": frozen.manifest_id,
+        "shard": f"{shard_index}/{shard_count}",
+        "identities_in_shard": len(episodes),
+        "rollouts_in_shard": len(episodes) * len(methods),
+        "arms": ["stock VLA (10 decode steps)",
+                 "Q10 (64 -> top16 softmax, 3 decode steps)",
+                 "Q50 (64 -> top16 softmax, 3 decode steps)"],
+        "execution": "first 10 actions, then replan",
+        "candidate_alignment": (
+            "same seed schedule; exact same candidates at the shared first boundary"),
+        "online_learning": "off; critics are frozen",
+        "video_frames_generated_chunks": "off",
+        "report_every_complete_identities": QPLANNING_HELDOUT_REPORT_EVERY,
+    })
+
+    policy, preprocess, postprocess = models.load_pi05(
+        repo_id=frozen.policy_repo_id, revision=frozen.policy_revision)
+    if int(policy.config.chunk_size) != 50:
+        raise ValueError(f"expected 50-action PI chunks, found {policy.config.chunk_size}")
+    for parameter in policy.model.parameters():
+        parameter.requires_grad_(False)
+    sampler.enable_encoding_cache(
+        policy.model, size=4, model_revision=frozen.policy_revision)
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=device, experiment=experiment, episodes=episodes, methods=methods,
+        cohort="qplanning_q10_q50_pro_heldout160",
+        shard_count=shard_count, shard_index=shard_index,
+        benchmark="libero_pro", driver="pi05_qplanning_q10_q50_pro_heldout160",
+        run_metadata=metadata,
+        provenance=gather_provenance(
+            model_repo_id=frozen.policy_repo_id,
+            model_revision=frozen.policy_revision),
+        report_every=0,
+        report_every_identities=QPLANNING_HELDOUT_REPORT_EVERY,
+        initial_tally=initial_tally,
+        initial_identity_outcomes=initial_outcomes,
+        matched_reference_outcomes={},
+        progress_include_overall=True,
+        rollout_batch_size=1,
+        resume_completed_only=True)
+    return {
+        "experiment": experiment,
+        "manifest_id": frozen.manifest_id,
+        "shard_count": shard_count,
+        "shard_index": shard_index,
+        "identities_requested": len(episodes),
+        "rollouts_requested": len(episodes) * len(methods),
+        "q10_checkpoint_id": q10_scorer.checkpoint_id,
+        "q50_checkpoint_id": q50_scorer.checkpoint_id,
+        "config_hashes": config_hashes,
+    }
+
+
 def validate_qplanning_eval_sentinel(*, horizon: int, checkpoint_id: str,
                                      experiment: str | None = None,
                                      store=None) -> dict:
@@ -292,4 +538,61 @@ def validate_qplanning_eval_sentinel(*, horizon: int, checkpoint_id: str,
         "decode_steps": 3, "executed_actions_per_boundary": 10,
         "video_and_frames_absent": True}
     print("Q-Planning sentinel:", summary)
+    return summary
+
+
+def validate_qplanning_heldout_sentinel(
+        *, q10_checkpoint_id: str, q50_checkpoint_id: str,
+        experiment: str = QPLANNING_HELDOUT_EXPERIMENT, store=None) -> dict:
+    """Audit that one exact held-out identity completed under all three arms."""
+    from .store import SupabaseStore
+
+    store = store or SupabaseStore()
+    q10 = validate_qplanning_eval_sentinel(
+        horizon=10, checkpoint_id=q10_checkpoint_id,
+        experiment=experiment, store=store)
+    q50 = validate_qplanning_eval_sentinel(
+        horizon=50, checkpoint_id=q50_checkpoint_id,
+        experiment=experiment, store=store)
+    rows = store.fetch_all(
+        "rollouts",
+        "suite,task_idx,episode_idx,init_state_hash,status,method,config_json,"
+        "video_path,obs_frames_path",
+        configure=lambda query: query.eq("experiment", experiment).eq(
+            "status", "completed"),
+        order_by=("rollout_id",))
+    required = {Method.VANILLA, Method.QPLANNING_Q10, Method.QPLANNING_Q50}
+    by_identity = {}
+    for row in rows:
+        if row.get("method") in required:
+            by_identity.setdefault(_identity_key(row), {})[row["method"]] = row
+    complete = {
+        key: arms for key, arms in by_identity.items()
+        if required.issubset(arms)}
+    if not complete:
+        raise ValueError("no held-out identity is complete under stock, Q10, and Q50")
+    identity, arms = next(iter(sorted(complete.items())))
+    stock = arms[Method.VANILLA]
+    config = stock["config_json"]
+    if isinstance(config, str):
+        config = json.loads(config)
+    if config.get("num_inference_steps") != 10 or config.get("n_action_steps") != 10:
+        raise AssertionError("stock sentinel is not 10 decode steps / 10 executed actions")
+    if config.get("num_samples") is not None:
+        raise AssertionError("stock sentinel unexpectedly uses candidate selection")
+    if stock.get("video_path") or stock.get("obs_frames_path"):
+        raise AssertionError("stock sentinel unexpectedly saved video or frames")
+    summary = {
+        "status": "passed",
+        "experiment": experiment,
+        "matched_identity": identity,
+        "arms": ["stock VLA", "Q10 planner", "Q50 planner"],
+        "stock_decode_steps": 10,
+        "planner_decode_steps": q10["decode_steps"],
+        "executed_actions_per_boundary": 10,
+        "q10_candidates": q10["candidates_per_boundary"],
+        "q50_candidates": q50["candidates_per_boundary"],
+        "video_and_frames_absent": True,
+    }
+    print("Held-out three-arm sentinel:", summary)
     return summary

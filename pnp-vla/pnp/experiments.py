@@ -238,7 +238,8 @@ HISTORICAL_PRO_BASELINE_SR = {
     "libero_object_with_mug": 0.95, "libero_goal_with_yellow_book": 0.90,
 }
 
-_METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
+_METHOD_LABELS = {Method.VANILLA: "stock VLA",
+                  Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
                   Method.FRACTIONAL_M2: "fractional m=2",
                   Method.FRACTIONAL_M4: "fractional m=4",
                   Method.SUFFIX_SENSITIVITY: "diagnostic base",
@@ -332,11 +333,12 @@ def format_matched_progress_table(identity_outcomes, method_names, references) -
         for label, reference in references.items():
             tally[(key[0], label)][0] += 1
             tally[(key[0], label)][1] += int(reference[key])
+    reference_note = "; hist = reused rollouts" if references else ""
     return format_progress_table(
         tally, [*method_names, *references], historical_sr=False, include_overall=True,
         count_label=(f"Exact matched table: {len(complete)} identities completed in THIS shard; "
                      "every column uses these identities. Cells = SR (successes/identities); "
-                     "hist = reused rollouts."))
+                     f"partial identities are excluded{reference_note}."))
 
 
 def format_probe_diagnostic_table(tally, method_names) -> str:
