@@ -260,7 +260,9 @@ _METHOD_LABELS = {Method.UNCERTAINTY: "observed", Method.REFINEMENT: "refine",
                    Method.FIVE_STEP_LOWEST_U20_REFINE: "5-step x3 + refine",
                    Method.FIVE_STEP_SINGLE_REFINE: "5-step x1 refine",
                    Method.THREE_STEP_SINGLE_REFINE: "3-step x1 refine",
-                   Method.THREE_STEP_SINGLE_QUERY: "3-step x1"}
+                   Method.THREE_STEP_SINGLE_QUERY: "3-step x1",
+                   Method.QPLANNING_Q10: "Q10 planner",
+                   Method.QPLANNING_Q50: "Q50 planner"}
 
 
 def format_progress_table(tally, method_names, historical_sr=None, *, include_overall=False,

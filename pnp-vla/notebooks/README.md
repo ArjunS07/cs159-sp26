@@ -37,6 +37,9 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
   cohort for workers 62, including
   paired/per-suite SR, U10/U20/U50, PnP contraction, failure detection, and new-arm compute.
   It downloads uncertainty-profile blobs only and needs no GPU or simulator.
+- `workers/66_eval_qplanning_q10_pro220.ipynb` and
+  `workers/67_eval_qplanning_q50_pro220.ipynb` evaluate the two trained critics separately
+  on the exact 220-identity PRO pilot, with matched historical stock printouts every 25 episodes.
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 

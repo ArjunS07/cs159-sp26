@@ -70,6 +70,15 @@ unaffected.
 Before launch, add `GH_PAT`, `HF_TOKEN`, `SUPABASE_URL`, and `SUPABASE_SERVICE_KEY` to Colab
 Secrets and grant notebook access. Run all cells in every worker that Colab allows concurrently.
 
+## Q-Planning critic evaluation
+
+- `66_eval_qplanning_q10_pro220.ipynb`: one Q10 worker, 220 rollouts.
+- `67_eval_qplanning_q50_pro220.ipynb`: one Q50 worker, 220 rollouts.
+
+Each uses 64 candidates, top 16 Q-weighted averaging, 3 decode steps, and 10 executed actions.
+The workers print exact episode-matched historical stock comparisons every 25 completions.
+Run them independently on two GPU runtimes.
+
 All six workers use `SHARD_COUNT=6` and distinct indices. Running only a subset is safe but does
 not reassign the absent workers' identities. If a runtime terminates, reopen the same worker and
 Run all; deterministic rollout IDs skip completed work. Never change `SHARD_COUNT` after collection

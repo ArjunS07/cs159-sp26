@@ -96,6 +96,9 @@ class ChunkContext:
     records: list = field(default_factory=list)
     chunk_positions: Any = None
     training_prefix: Any = None  # exact frozen-VLA prefix/model inputs, CPU arrays when requested
+    # Live GPU prefix used only by online Q candidate scoring during this sampler call.
+    prefix_embeddings: Any = None
+    prefix_pad_masks: Any = None
 
 
 @dataclass
@@ -171,17 +174,38 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
         begin_chunk()
 
     # ---- prefix / KV cache: replicated verbatim from the original sample_actions ----
-    # (opt-in) reuse the prefix encoding across paired methods at the same obs — skips embed_prefix.
+    # Q-Planning repeats one observation across candidate lanes. Encode that observation once,
+    # then broadcast its prefix; otherwise the image tower needlessly sees the same image N times.
+    shared_singleton = bool(getattr(strat, "shared_prefix_singleton", False))
+    if shared_singleton:
+        def singleton(value):
+            if torch.is_tensor(value):
+                return value[:1]
+            if isinstance(value, list):
+                return [singleton(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(singleton(item) for item in value)
+            raise TypeError(
+                "shared-prefix sampler inputs must be tensors or nested lists/tuples")
+
+        prefix_inputs = tuple(singleton(value) for value in (
+            images, img_masks, tokens, masks))
+    else:
+        prefix_inputs = (images, img_masks, tokens, masks)
+    # (opt-in) reuse the singleton prefix across candidate microbatches at the same observation.
     cache = self._pnp.enc_cache
-    ckey = cache.key(images, img_masks, tokens, masks) if cache is not None else None
+    ckey = cache.key(*prefix_inputs) if cache is not None else None
     prefix = cache.get(ckey) if cache is not None else None
     if prefix is None:
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(*prefix_inputs)
         if cache is not None:
             cache.put(ckey, (prefix_embs, prefix_pad_masks, prefix_att_masks))
     else:
         prefix_embs, prefix_pad_masks, prefix_att_masks = prefix
+    if shared_singleton and bsize > 1:
+        prefix_embs = prefix_embs.expand(bsize, *prefix_embs.shape[1:])
+        prefix_pad_masks = prefix_pad_masks.expand(bsize, *prefix_pad_masks.shape[1:])
+        prefix_att_masks = prefix_att_masks.expand(bsize, *prefix_att_masks.shape[1:])
     prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
     prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
     prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
@@ -217,7 +241,9 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
     ctx = ChunkContext(num_steps=num_steps, device=device,
                        obs_enc=prefix_embs.mean(dim=1).detach(),
                        chunk_pos=float(positions) if not isinstance(positions, (list, tuple)) else 0.0,
-                       chunk_positions=positions, training_prefix=training_prefix)
+                       chunk_positions=positions, training_prefix=training_prefix,
+                       prefix_embeddings=prefix_embs,
+                       prefix_pad_masks=prefix_pad_masks)
     if hasattr(strat, "recorders"):
         ctx.records = [[] for _ in range(bsize)]
 

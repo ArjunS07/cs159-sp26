@@ -398,9 +398,12 @@ class SupabaseStore:
         The flat RolloutConfig fields map 1:1 to these columns, so this is near-identity."""
         on = config.has_probe
         multisample = config.num_samples is not None
-        measurement = on or multisample
+        measurement = on or (
+            multisample and getattr(config, "qplanning_ckpt_id", None) is None)
         steps = (list(config.pnp_steps) if on and config.pnp_steps else
-                 list(config.ms_probe_steps) if multisample else None)
+                 list(config.ms_probe_steps)
+                 if multisample and getattr(config, "qplanning_ckpt_id", None) is None
+                 else None)
         return {
             "method": method,
             "pnp_enabled": measurement,
@@ -551,6 +554,20 @@ class SupabaseStore:
                 if any(selection.get(field) is not None for selection in sels):
                     row["ms_candidate_u"][field] = [
                         selection.get(field) for selection in sels]
+        if result.get("qplanning_selections"):
+            selections = result["qplanning_selections"]
+            row["ms_chosen_idx"] = int(selections[0]["best_index"])
+            row["ms_candidate_u"] = {
+                "qplanning": {
+                    field: [selection[field] for selection in selections]
+                    for field in (
+                        "q_values", "best_index", "elite_indices", "elite_weights",
+                        "q_mean", "q_std", "q_min", "q_max", "candidate_noise_seeds",
+                        "n_candidates", "n_elites", "temperature", "denoise_steps",
+                        "candidate_batch_size", "candidate_equivalent_vf_evals",
+                        "first10_diversity", "full50_diversity",
+                        "inference_ms", "n_vf_evals")
+                }}
         blobs = {}
         if result.get("trajectory"):
             blobs["trajectory"] = result["trajectory"]

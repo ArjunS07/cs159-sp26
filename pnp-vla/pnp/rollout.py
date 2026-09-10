@@ -282,7 +282,9 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
     generated_chunks = [] if config.save_generated_chunks else None
     candidate_generated_chunks = (
         [] if config.save_generated_chunks and multisample else None)
-    ms_selections = [] if multisample else None
+    qplanning = config.qplanning_ckpt_id is not None
+    ms_selections = [] if multisample and not qplanning else None
+    qplanning_selections = [] if qplanning else None
     # capture agentview frames when either sink wants them (obs_frames OR a video)
     frames = [] if (config.save_observations or config.video != "off") else None
     nan_count = 0
@@ -400,66 +402,93 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
 
                     candidate_noise_seeds = [
                         _candidate_seed(index) for index in range(config.num_samples)]
-                    detailed_selection = config.selection_uncertainty_horizon is not None
-                    selection_kwargs = ({"perturb_seed_of": _candidate_seed}
-                                        if config.candidate_seed_scheme == "stock_slot0_v1"
-                                        else {})
-                    selection = multi_sample_select(
-                        policy, batch, ep_seed, ci, config.num_samples,
-                        tuple(config.ms_probe_steps), _noise_of,
-                        num_iterations=config.pnp_k,
-                        uncertainty_horizon=config.selection_uncertainty_horizon,
-                        return_details=detailed_selection, return_actions=True,
-                        **selection_kwargs)
-                    chunk, chosen, cand_u, candidate_actions = selection[:4]
-                    candidate_profiles = selection[4] if detailed_selection else None
-                    executed_chunk_noise_seed = candidate_noise_seeds[chosen]
-                    selection_record = {
-                        "chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u,
-                        "candidate_noise_seeds": candidate_noise_seeds,
-                        "selected_noise_seed": int(executed_chunk_noise_seed),
-                        "selected_perturb_seed": int(
-                            executed_chunk_noise_seed
-                            if config.candidate_seed_scheme == "stock_slot0_v1"
-                            else ep_seed + ci * 1000 + chosen),
-                        "u_spread": float(max(cand_u) - min(cand_u)),
-                        "action_disagreement": candidate_action_disagreement(
-                            candidate_actions, action_dim=adim),
-                        "executed_prefix_disagreement": candidate_action_disagreement(
-                            candidate_actions, action_dim=adim,
-                            horizon=config.n_action_steps),
-                        **({"candidate_profiles": candidate_profiles,
-                            "selection_uncertainty_horizon":
-                                int(config.selection_uncertainty_horizon)}
-                           if candidate_profiles is not None else {})}
-                    if config.multi_sample_refine_selected:
-                        selected_unrefined = chunk
-                        selected_seed = _candidate_seed(chosen)
-                        _pnp_seed_perturb(selected_seed)
-                        chunk, refined_score, refined_profile = _sampler.refine_action_chunk(
-                            policy, batch, noise=_noise_of(chosen),
-                            probe_steps=tuple(config.ms_probe_steps),
+                    if qplanning:
+                        if config.qplanning_scorer is None:
+                            raise ValueError(
+                                "qplanning_ckpt_id requires a loaded qplanning_scorer")
+                        from .qplanning_critic.inference import qplanning_select
+                        candidate_noises = torch.cat([
+                            _noise_of(index) for index in range(config.num_samples)], dim=0)
+                        policy_proprio = policy_observation["observation.state"]
+                        if torch.is_tensor(policy_proprio):
+                            policy_proprio = policy_proprio.detach().cpu().numpy()
+                        chunk, selection_record = qplanning_select(
+                            policy, batch, candidate_noises,
+                            scorer=config.qplanning_scorer,
+                            robot_state=_raw_robot_state(obs),
+                            policy_proprio=np.asarray(policy_proprio, dtype=np.float32),
+                            n_elites=int(config.qplanning_n_elites),
+                            temperature=float(config.qplanning_temperature),
+                            candidate_batch_size=int(
+                                config.qplanning_candidate_batch_size))
+                        selection_record["chunk_idx"] = ci
+                        selection_record["candidate_noise_seeds"] = [
+                            int(seed) for seed in candidate_noise_seeds]
+                        executed_chunk_noise_seed = candidate_noise_seeds[
+                            int(selection_record["best_index"])]
+                        qplanning_selections.append(selection_record)
+                        queue_postprocess = postprocess
+                    else:
+                        detailed_selection = config.selection_uncertainty_horizon is not None
+                        selection_kwargs = ({"perturb_seed_of": _candidate_seed}
+                                            if config.candidate_seed_scheme == "stock_slot0_v1"
+                                            else {})
+                        selection = multi_sample_select(
+                            policy, batch, ep_seed, ci, config.num_samples,
+                            tuple(config.ms_probe_steps), _noise_of,
                             num_iterations=config.pnp_k,
                             uncertainty_horizon=config.selection_uncertainty_horizon,
-                            n_action_steps=config.n_action_steps)
-                        pre_score = float(cand_u[chosen])
-                        selection_record["selected_refinement"] = {
-                            "pre_u": pre_score, "refined_path_u": float(refined_score),
-                            "delta_u": float(refined_score - pre_score),
-                            "lowered_u": bool(refined_score < pre_score),
-                            "initial_noise_seed": int(selected_seed),
-                            "perturb_seed": int(selected_seed),
-                            "refined_path_profile": refined_profile,
-                            "selected_prefix_movement": candidate_action_disagreement(
-                                [selected_unrefined, chunk], action_dim=adim,
+                            return_details=detailed_selection, return_actions=True,
+                            **selection_kwargs)
+                        chunk, chosen, cand_u, candidate_actions = selection[:4]
+                        candidate_profiles = selection[4] if detailed_selection else None
+                        executed_chunk_noise_seed = candidate_noise_seeds[chosen]
+                        selection_record = {
+                            "chunk_idx": ci, "chosen": int(chosen), "cand_u": cand_u,
+                            "candidate_noise_seeds": candidate_noise_seeds,
+                            "selected_noise_seed": int(executed_chunk_noise_seed),
+                            "selected_perturb_seed": int(
+                                executed_chunk_noise_seed
+                                if config.candidate_seed_scheme == "stock_slot0_v1"
+                                else ep_seed + ci * 1000 + chosen),
+                            "u_spread": float(max(cand_u) - min(cand_u)),
+                            "action_disagreement": candidate_action_disagreement(
+                                candidate_actions, action_dim=adim),
+                            "executed_prefix_disagreement": candidate_action_disagreement(
+                                candidate_actions, action_dim=adim,
                                 horizon=config.n_action_steps),
-                        }
-                    ms_selections.append(selection_record)
-                    if candidate_generated_chunks is not None:
-                        candidate_generated_chunks.append(np.stack([
-                            action.squeeze(0).detach().float().cpu().numpy()
-                            for action in candidate_actions]))
-                    queue_postprocess = postprocess
+                            **({"candidate_profiles": candidate_profiles,
+                                "selection_uncertainty_horizon":
+                                    int(config.selection_uncertainty_horizon)}
+                               if candidate_profiles is not None else {})}
+                        if config.multi_sample_refine_selected:
+                            selected_unrefined = chunk
+                            selected_seed = _candidate_seed(chosen)
+                            _pnp_seed_perturb(selected_seed)
+                            chunk, refined_score, refined_profile = _sampler.refine_action_chunk(
+                                policy, batch, noise=_noise_of(chosen),
+                                probe_steps=tuple(config.ms_probe_steps),
+                                num_iterations=config.pnp_k,
+                                uncertainty_horizon=config.selection_uncertainty_horizon,
+                                n_action_steps=config.n_action_steps)
+                            pre_score = float(cand_u[chosen])
+                            selection_record["selected_refinement"] = {
+                                "pre_u": pre_score, "refined_path_u": float(refined_score),
+                                "delta_u": float(refined_score - pre_score),
+                                "lowered_u": bool(refined_score < pre_score),
+                                "initial_noise_seed": int(selected_seed),
+                                "perturb_seed": int(selected_seed),
+                                "refined_path_profile": refined_profile,
+                                "selected_prefix_movement": candidate_action_disagreement(
+                                    [selected_unrefined, chunk], action_dim=adim,
+                                    horizon=config.n_action_steps),
+                            }
+                        ms_selections.append(selection_record)
+                        if candidate_generated_chunks is not None:
+                            candidate_generated_chunks.append(np.stack([
+                                action.squeeze(0).detach().float().cpu().numpy()
+                                for action in candidate_actions]))
+                        queue_postprocess = postprocess
                 else:
                     batch = preprocess(policy_observation)
                     with torch.no_grad():
@@ -665,6 +694,8 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
             result["uncertainty_gradient_telemetry"] = tap.uncertainty_gradient_telemetry
     if ms_selections is not None:
         result["ms_selections"] = ms_selections
+    if qplanning_selections is not None:
+        result["qplanning_selections"] = qplanning_selections
     return result
 
 

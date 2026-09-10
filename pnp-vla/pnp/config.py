@@ -103,6 +103,8 @@ class Method:
     FIVE_STEP_SINGLE_REFINE = "five_step_single_refine"
     THREE_STEP_SINGLE_REFINE = "three_step_single_refine"
     THREE_STEP_SINGLE_QUERY = "three_step_single_query"
+    QPLANNING_Q10 = "qplanning_q10"
+    QPLANNING_Q50 = "qplanning_q50"
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
@@ -120,7 +122,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.CHUNK_SOURCE_M1, Method.FIVE_STEP_SINGLE_QUERY,
                Method.FIVE_STEP_LOWEST_U20, Method.FIVE_STEP_LOWEST_U20_REFINE,
                Method.FIVE_STEP_SINGLE_REFINE, Method.THREE_STEP_SINGLE_REFINE,
-               Method.THREE_STEP_SINGLE_QUERY,
+               Method.THREE_STEP_SINGLE_QUERY, Method.QPLANNING_Q10,
+               Method.QPLANNING_Q50,
                Method.PNP_ONLY, Method.PCP, Method.COLLECT, Method.PCP_SEARCH_COLLECT)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 
@@ -198,6 +201,13 @@ class RolloutConfig:
     # Explicit two-stage action: measure all ordinary candidates, choose the lowest-uncertainty
     # one, then rerun only that same initial noise under refine-last P&P feedback.
     multi_sample_refine_selected: bool = False
+    # Q-Planning uses num_samples ordinary policy candidates, scores each with one trained
+    # critic, and executes a Q-softmax blend of the highest-valued candidates.
+    qplanning_ckpt_id: Optional[str] = None
+    qplanning_n_elites: Optional[int] = None
+    qplanning_temperature: Optional[float] = None
+    qplanning_candidate_batch_size: Optional[int] = None
+    qplanning_scorer: object = field(default=None, repr=False, compare=False)
     # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
     # None intentionally preserves the legacy full-generated-chunk behavior. Production drivers
@@ -290,6 +300,40 @@ class RolloutConfig:
             if self.candidate_seed_scheme != "stock_slot0_v1":
                 raise ValueError(
                     "multi_sample_refine_selected requires candidate_seed_scheme='stock_slot0_v1'")
+        qplanning = self.qplanning_ckpt_id is not None
+        qplanning_fields = (
+            self.qplanning_n_elites, self.qplanning_temperature,
+            self.qplanning_candidate_batch_size, self.qplanning_scorer)
+        if not qplanning and any(value is not None for value in qplanning_fields):
+            raise ValueError("Q-Planning settings require qplanning_ckpt_id")
+        if qplanning:
+            if not str(self.qplanning_ckpt_id).strip():
+                raise ValueError("qplanning_ckpt_id must be non-empty")
+            if self.num_samples is None or self.num_samples < 2:
+                raise ValueError("Q-Planning requires at least two num_samples candidates")
+            if self.candidate_seed_scheme != "stock_slot0_v1":
+                raise ValueError(
+                    "Q-Planning requires candidate_seed_scheme='stock_slot0_v1'")
+            if self.selection_uncertainty_horizon is not None:
+                raise ValueError("Q-Planning scores Q directly, not selection uncertainty")
+            if self.multi_sample_refine_selected:
+                raise ValueError("Q-Planning and select-then-refine are separate experiments")
+            if (isinstance(self.qplanning_n_elites, bool)
+                    or self.qplanning_n_elites is None
+                    or int(self.qplanning_n_elites) != self.qplanning_n_elites
+                    or not 1 <= self.qplanning_n_elites <= self.num_samples):
+                raise ValueError("qplanning_n_elites must lie in [1, num_samples]")
+            if (self.qplanning_temperature is None
+                    or not math.isfinite(float(self.qplanning_temperature))
+                    or float(self.qplanning_temperature) <= 0):
+                raise ValueError("qplanning_temperature must be finite and positive")
+            if (isinstance(self.qplanning_candidate_batch_size, bool)
+                    or self.qplanning_candidate_batch_size is None
+                    or int(self.qplanning_candidate_batch_size)
+                    != self.qplanning_candidate_batch_size
+                    or not 1 <= self.qplanning_candidate_batch_size <= self.num_samples):
+                raise ValueError(
+                    "qplanning_candidate_batch_size must lie in [1, num_samples]")
         if self.refine_average and not self.refine:
             raise ValueError("refine_average=True requires refine=True")
         if self.refine_horizon_m is not None:
@@ -415,6 +459,11 @@ class RolloutConfig:
             logical.pop("multi_sample_refine_selected")
         if logical.get("selection_uncertainty_horizon") is None:
             logical.pop("selection_uncertainty_horizon")
+        if logical.get("qplanning_ckpt_id") is None:
+            logical.pop("qplanning_ckpt_id")
+            logical.pop("qplanning_n_elites")
+            logical.pop("qplanning_temperature")
+            logical.pop("qplanning_candidate_batch_size")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
@@ -454,6 +503,8 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "num_samples", "ms_probe_steps", "selection_uncertainty_horizon",
                   "candidate_set_id", "policy_source_id", "candidate_seed_scheme",
                   "multi_sample_refine_selected",
+                  "qplanning_ckpt_id", "qplanning_n_elites",
+                  "qplanning_temperature", "qplanning_candidate_batch_size",
                   "num_inference_steps",
                   "n_action_steps", "suffix_probe_samples")
 

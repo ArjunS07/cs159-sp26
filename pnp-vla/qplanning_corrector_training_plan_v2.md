@@ -1,6 +1,15 @@
 # Q-Planning-Inspired Corrector: Offline Training Plan v2
 
-Status: authoritative proposed plan. This supersedes `qplanning_corrector_training_plan.md`. No trainer or notebooks are implemented here.
+Status: authoritative semantics for the implemented trainer in `pnp/qplanning_critic/` and `notebooks/64_train_qplanning_q50_then_q10.ipynb`. This supersedes `qplanning_corrector_training_plan.md`.
+
+## Evaluation handoff
+
+- Q10 and Q50 training use executed closed-loop windows. Q50 spans five 10-action replans; it
+  is not the unexecuted tail of one generated chunk.
+- Run notebooks 66 and 67 independently. Each evaluates one saved step-8000 critic on the same
+  frozen 220 PRO identities and compares against exact matched historical stock every 25 episodes.
+- Inference samples 64 candidates with 3 Euler steps, Q-softmax averages the top 16, executes
+  10 actions, and replans. No PnP, uncertainty gate, video, frames, or generated-chunk blobs.
 
 ## Objective
 
