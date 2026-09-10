@@ -1,15 +1,24 @@
 # Q-Planning-Inspired Corrector: Offline Training Plan v2
 
-Status: authoritative semantics for the implemented trainer in `pnp/qplanning_critic/` and `notebooks/64_train_qplanning_q50_then_q10.ipynb`. This supersedes `qplanning_corrector_training_plan.md`.
+Status: authoritative record of the implemented and completed offline Q10/Q50 training workflow,
+plus the current frozen-critic evaluation protocol. This supersedes
+`qplanning_corrector_training_plan.md`.
 
 ## Evaluation handoff
 
 - Q10 and Q50 training use executed closed-loop windows. Q50 spans five 10-action replans; it
   is not the unexecuted tail of one generated chunk.
-- Run notebooks 66 and 67 independently. Each evaluates one saved step-8000 critic on the same
-  frozen 220 PRO identities and compares against exact matched historical stock every 25 episodes.
+- Notebooks 66 and 67 are the earlier development launchers on PRO220. That cohort is not a
+  guaranteed train-disjoint final test and should not be used for confirmatory claims.
+- The current evaluation is notebook 68, split into four fixed workers over the reserved
+  160-identity position-perturbation PRO manifest. Every worker runs newly collected stock VLA,
+  Q10, and Q50 outcomes on the same 40 identities and prints an exact matched table every ten
+  complete identities.
 - Inference samples 64 candidates with 3 Euler steps, Q-softmax averages the top 16, executes
   10 actions, and replans. No PnP, uncertainty gate, video, frames, or generated-chunk blobs.
+- Stock uses the ordinary 10-step decoder and also executes ten actions. Q10 and Q50 use the same
+  deterministic candidate-seed schedule and identical candidates at their shared first boundary.
+- Both critics remain frozen. Do not perform online updates on the reserved 160 identities.
 
 ## Objective
 
@@ -110,7 +119,7 @@ The RL token is an ordinary learned parameter of shape `(1, 1, 768)`, initialize
 
 ## Fixed training schedule
 
-Train each model once on the existing immutable snapshot:
+Both completed critics were trained from the same immutable `pcpcds-*` snapshot using:
 
 - 8,000 optimizer updates;
 - effective batch size 64;
@@ -121,7 +130,10 @@ Train each model once on the existing immutable snapshot:
 - EMA `tau = 0.005`;
 - identical declared seed.
 
-If Q50 requires a smaller GPU microbatch, use gradient accumulation to preserve effective batch 64. Do not recollect data or restart at an intermediate checkpoint.
+Notebook 64 queues Q50 and then Q10 from one local `source_parts_v2` mirror and reconstructs
+training windows in memory instead of writing horizon-specific copies. Its checked-in microbatch
+defaults are conservative; the exact microbatch used by a completed run is recorded in that
+checkpoint. Gradient accumulation always preserves effective batch 64.
 
 ## Periodic output
 
@@ -137,7 +149,10 @@ Every 500 updates, evaluate on a fixed set of already recorded validation episod
 validation | HL-Gauss CE ... | Q MAE ... | Q(success) ... | Q(failure) ... | failure AUC ...
 ```
 
-This validation performs no simulator rollout and does not alter the fixed 8,000-step schedule. Save resumable checkpoints every 1,000 updates and at the end, including data/split hashes, source PI revision, horizon, architecture, optimizer, and EMA state.
+This validation performs no simulator rollout and does not alter the fixed 8,000-step schedule.
+A resumable checkpoint is written every 1,000 updates and at the end, including data/split hashes,
+source PI revision, horizon, architecture, optimizer, and EMA state. To bound Drive usage, each
+new save replaces the preceding checkpoint for that critic; only the newest checkpoint remains.
 
 ## Uncertainty use in v1 training
 
@@ -153,25 +168,29 @@ Later experiments may add an uncertainty token, auxiliary U/failure head, extern
 
 The paper's largest gains do not come from critic architecture alone. Its offline Q-planner improves more modestly, while the large gains follow repeated Q-guided collection and Q-only updates. It also uses many diverse short-denoising candidates at inference. Therefore, successful offline training here establishes only that the critic is calibrated and action-sensitive enough to justify a matched rollout pilot.
 
-After training, compare Q10 and Q50 on identical held-out data using final validation loss, return MAE, success/failure separation, failure AUC, and valid same-state candidate-ranking diagnostics. Then take the stronger model into a matched 220-episode stock-versus-Q-planner pilot. Do not start continual online updates until that planner shows a credible action-selection signal.
+Offline validation compares Q10 and Q50 using final validation loss, return MAE,
+success/failure separation, failure AUC, and same-state candidate-ranking diagnostics. The next
+simulator test is the predeclared three-arm PRO160 evaluation in notebook 68. Report stock, Q10,
+and Q50 separately on all 160 matched identities; do not tune a threshold or planner setting on
+those outcomes and then describe the same set as untouched. Continual Q-only updates remain a
+later experiment, after a frozen critic demonstrates a credible action-selection signal.
 
-## Expected compute
+## Training execution
 
-With cached PI context and only the critic decoder trained, estimate approximately:
+The full Q50 and Q10 runs have been completed and saved. Notebook 64 remains the reproducible
+launcher: it mirrors compressed source parts to ephemeral local storage once, streams both
+horizons from that mirror, prints throughput and ETA every 100 updates, validates every 500, and
+queues Q10 after Q50. Training directly from Drive or rebuilding persistent Q10/Q50 window caches
+is obsolete because it is substantially slower and can exhaust Colab storage.
 
-- Q10: 3-7 hours on one A100 80 GB;
-- Q50: 5-10 hours on one A100 80 GB;
-- two A100 runtimes in parallel: one overnight wall-clock window.
+## Implemented deliverables
 
-The later implementation should print measured throughput and ETA after the first 100 updates. Copy artifacts from Drive to local runtime storage before training to avoid Drive I/O dominating the run.
-
-## Planned implementation deliverables
-
-When requested:
-
-1. one manifest/snapshot validator and transition builder supporting horizons 10 and 50;
-2. one shared critic implementation and trainer;
-3. one Q50-paper-style training notebook;
-4. one Q10-causal training notebook;
-5. one compact offline comparison notebook;
-6. tests for split leakage, horizon construction, terminal masking, normalization, RL-token/action shapes, EMA updates, and checkpoint resume.
+1. Immutable snapshot validation and transition construction for horizons 10 and 50.
+2. Shared RL-token critic, EMA target, HL-Gauss trainer, and inference scorer in
+   `pnp/qplanning_critic/`.
+3. Combined full-run launcher `notebooks/64_train_qplanning_q50_then_q10.ipynb`.
+4. Development evaluation launchers 66/67 for PRO220.
+5. Four matched, train-disjoint evaluation workers
+   `notebooks/workers/68_eval_qplanning_heldout160_worker_{0,1,2,3}.ipynb`.
+6. Tests for split leakage, horizon construction, terminal masking, normalization,
+   RL-token/action shapes, EMA/checkpoint behavior, inference selection, and worker contracts.
