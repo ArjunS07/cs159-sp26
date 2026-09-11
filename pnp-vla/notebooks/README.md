@@ -40,6 +40,10 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
 - `workers/66_eval_qplanning_q10_pro220.ipynb` and
   `workers/67_eval_qplanning_q50_pro220.ipynb` evaluate the two trained critics separately
   on the exact 220-identity PRO pilot, with matched historical stock printouts every 25 episodes.
+- `workers/68_eval_qplanning_heldout160_worker_{0,1,2,3}.ipynb` run stock, Q10, and Q50 on
+  the untouched 160-identity position-perturbation split. `69_analyze_qplanning_heldout160.ipynb`
+  reports exact paired/per-suite SR, Q-score and candidate-diversity failure diagnostics, and
+  clearly labeled gate screens using the exact worker-41 U10/U20/U50 overlap.
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 
