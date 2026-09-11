@@ -179,6 +179,13 @@ U10, U50, contraction, held-out position-perturbation episodes, and online repla
 from this run. The purpose is to test whether an uncertainty-aware critic learns a useful
 action-dependent future-risk signal before adding deployment selection or continual learning.
 
+The follow-up evaluation uses
+`workers/71_eval_qplanning_q50_u20_heldout160_worker_{0,1}.ipynb`. It ranks the same 64
+three-step candidates by `z(Q) - beta * z(predicted future U20)` for beta 0.25, 0.5, and 1.0,
+retains the top 16, and applies the ordinary Q-softmax blend within that retained set. Current
+U20 is measured live with the training-time 10-step, probes-(3,4), K=5 diagnostic. The workers
+do not rerun stock; their periodic tables reuse the exact matched stock rows from notebook 68.
+
 ## Interpretation and next stage
 
 The paper's largest gains do not come from critic architecture alone. Its offline Q-planner improves more modestly, while the large gains follow repeated Q-guided collection and Q-only updates. It also uses many diverse short-denoising candidates at inference. Therefore, successful offline training here establishes only that the critic is calibrated and action-sensitive enough to justify a matched rollout pilot.

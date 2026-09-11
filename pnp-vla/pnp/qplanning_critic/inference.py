@@ -247,15 +247,52 @@ def qplanning_select(policy, batch, candidate_noises: torch.Tensor, *,
     finally:
         sampler.set_strategy(policy.model, previous_strategy)
     candidates = torch.cat(chunks, dim=0)
-    q_values = scorer.score(
-        shared_prefix, shared_valid, robot_state, policy_proprio, candidates)
-    blended, elite_indices, elite_weights = q_weighted_average(
-        candidates, q_values, n_elites=n_elites, temperature=temperature)
     denoise_steps = int(
         policy.model._pnp.num_steps or policy.config.num_inference_steps)
+    u20_telemetry = {}
+    if getattr(scorer, "requires_current_u20", False):
+        from .. import sampler
+
+        # Training U20 was measured on the ordinary 10-step decoder at Euler
+        # probes 3 and 4. Candidate generation remains the paper-style 3-step
+        # path; this additional pass supplies only the live state-risk context.
+        previous_num_steps = policy.model._pnp.num_steps
+        try:
+            policy.model._pnp.num_steps = 10
+            _, current_u20 = sampler.measure_chunk_uncertainty(
+                policy, batch, candidate_noises[:1],
+                probe_steps=(3, 4), num_iterations=5,
+                uncertainty_horizon=20)
+        finally:
+            policy.model._pnp.num_steps = previous_num_steps
+        q_values, predicted_future_u20, selection_scores = scorer.score_components(
+            shared_prefix, shared_valid, robot_state, policy_proprio, candidates,
+            current_u20=float(current_u20), batch_size=candidate_batch_size)
+        _, elite_indices = torch.topk(
+            selection_scores, int(n_elites), largest=True, sorted=True)
+        elite_q = q_values.index_select(0, elite_indices)
+        elite_weights = torch.softmax(elite_q / float(temperature), dim=0)
+        blended = torch.sum(
+            candidates.index_select(0, elite_indices)
+            * elite_weights[:, None, None], dim=0, keepdim=True)
+        best_index = int(torch.argmax(selection_scores))
+        u20_telemetry = {
+            "current_u20": float(current_u20),
+            "predicted_future_u20": [
+                float(value) for value in predicted_future_u20.detach().cpu()],
+            "selection_scores": [
+                float(value) for value in selection_scores.detach().cpu()],
+            "uncertainty_beta": float(scorer.uncertainty_beta),
+        }
+    else:
+        q_values = scorer.score(
+            shared_prefix, shared_valid, robot_state, policy_proprio, candidates)
+        blended, elite_indices, elite_weights = q_weighted_average(
+            candidates, q_values, n_elites=n_elites, temperature=temperature)
+        best_index = int(torch.argmax(q_values))
     telemetry = {
         "q_values": [float(value) for value in q_values.detach().cpu()],
-        "best_index": int(torch.argmax(q_values)),
+        "best_index": best_index,
         "elite_indices": [int(value) for value in elite_indices.detach().cpu()],
         "elite_weights": [float(value) for value in elite_weights.detach().cpu()],
         "q_mean": float(q_values.mean()), "q_std": float(q_values.std(unbiased=False)),
@@ -266,5 +303,6 @@ def qplanning_select(policy, batch, candidate_noises: torch.Tensor, *,
         "candidate_equivalent_vf_evals": int(n_candidates * denoise_steps),
         "first10_diversity": _diversity_summary(candidates, 10),
         "full50_diversity": _diversity_summary(candidates, 50),
+        **u20_telemetry,
     }
     return blended, telemetry

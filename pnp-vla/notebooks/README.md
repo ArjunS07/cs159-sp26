@@ -47,6 +47,9 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
 - `70_train_qplanning_q50_u20.ipynb` is the separate 8,000-update Q50+U20 experiment:
   current-boundary U20 is an input and mean U20 over the next four planning boundaries is an
   auxiliary target. It uses only the immutable train-eligible snapshot.
+- `workers/71_eval_qplanning_q50_u20_heldout160_worker_{0,1}.ipynb` evaluate that checkpoint
+  on the same fixed PRO160 identities with inference coefficients 0.25, 0.5, and 1.0. They run
+  only the three new arms and reuse notebook 68's exact matched stock outcomes in progress tables.
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 

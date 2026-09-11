@@ -566,7 +566,10 @@ class SupabaseStore:
                         "n_candidates", "n_elites", "temperature", "denoise_steps",
                         "candidate_batch_size", "candidate_equivalent_vf_evals",
                         "first10_diversity", "full50_diversity",
+                        "current_u20", "predicted_future_u20", "selection_scores",
+                        "uncertainty_beta",
                         "inference_ms", "n_vf_evals")
+                    if field in selections[0]
                 }}
         blobs = {}
         if result.get("trajectory"):

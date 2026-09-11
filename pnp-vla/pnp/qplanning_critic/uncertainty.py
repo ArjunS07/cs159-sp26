@@ -312,6 +312,129 @@ class QPlanningU20Critic(QPlanningCritic):
         return (logits.softmax(-1) * self.value_bins).sum(-1)
 
 
+class QPlanningU20Scorer:
+    """Frozen Q50+U20 checkpoint with one deployment tradeoff coefficient."""
+
+    requires_current_u20 = True
+
+    def __init__(self, model: QPlanningU20Critic, *, checkpoint_id: str,
+                 checkpoint_path: str, snapshot_id: str, update: int,
+                 source_policy: dict, uncertainty_beta: float, device):
+        if float(uncertainty_beta) not in (0.25, 0.5, 1.0):
+            raise ValueError("uncertainty_beta must be one of 0.25, 0.5, or 1.0")
+        self.model = model
+        self.base_checkpoint_id = checkpoint_id
+        self.checkpoint_id = f"{checkpoint_id}:beta{float(uncertainty_beta):.2f}"
+        self.checkpoint_path = checkpoint_path
+        self.snapshot_id = snapshot_id
+        self.update = int(update)
+        self.source_policy = dict(source_policy)
+        self.uncertainty_beta = float(uncertainty_beta)
+        self.device = torch.device(device)
+
+    @property
+    def horizon(self) -> int:
+        return 50
+
+    @torch.no_grad()
+    def score_components(self, prefix, prefix_valid, robot, proprio, actions,
+                         *, current_u20: float, batch_size: int = 64):
+        actions = torch.as_tensor(actions, device=self.device)
+        if actions.ndim != 3 or actions.shape[1] < 50:
+            raise ValueError("Q50+U20 candidates must be [N,>=50,action_dim]")
+        prefix = torch.as_tensor(prefix, device=self.device)
+        prefix_valid = torch.as_tensor(prefix_valid, device=self.device).bool()
+        if prefix.ndim == 2:
+            prefix = prefix[None]
+        if prefix_valid.ndim == 1:
+            prefix_valid = prefix_valid[None]
+        robot = torch.as_tensor(
+            robot, device=self.device, dtype=torch.float32).reshape(1, -1)
+        proprio = torch.as_tensor(
+            proprio, device=self.device, dtype=torch.float32).reshape(1, -1)
+        q_parts, u_parts = [], []
+        use_amp = self.device.type == "cuda" and torch.cuda.is_bf16_supported()
+        for start in range(0, len(actions), int(batch_size)):
+            stop = min(len(actions), start + int(batch_size))
+            width = stop - start
+            with torch.autocast(
+                    device_type=self.device.type, dtype=torch.bfloat16,
+                    enabled=use_amp):
+                logits, normalized_u = self.model(
+                    prefix.expand(width, -1, -1),
+                    prefix_valid.expand(width, -1),
+                    robot.expand(width, -1), proprio.expand(width, -1),
+                    actions[start:stop, :50, :self.model.config.action_dim],
+                    torch.ones((width, 50), dtype=torch.bool, device=self.device),
+                    torch.full(
+                        (width,), float(current_u20), dtype=torch.float32,
+                        device=self.device))
+                q_parts.append(
+                    (logits.softmax(-1) * self.model.value_bins).sum(-1).float())
+                u_parts.append(
+                    self.model.denormalize_target_u20(normalized_u).float())
+        q_values, future_u20 = torch.cat(q_parts), torch.cat(u_parts)
+
+        def standardize(values):
+            return (values - values.mean()) / values.std(unbiased=False).clamp_min(1e-6)
+
+        selection = (
+            standardize(q_values)
+            - self.uncertainty_beta * standardize(future_u20))
+        return q_values, future_u20, selection
+
+
+def load_qplanning_u20_scorer(checkpoint_path: str | Path, *,
+                              uncertainty_beta: float, device=None,
+                              expected_source_revision: str | None = None):
+    """Load the final Q50+U20 checkpoint for one declared inference beta."""
+    path = Path(checkpoint_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Q50+U20 checkpoint not found: {path}")
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("format") != "qplanning_q50_u20_v1":
+        raise ValueError("checkpoint is not Q50+U20 v1")
+    architecture = dict(payload["architecture"])
+    if architecture.pop("u20_auxiliary", None) is not True:
+        raise ValueError("checkpoint lacks the U20 auxiliary architecture marker")
+    if int(architecture.pop("future_u20_boundaries", -1)) != FUTURE_BOUNDARIES:
+        raise ValueError("checkpoint uses a different future-U20 target")
+    prefix_dim = int(architecture.pop("prefix_dim"))
+    robot_dim = int(architecture.pop("robot_dim"))
+    proprio_dim = int(architecture.pop("proprio_dim"))
+    config = QPlanningModelConfig(**architecture)
+    source_policy = dict(payload.get("source_policy") or {})
+    if not source_policy.get("repo_id") or not source_policy.get("revision"):
+        raise ValueError("checkpoint lacks immutable source-policy provenance")
+    if (expected_source_revision is not None
+            and source_policy["revision"] != expected_source_revision):
+        raise ValueError("checkpoint source revision differs from requested PI checkpoint")
+    model = QPlanningU20Critic(
+        prefix_dim=prefix_dim, robot_dim=robot_dim,
+        proprio_dim=proprio_dim, config=config)
+    model.load_state_dict(payload["model"])
+    model.to(device).eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    checkpoint_id = (
+        f"{payload.get('snapshot_id', 'unknown')}:q50u20:"
+        f"step{int(payload.get('update', 0))}:{digest.hexdigest()[:16]}")
+    scorer = QPlanningU20Scorer(
+        model, checkpoint_id=checkpoint_id, checkpoint_path=str(path),
+        snapshot_id=str(payload.get("snapshot_id", "")),
+        update=int(payload.get("update", 0)), source_policy=source_policy,
+        uncertainty_beta=uncertainty_beta, device=device)
+    print(
+        f"[qplanning-u20] loaded step {scorer.update}, beta={scorer.uncertainty_beta:g} | "
+        f"{scorer.checkpoint_id}", flush=True)
+    return scorer
+
+
 def _loader(dataset, batch_size: int, *, shuffle: bool, seed: int = 0):
     if shuffle:
         return DataLoader(

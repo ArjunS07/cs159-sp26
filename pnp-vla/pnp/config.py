@@ -105,6 +105,9 @@ class Method:
     THREE_STEP_SINGLE_QUERY = "three_step_single_query"
     QPLANNING_Q10 = "qplanning_q10"
     QPLANNING_Q50 = "qplanning_q50"
+    QPLANNING_Q50_U025 = "qplanning_q50_u20_beta025"
+    QPLANNING_Q50_U050 = "qplanning_q50_u20_beta050"
+    QPLANNING_Q50_U100 = "qplanning_q50_u20_beta100"
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
@@ -123,7 +126,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.FIVE_STEP_LOWEST_U20, Method.FIVE_STEP_LOWEST_U20_REFINE,
                Method.FIVE_STEP_SINGLE_REFINE, Method.THREE_STEP_SINGLE_REFINE,
                Method.THREE_STEP_SINGLE_QUERY, Method.QPLANNING_Q10,
-               Method.QPLANNING_Q50,
+               Method.QPLANNING_Q50, Method.QPLANNING_Q50_U025,
+               Method.QPLANNING_Q50_U050, Method.QPLANNING_Q50_U100,
                Method.PNP_ONLY, Method.PCP, Method.COLLECT, Method.PCP_SEARCH_COLLECT)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 

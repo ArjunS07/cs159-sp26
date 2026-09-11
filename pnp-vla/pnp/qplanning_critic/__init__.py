@@ -9,8 +9,9 @@ from .inference import (
 from .train import evaluate_qplanning_critic, train_qplanning_critic
 from .workflow import run_qplanning_training_test
 from .uncertainty import (
-    QPlanningU20Critic, QPlanningU20WindowDataset, U20LabelCache,
-    prepare_u20_label_cache, run_q50_u20_training)
+    QPlanningU20Critic, QPlanningU20Scorer, QPlanningU20WindowDataset,
+    U20LabelCache, load_qplanning_u20_scorer, prepare_u20_label_cache,
+    run_q50_u20_training)
 
 __all__ = [
     "QPlanningModelConfig", "QPlanningTrainConfig", "QPlanningCacheIndex",
@@ -19,6 +20,7 @@ __all__ = [
     "QPlanningScorer", "load_qplanning_scorer", "q_weighted_average",
     "qplanning_select",
     "evaluate_qplanning_critic", "train_qplanning_critic", "run_qplanning_training_test",
-    "QPlanningU20Critic", "QPlanningU20WindowDataset", "U20LabelCache",
-    "prepare_u20_label_cache", "run_q50_u20_training",
+    "QPlanningU20Critic", "QPlanningU20Scorer", "QPlanningU20WindowDataset",
+    "U20LabelCache", "load_qplanning_u20_scorer", "prepare_u20_label_cache",
+    "run_q50_u20_training",
 ]
