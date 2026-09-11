@@ -44,6 +44,9 @@ stack mismatch, restart with a fresh GPU runtime instead of upgrading Torch in p
   the untouched 160-identity position-perturbation split. `69_analyze_qplanning_heldout160.ipynb`
   reports exact paired/per-suite SR, Q-score and candidate-diversity failure diagnostics, and
   clearly labeled gate screens using the exact worker-41 U10/U20/U50 overlap.
+- `70_train_qplanning_q50_u20.ipynb` is the separate 8,000-update Q50+U20 experiment:
+  current-boundary U20 is an input and mean U20 over the next four planning boundaries is an
+  auxiliary target. It uses only the immutable train-eligible snapshot.
 - `11_arbitrate_and_confirm_verifier.ipynb` — development-only baseline/hybrid selection,
   followed by one-shot evaluation of exactly one eligible winner on the sealed PRO cohort.
 

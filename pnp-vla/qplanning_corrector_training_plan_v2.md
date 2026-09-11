@@ -164,6 +164,21 @@ Do not feed U10/U20 to either critic and do not use it to weight training exampl
 
 Later experiments may add an uncertainty token, auxiliary U/failure head, external activation gate, or candidate objective `Q - beta * U`. These must remain separate from the initial Q10/Q50 comparison.
 
+## Q50+U20 follow-up
+
+Notebook `70_train_qplanning_q50_u20.ipynb` implements the first uncertainty-aware follow-up
+without changing the immutable data split. It trains Q50 from scratch for the same 8,000 updates
+and effective batch size 64. At each planning boundary it:
+
+- feeds measured U20 from that boundary as a log-normalized context token;
+- predicts Q with the ordinary RL-token HL-Gauss head;
+- predicts mean U20 over the next four planning boundaries with a second learned token;
+- optimizes `Q cross-entropy + 0.25 * SmoothL1(future U20)`.
+
+U10, U50, contraction, held-out position-perturbation episodes, and online replay are excluded
+from this run. The purpose is to test whether an uncertainty-aware critic learns a useful
+action-dependent future-risk signal before adding deployment selection or continual learning.
+
 ## Interpretation and next stage
 
 The paper's largest gains do not come from critic architecture alone. Its offline Q-planner improves more modestly, while the large gains follow repeated Q-guided collection and Q-only updates. It also uses many diverse short-denoising candidates at inference. Therefore, successful offline training here establishes only that the critic is calibrated and action-sensitive enough to justify a matched rollout pilot.

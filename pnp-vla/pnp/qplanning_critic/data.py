@@ -900,7 +900,7 @@ def collate_windows(items: list[dict]) -> dict[str, torch.Tensor]:
     prefix, pad = padded("prefix", "pad")
     next_prefix, next_pad = padded("next_prefix", "next_pad")
     tensor = lambda name: torch.from_numpy(np.stack([item[name] for item in items]))
-    return {
+    result = {
         "prefix": prefix, "pad": pad,
         "robot": tensor("robot").float(), "proprio": tensor("proprio").float(),
         "action": tensor("action").float(), "action_valid": tensor("action_valid").bool(),
@@ -912,3 +912,15 @@ def collate_windows(items: list[dict]) -> dict[str, torch.Tensor]:
         "mc_return": tensor("mc_return").float(), "success": tensor("success").bool(),
         "start_step": tensor("start_step").long(),
     }
+    optional = {
+        "current_u20": torch.float32,
+        "next_current_u20": torch.float32,
+        "future_u20": torch.float32,
+        "future_u20_valid": torch.bool,
+    }
+    for name, dtype in optional.items():
+        if name in items[0]:
+            if not all(name in item for item in items):
+                raise ValueError(f"mixed presence of optional field {name}")
+            result[name] = tensor(name).to(dtype=dtype)
+    return result
