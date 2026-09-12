@@ -189,6 +189,7 @@ def train_qplanning_critic(model: QPlanningCritic,
                            source_policy: dict,
                            output_dir: str | Path,
                            config: QPlanningTrainConfig,
+                           train_batch_sampler: Sampler[list[int]] | None = None,
                            resume: bool = True) -> tuple[QPlanningCritic, QPlanningCritic, dict]:
     if not len(train_dataset):
         raise ValueError("training dataset is empty")
@@ -213,7 +214,13 @@ def train_qplanning_critic(model: QPlanningCritic,
                 if torch.is_tensor(value):
                     state[key] = value.to(device)
         print(f"[qplanning] resumed {latest.name} at step {start_update}")
-    loader = _loader(train_dataset, config.micro_batch_size, shuffle=True, seed=config.seed)
+    if train_batch_sampler is None:
+        loader = _loader(
+            train_dataset, config.micro_batch_size, shuffle=True, seed=config.seed)
+    else:
+        loader = DataLoader(
+            train_dataset, batch_sampler=train_batch_sampler, num_workers=0,
+            collate_fn=collate_windows)
     iterator = iter(loader)
     use_amp = bool(config.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
     started = time.perf_counter()

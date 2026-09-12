@@ -84,7 +84,7 @@ class CompactCacheIndex:
 
 
 _ROLLOUT_FIELDS = (
-    "rollout_id,benchmark,suite,task_idx,episode_idx,init_state_hash,training_data_path,"
+    "rollout_id,benchmark,suite,task_idx,episode_idx,init_state_hash,success,training_data_path,"
     "training_data_schema_version,ahats_path,run_id,"
     "pcp_train_eligible,training_ready"
 )

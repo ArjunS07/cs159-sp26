@@ -12,6 +12,9 @@ from .uncertainty import (
     QPlanningU20Critic, QPlanningU20Scorer, QPlanningU20WindowDataset,
     U20LabelCache, load_qplanning_u20_scorer, prepare_u20_label_cache,
     run_q50_u20_training)
+from .replay_priority import (
+    PRIORITY_STRATEGIES, PrioritizedReplayBatchSampler, ReplayPriorityPlan,
+    build_replay_priority_plan, run_q50_priority_worker)
 
 __all__ = [
     "QPlanningModelConfig", "QPlanningTrainConfig", "QPlanningCacheIndex",
@@ -23,4 +26,6 @@ __all__ = [
     "QPlanningU20Critic", "QPlanningU20Scorer", "QPlanningU20WindowDataset",
     "U20LabelCache", "load_qplanning_u20_scorer", "prepare_u20_label_cache",
     "run_q50_u20_training",
+    "PRIORITY_STRATEGIES", "ReplayPriorityPlan", "PrioritizedReplayBatchSampler",
+    "build_replay_priority_plan", "run_q50_priority_worker",
 ]
