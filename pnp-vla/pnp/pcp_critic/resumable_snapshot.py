@@ -44,18 +44,39 @@ def _download_with_retry(store, path: str, *, attempts: int = 8) -> bytes:
     raise AssertionError("unreachable")
 
 
+def _load_json_with_retry(store, path: str, *, attempts: int = 8) -> dict:
+    """Download a JSON object, retrying successful but invalid HTTP responses."""
+    for attempt in range(1, attempts + 1):
+        payload = _download_with_retry(store, path, attempts=attempts)
+        try:
+            return json.loads(payload)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            if attempt == attempts:
+                raise ValueError(
+                    f"invalid JSON manifest after {attempts} attempts: {path} "
+                    f"({len(payload)} bytes)") from error
+            delay = min(30, 2 ** (attempt - 1))
+            print(
+                f"[pcp-snapshot] invalid JSON manifest while reading {path} "
+                f"({len(payload)} bytes); retry {attempt}/{attempts} in {delay}s",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def load_training_fields_with_retry(store, path: str, fields: Iterable[str], *,
                                     attempts: int = 8) -> dict[str, np.ndarray]:
     """Load selected multipart arrays, retrying HTTP transport failures."""
     wanted = tuple(dict.fromkeys(fields))
-    payload = _download_with_retry(store, path, attempts=attempts)
     if path.endswith(".npz"):
+        payload = _download_with_retry(store, path, attempts=attempts)
         with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
             missing = sorted(set(wanted) - set(archive.files))
             if missing:
                 raise ValueError(f"training artifact {path} is missing {missing}")
             return {name: archive[name] for name in wanted}
-    manifest = json.loads(payload)
+    manifest = _load_json_with_retry(store, path, attempts=attempts)
     if manifest.get("format") != TRAINING_DATA_MULTIPART_FORMAT:
         raise ValueError(f"unsupported training-data manifest at {path}")
     missing = sorted(set(wanted) - set(manifest.get("arrays", {})))

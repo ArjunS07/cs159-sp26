@@ -20,7 +20,7 @@ from torch.utils.data import Dataset
 
 from ..pcp_critic.data import DatasetSnapshot, eligible_rollout_rows
 from ..pcp_critic.resumable_snapshot import (
-    _download_with_retry, load_training_fields_with_retry)
+    _download_with_retry, _load_json_with_retry, load_training_fields_with_retry)
 from ..store import TRAINING_DATA_MULTIPART_FORMAT
 
 
@@ -357,8 +357,7 @@ def _source_entry(path: Path, source_dir: Path, row: dict,
 
 def _mirror_multipart_source_rollout(store, source_dir: Path, row: dict) -> dict:
     """Mirror already-compressed remote parts without recompressing prefix embeddings."""
-    manifest_payload = _download_with_retry(store, row["training_data_path"])
-    remote = json.loads(manifest_payload)
+    remote = _load_json_with_retry(store, row["training_data_path"])
     if remote.get("format") != TRAINING_DATA_MULTIPART_FORMAT:
         raise ValueError(
             f"unsupported training-data manifest at {row['training_data_path']}")

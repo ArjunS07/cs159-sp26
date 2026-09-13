@@ -36,9 +36,10 @@ def _objects(value):
 
 
 class FakeStore:
-    def __init__(self, objects, fail_once=None):
+    def __init__(self, objects, fail_once=None, invalid_once=None):
         self.objects = objects
         self.fail_once = fail_once
+        self.invalid_once = invalid_once
         self.downloaded = []
 
     def _download(self, path):
@@ -46,6 +47,9 @@ class FakeStore:
         if path == self.fail_once:
             self.fail_once = None
             raise httpx.ReadError("connection reset")
+        if path == self.invalid_once:
+            self.invalid_once = None
+            return b""
         return self.objects[path]
 
 
@@ -57,6 +61,15 @@ def test_selected_field_loader_retries_and_skips_unused_parts(monkeypatch):
     assert loaded["bellman/action"].shape == (2, 50, 7)
     assert store.downloaded == ["manifest-1", "part-1", "part-1"]
     assert "unused-1" not in store.downloaded
+
+
+def test_selected_field_loader_retries_empty_json_manifest(monkeypatch):
+    store = FakeStore(_objects(1), invalid_once="manifest-1")
+    monkeypatch.setattr("pnp.pcp_critic.resumable_snapshot.time.sleep", lambda _: None)
+    loaded = load_training_fields_with_retry(
+        store, "manifest-1", ("bellman/action",), attempts=2)
+    assert loaded["bellman/action"].shape == (2, 50, 7)
+    assert store.downloaded == ["manifest-1", "manifest-1", "part-1"]
 
 
 def test_action_statistics_resume_without_redownloading_completed_rows(tmp_path):
