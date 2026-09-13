@@ -14,7 +14,7 @@ older `qplanning_corrector_training_plan.md`.
 | Matched OOD PRO160 evaluation | Completed | Net neutral/slightly negative versus stock; no demonstrated SR benefit |
 | Q50 + future-U20 auxiliary head | Trained; evaluation stopped early | All tested uncertainty coefficients were degrading SR during the partial run |
 | Failure/U20-prioritized replay | Training in progress | Four fresh Q50 arms split across notebooks 72 |
-| LIBERO-only Q50 base | Ready to run | Notebook 73; intended for a staged LIBERO → PRO continual experiment |
+| LIBERO-only Q50 base | Completed | Notebook 73 trained the base checkpoint for a staged LIBERO → PRO continual experiment; staged adaptation has not been run |
 | Paper-style continual/online replay | Not yet implemented | Candidate next stage after replay-priority results |
 
 ## Data and evaluation partitions
@@ -239,8 +239,8 @@ a quantity directly optimized during candidate selection. No outcome is availabl
 
 ## Experiment 4: LIBERO-only base for staged adaptation
 
-Notebook 73 is ready to train a fresh ordinary Q50 critic on only the 600 standard-LIBERO
-rollouts:
+Notebook 73 trained a fresh ordinary Q50 critic on only the 600 standard-LIBERO rollouts. The run
+completed with:
 
 - 4,000 optimizer updates;
 - uniform replay;
@@ -253,7 +253,7 @@ The shorter 4,000-update schedule avoids applying the mixed 1,880-rollout run's 
 sample reuse to a dataset about one third its size. File:
 `notebooks/73_train_q50_libero_only_base.ipynb`.
 
-This checkpoint is intended to support a clean staged experiment:
+The resulting checkpoint is intended to support a clean staged experiment:
 
 1. train the base critic on standard LIBERO;
 2. continue Q-only training on the 1,280 non-position PRO rollouts;
@@ -304,6 +304,36 @@ A more expensive extension is to use high episode/prefix U20 to request addition
 forks from selected states, producing counterfactual action/outcome evidence. This directly targets
 the current critic's weakness: it is trained on one realized action sequence per state but is asked
 at inference to compare many counterfactual candidates from that state.
+
+The bounded fork design proposed in `astraslop.md` is a concrete diagnostic version of this idea:
+
+1. Freeze a manifest of 64 distinct task/initialization identities, balanced as eight conditions
+   with eight initializations each across two already-used development regimes.
+2. Choose one live decision boundary per identity using a predeclared task/phase rule. Do not choose
+   boundaries after observing candidate outcomes or exclusively because their uncertainty is high.
+3. From the exact same saved simulator state, evaluate four fixed candidate action prefixes with
+   two independent continuation replications each: 64 × 4 × 2 = 512 branch continuations.
+4. Include the default action among the candidates and reuse matched continuation seeds across
+   alternatives. This separates candidate quality from future-environment randomness.
+5. Reserve up to 480 additional continuations for a specific diagnosed coverage or uncertainty
+   problem rather than allocating them automatically.
+6. Use the branch outcomes for direct intervention estimates and out-of-fold critic/ranking
+   diagnostics. If the pilot supports learning, a proposed expansion is 256 new identities × four
+   candidates × two seeds = 2,048 continuations, followed by a frozen-selector audit on independent
+   identities.
+
+Uncertainty can be tested as a rule for allocating the reserve or selecting future states to fork,
+but it should be compared at matched simulator-transition cost against uniform and failure-based
+allocation. Candidate outcomes must never be used to select the state whose branches supply its
+training label.
+
+### Longer-term: settings without an environment failure signal
+
+The Q-Planning paper notes settings without a readily available environment failure signal as a
+possible extension. P&P uncertainty could potentially supply an intrinsic difficulty or novelty
+signal for collection, replay, or abstention in such settings. This is not a current workstream:
+the LIBERO and LIBERO-PRO experiments used here provide environment outcome/failure signals, so the
+idea is only worth a brief later investigation rather than displacing the current controlled tests.
 
 ## Important interpretation constraints
 
