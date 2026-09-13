@@ -263,7 +263,9 @@ _METHOD_LABELS = {Method.VANILLA: "stock VLA",
                    Method.THREE_STEP_SINGLE_REFINE: "3-step x1 refine",
                    Method.THREE_STEP_SINGLE_QUERY: "3-step x1",
                    Method.QPLANNING_Q10: "Q10 planner",
-                   Method.QPLANNING_Q50: "Q50 planner"}
+                   Method.QPLANNING_Q50: "Q50 planner",
+                   Method.QPLANNING_Q50_PRIORITY_FAILURE: "Q50 failure-priority",
+                   Method.QPLANNING_Q50_PRIORITY_U20_4CHUNK: "Q50 4-chunk-U20-priority"}
 
 
 def format_progress_table(tally, method_names, historical_sr=None, *, include_overall=False,

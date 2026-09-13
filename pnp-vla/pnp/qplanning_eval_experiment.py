@@ -472,13 +472,15 @@ def run_qplanning_heldout_worker(
 
 def validate_qplanning_eval_sentinel(*, horizon: int, checkpoint_id: str,
                                      experiment: str | None = None,
+                                     method: str | None = None,
                                      store=None) -> dict:
     """Audit one persisted rollout's planner settings and boundary telemetry."""
     from .store import SupabaseStore
 
     horizon = int(horizon)
     experiment = experiment or QPLANNING_EVAL_EXPERIMENTS[horizon]
-    method = Method.QPLANNING_Q10 if horizon == 10 else Method.QPLANNING_Q50
+    method = method or (
+        Method.QPLANNING_Q10 if horizon == 10 else Method.QPLANNING_Q50)
     store = store or SupabaseStore()
     rows = store.fetch_all(
         "rollouts",

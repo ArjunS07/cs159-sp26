@@ -108,6 +108,8 @@ class Method:
     QPLANNING_Q50_U025 = "qplanning_q50_u20_beta025"
     QPLANNING_Q50_U050 = "qplanning_q50_u20_beta050"
     QPLANNING_Q50_U100 = "qplanning_q50_u20_beta100"
+    QPLANNING_Q50_PRIORITY_FAILURE = "qplanning_q50_priority_failure"
+    QPLANNING_Q50_PRIORITY_U20_4CHUNK = "qplanning_q50_priority_u20_4chunk"
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
@@ -128,6 +130,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.THREE_STEP_SINGLE_QUERY, Method.QPLANNING_Q10,
                Method.QPLANNING_Q50, Method.QPLANNING_Q50_U025,
                Method.QPLANNING_Q50_U050, Method.QPLANNING_Q50_U100,
+               Method.QPLANNING_Q50_PRIORITY_FAILURE,
+               Method.QPLANNING_Q50_PRIORITY_U20_4CHUNK,
                Method.PNP_ONLY, Method.PCP, Method.COLLECT, Method.PCP_SEARCH_COLLECT)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 
