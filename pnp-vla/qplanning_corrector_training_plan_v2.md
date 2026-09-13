@@ -210,7 +210,9 @@ candidate-level counterfactual rankings that are safe to optimize at inference.
 ## Experiment 3: prioritized replay, currently running
 
 Notebooks 72 train four ordinary Q50 critics from step zero. Architecture, Bellman targets,
-optimizer, seed, 8,000-update schedule, and validation split are fixed. Uncertainty changes only
+optimizer, seed, 6,000-update stopping point, and validation split are fixed. These runs retain the
+original 8,000-update learning-rate schedule horizon, so a previously saved step-6000 checkpoint and
+the remaining arms have the same learning rates through update 6000. Uncertainty changes only
 which recorded windows enter training; it is not an input or auxiliary loss.
 
 Every microbatch is:

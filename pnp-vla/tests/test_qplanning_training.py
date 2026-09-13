@@ -7,6 +7,15 @@ from pnp.qplanning_critic.model import QPlanningCritic
 from pnp.qplanning_critic.train import train_qplanning_critic
 
 
+def test_training_can_stop_before_original_lr_schedule_horizon():
+    config = QPlanningTrainConfig(
+        updates=6_000, lr_schedule_updates=8_000, warmup_updates=500)
+    assert config.learning_rate_at(6_000) > 0
+    assert QPlanningTrainConfig(
+        updates=8_000, warmup_updates=500).learning_rate_at(6_000) == (
+            config.learning_rate_at(6_000))
+
+
 def test_qplanning_trainer_saves_resumable_single_q_checkpoint(tmp_path):
     n, horizon = 4, 10
     arrays = {

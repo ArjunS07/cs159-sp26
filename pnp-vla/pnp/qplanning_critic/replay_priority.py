@@ -332,7 +332,8 @@ def run_q50_priority_worker(
 
     train_config = QPlanningTrainConfig(
         effective_batch_size=64, micro_batch_size=micro_batch_size,
-        updates=8_000, warmup_updates=500, print_interval=100,
+        updates=6_000, lr_schedule_updates=8_000,
+        warmup_updates=500, print_interval=100,
         eval_interval=500, checkpoint_interval=1_000,
         max_validation_transitions=4096)
     model_config = QPlanningModelConfig(action_horizon=50, action_dim=cache.action_dim)
@@ -367,6 +368,7 @@ def run_q50_priority_worker(
         print("\nTraining contract")
         print(f"  strategy={strategy}; fresh initialization={initial_digest}")
         print(f"  device={device}; updates={train_config.updates}")
+        print(f"  learning-rate schedule horizon={train_config.lr_schedule_updates}")
         print(f"  effective batch={train_config.effective_batch_size}; "
               f"microbatch={train_config.micro_batch_size}; "
               f"accumulation={train_config.accumulation_steps}")

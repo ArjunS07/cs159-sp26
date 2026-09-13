@@ -40,6 +40,7 @@ class QPlanningTrainConfig:
     effective_batch_size: int = 64
     micro_batch_size: int = 16
     updates: int = 8_000
+    lr_schedule_updates: int | None = None
     warmup_updates: int = 500
     print_interval: int = 100
     eval_interval: int = 500
@@ -58,6 +59,8 @@ class QPlanningTrainConfig:
             raise ValueError("effective_batch_size must be divisible by micro_batch_size")
         if self.warmup_updates < 0 or self.warmup_updates > self.updates:
             raise ValueError("warmup_updates must lie in [0, updates]")
+        if self.lr_schedule_updates is not None and self.lr_schedule_updates < self.updates:
+            raise ValueError("lr_schedule_updates must be at least updates")
         for value in (self.print_interval, self.eval_interval, self.checkpoint_interval):
             if value < 1:
                 raise ValueError("logging/checkpoint intervals must be positive")
@@ -69,7 +72,8 @@ class QPlanningTrainConfig:
     def learning_rate_at(self, update: int) -> float:
         if self.warmup_updates and update <= self.warmup_updates:
             return self.learning_rate * update / self.warmup_updates
-        span = max(1, self.updates - self.warmup_updates)
+        schedule_updates = self.lr_schedule_updates or self.updates
+        span = max(1, schedule_updates - self.warmup_updates)
         progress = min(1.0, max(0.0, (update - self.warmup_updates) / span))
         return self.learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
 

@@ -87,6 +87,7 @@ def test_two_priority_notebooks_split_four_fresh_q50_runs():
             "".join(cell.get("source", [])) for cell in notebook["cells"])
         assert f"STRATEGIES = {strategies!r}" in source
         assert "run_q50_priority_worker(" in source
-        assert "'updates_per_strategy': 8000" in source
+        assert "'updates_per_strategy': 6000" in source
+        assert "'lr_schedule_horizon': 8000" in source
         assert "MICRO_BATCH_SIZE = 64" in source
         assert "resume=True" in source
