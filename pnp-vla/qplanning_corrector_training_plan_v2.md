@@ -364,6 +364,11 @@ any-branch oracle gain over the stock branch, suite effects, and selected U20. N
 is trained by this pilot. If acquisition is informative, the declared follow-up training mix is
 65% selected tree replay and 35% ordinary replay.
 
+Notebook 77's blocking invariant is within-tree restoration: exact stored parent actions are
+replayed, then every branch is checked after canonical MuJoCo state correction. Independent full
+episode replays and repeated GPU predictions are logged separately as reproducibility diagnostics;
+they are not required to be byte-identical for a persisted tree whose candidates are generated once.
+
 ### Longer-term: settings without an environment failure signal
 
 The Q-Planning paper notes settings without a readily available environment failure signal as a

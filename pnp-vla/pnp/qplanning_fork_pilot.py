@@ -546,11 +546,12 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
                 result = collect_replay_candidate_group(
                     env, ep, policy, preprocess, postprocess, device,
                     chunk_idx=item["chunk_idx"], uncertainty_stratum=item["strategy"],
-                    prefix_length=FORK_PILOT_EXECUTED_ACTIONS, candidate_count=1,
+                    prefix_length=FORK_PILOT_EXECUTED_ACTIONS, candidate_count=2,
                     experiment=item["experiment"], collection_split="restoration_preflight",
                     manifest_hash=document["manifest_hash"],
                     model_revision=payload["policy_revision"],
                     n_action_steps=FORK_PILOT_EXECUTED_ACTIONS,
+                    candidate_num_inference_steps=FORK_PILOT_PROPOSAL_DENOISE_STEPS,
                     replay_actions_override=source_replay_actions[
                         item["source_rollout_id"]][
                             :int(item["chunk_idx"]) * FORK_PILOT_EXECUTED_ACTIONS])
@@ -572,8 +573,10 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
         restoration_fields = (
             "parent_replay_actions_sha256", "root_sim_state_sha256",
             "root_policy_input_sha256")
-        restoration_exact = all(
-            metadata_a[field] == metadata_b[field] for field in restoration_fields)
+        repeat_equal = {
+            field: metadata_a[field] == metadata_b[field]
+            for field in restoration_fields}
+        independent_root_replay_exact = all(repeat_equal.values())
         noise_exact = (
             candidate_a["metadata_json"]["candidate_noise_sha256"]
             == candidate_b["metadata_json"]["candidate_noise_sha256"])
@@ -583,13 +586,24 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
             and metadata_b["exact_sim_state_validated"]
             and metadata_a["parent_replay_source"] == "stored_source_trajectory"
             and metadata_b["parent_replay_source"] == "stored_source_trajectory"
-            and restoration_exact and noise_exact)
+            and metadata_a["parent_replay_actions_sha256"]
+            == metadata_b["parent_replay_actions_sha256"]
+            and noise_exact)
         report = {
             "strategy": item["strategy"], "suite": item["suite"],
             "task_idx": item["task_idx"], "episode_idx": item["episode_idx"],
             "chunk_idx": item["chunk_idx"], "policy_chunk_max_abs": policy_error,
             "env_chunk_max_abs": env_error,
-            "root_restoration_exact": bool(restoration_exact),
+            "branch_restore_max_abs": float(max(
+                metadata_a["replay_state_max_abs_after_correction"],
+                metadata_b["replay_state_max_abs_after_correction"])),
+            "parent_actions_repeat_exact": bool(
+                repeat_equal["parent_replay_actions_sha256"]),
+            "root_sim_repeat_exact": bool(
+                repeat_equal["root_sim_state_sha256"]),
+            "root_policy_input_repeat_exact": bool(
+                repeat_equal["root_policy_input_sha256"]),
+            "independent_root_replay_exact": bool(independent_root_replay_exact),
             "root_noise_exact": bool(noise_exact),
             "prediction_repeat_exact": bool(prediction_repeat_exact),
             "outcomes_match": bool(candidate_a["success"] == candidate_b["success"]),

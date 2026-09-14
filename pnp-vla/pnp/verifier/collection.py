@@ -504,7 +504,7 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         ep.get("benchmark", "libero"), ep["suite"], ep["task_idx"],
         ep.get("ep_idx", ep.get("episode_idx", 0)), chunk_idx, namespace=experiment,
         trajectory_seed=trajectory_seed)
-    candidates, replay_state_errors = [], []
+    candidates, replay_state_errors, post_correction_errors = [], [], []
     for kind in policy_chunks:
         branch_obs = _reset_and_replay_actions(env, ep, policy, replay_actions)
         if branch_obs is None:
@@ -528,6 +528,10 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                 corrected_error = float(np.max(np.abs(corrected - canonical_state)))
                 raise RuntimeError(
                     f"sim state correction failed (max_abs={corrected_error:.3g})")
+        final_branch_state = np.asarray(branch_sim.get_state().flatten())
+        post_correction_error = float(np.max(np.abs(
+            final_branch_state - canonical_state)))
+        post_correction_errors.append(post_correction_error)
         success, n_steps = _run_continuation(
             env, branch_obs, ep, policy, preprocess, postprocess, device,
             prefix=env_chunks[kind][:prefix_length], branch_seed=seed ^ 0x51A7,
@@ -539,6 +543,7 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
             "metadata_json": {
                 "source_episode_seed": seed, "chunk_idx": chunk_idx,
                 "replay_state_max_abs_before_correction": replay_state_error,
+                "replay_state_max_abs_after_correction": post_correction_error,
                 "sim_state_corrected": state_corrected,
                 "denoise_steps": candidate_steps[kind],
                 "executed_prefix_length": int(prefix_length),
@@ -565,7 +570,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         "metadata_json": {
                           "replay_validated": not any(
                               error > state_atol for error in replay_state_errors),
-                          "exact_sim_state_validated": True,
+                          "exact_sim_state_validated": not any(
+                              error > state_atol for error in post_correction_errors),
                           "state_initialization": (
                               "replay_plus_sim_correction" if any(
                                   error > state_atol for error in replay_state_errors)
@@ -574,6 +580,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                               error > state_atol for error in replay_state_errors),
                           "replay_state_max_abs_before_correction": max(
                               replay_state_errors, default=0.0),
+                          "replay_state_max_abs_after_correction": max(
+                              post_correction_errors, default=0.0),
                           "replay_action_count": len(replay_actions),
                           "parent_replay_source": replay_source,
                           "parent_replay_actions_sha256": _content_digest(
