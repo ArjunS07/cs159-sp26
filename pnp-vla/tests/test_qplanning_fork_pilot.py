@@ -13,6 +13,7 @@ from pnp.qplanning_fork_pilot import (
     FORK_PILOT_STRATEGIES,
     FORK_PILOT_TRAIN_PRIORITY_FRACTION,
     FORK_PILOT_TREES_PER_STRATEGY,
+    _trajectory_actions_from_payload,
     _validate_manifest,
     build_fixed_fork_manifest,
     u20_profile_from_ahats,
@@ -33,6 +34,14 @@ def test_u20_profile_uses_first_twenty_action_positions_and_probe_mean():
     )
     profile = u20_profile_from_ahats(payload.getvalue())
     assert profile == (11.5, 3.0)
+
+
+def test_compact_source_trajectory_actions_are_lossless():
+    payload = BytesIO()
+    actions = np.arange(140, dtype=np.float32).reshape(20, 7)
+    np.savez_compressed(payload, actions=actions, robot_state=np.zeros((20, 8)))
+    loaded = _trajectory_actions_from_payload(payload.getvalue())
+    np.testing.assert_array_equal(loaded, actions)
 
 
 def _source_fixture():
@@ -65,6 +74,7 @@ def test_fixed_manifest_has_equal_tree_budgets_and_balanced_shards():
     payload = first["payload"]
     assert payload["candidate_count"] == FORK_PILOT_CANDIDATES == 9
     assert payload["future_training_priority_fraction"] == 0.65
+    assert "exact stored source-trajectory" in payload["source_scope"]
     counts = Counter(item["strategy"] for item in payload["trees"])
     assert counts == Counter({strategy: FORK_PILOT_TREES_PER_STRATEGY
                               for strategy in FORK_PILOT_STRATEGIES})

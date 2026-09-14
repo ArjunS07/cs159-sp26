@@ -27,9 +27,9 @@ from .verifier.collection import (
     candidate_group_id, collect_replay_candidate_group)
 
 
-FORK_PILOT_VERSION = 1
+FORK_PILOT_VERSION = 2
 FORK_PILOT_SNAPSHOT_ID = "pcpcds-98d1f32dff8213841529b3c6"
-FORK_PILOT_MANIFEST_PATH = "qplanning_forks/manifests/fixed_three_priority_v1.json"
+FORK_PILOT_MANIFEST_PATH = "qplanning_forks/manifests/fixed_three_priority_v2.json"
 FORK_PILOT_STRATEGIES = ("random", "u20", "failure")
 FORK_PILOT_TREES_PER_STRATEGY = 64
 FORK_PILOT_CANDIDATES = 9
@@ -199,7 +199,8 @@ def build_fixed_fork_manifest(source_rows: list[dict], profiles: dict[str, tuple
         "future_training_priority_fraction": FORK_PILOT_TRAIN_PRIORITY_FRACTION,
         "source_scope": (
             "Q-planning snapshot training split; LIBERO-PRO train suites only; "
-            "position and ten-state behavior-seed suites excluded"),
+            "position and ten-state behavior-seed suites excluded; roots restored "
+            "from exact stored source-trajectory environment actions"),
         "trees": trees,
     }
     manifest_hash = _digest(payload)
@@ -327,6 +328,41 @@ def _episode_lookup(items: list[dict]):
     return lookup
 
 
+def _trajectory_actions_from_payload(payload: bytes) -> np.ndarray:
+    """Read the compact trajectory artifact used for exact parent replay."""
+    with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+        if "actions" not in archive.files:
+            raise ValueError("source trajectory artifact has no actions array")
+        actions = np.asarray(archive["actions"], dtype=np.float32).copy()
+    if actions.ndim != 2 or actions.shape[1] != 7 or not np.isfinite(actions).all():
+        raise ValueError(f"invalid source environment actions {actions.shape}")
+    return actions
+
+
+def _load_source_replay_actions(store, items: list[dict]) -> dict[str, np.ndarray]:
+    """Download each tiny source trajectory once and retain its exact env actions."""
+    rollout_ids = sorted({str(item["source_rollout_id"]) for item in items})
+    rows = []
+    for start in range(0, len(rollout_ids), 100):
+        batch = rollout_ids[start:start + 100]
+        rows.extend(store.fetch_all(
+            "rollouts", "rollout_id,trajectory_path",
+            configure=lambda query, batch=batch: query.in_("rollout_id", batch),
+            order_by=("rollout_id",)))
+    paths = {str(row["rollout_id"]): row.get("trajectory_path") for row in rows}
+    missing = [rollout_id for rollout_id in rollout_ids if not paths.get(rollout_id)]
+    if missing:
+        raise ValueError(
+            f"fork roots require compact source trajectories; missing {missing[:3]}")
+    result = {}
+    for index, rollout_id in enumerate(rollout_ids, 1):
+        result[rollout_id] = _trajectory_actions_from_payload(
+            _download_with_retry(store, paths[rollout_id]))
+        if index % 10 == 0 or index == len(rollout_ids):
+            print(f"[qfork] source trajectories: {index}/{len(rollout_ids)}", flush=True)
+    return result
+
+
 def _group_id(item: dict) -> str:
     return candidate_group_id(
         "libero_pro", item["suite"], item["task_idx"], item["episode_idx"],
@@ -410,6 +446,7 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
         return {"new_trees": 0, "requested_trees": len(items), "complete": len(complete)}
 
     lookup = _episode_lookup(items)
+    source_replay_actions = _load_source_replay_actions(store, pending)
     policy, preprocess, postprocess = models.load_pi05()
     device = models.default_device()
     policy.model._pnp.num_steps = FORK_PILOT_STOCK_DENOISE_STEPS
@@ -445,7 +482,10 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
                     manifest_hash=document["manifest_hash"],
                     model_revision=payload["policy_revision"],
                     n_action_steps=FORK_PILOT_EXECUTED_ACTIONS,
-                    candidate_num_inference_steps=FORK_PILOT_PROPOSAL_DENOISE_STEPS)
+                    candidate_num_inference_steps=FORK_PILOT_PROPOSAL_DENOISE_STEPS,
+                    replay_actions_override=source_replay_actions[
+                        item["source_rollout_id"]][
+                            :int(item["chunk_idx"]) * FORK_PILOT_EXECUTED_ACTIONS])
             finally:
                 env.close()
             if result is None:
@@ -491,6 +531,7 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
     roots = [next(item for item in payload["trees"] if item["strategy"] == strategy)
              for strategy in FORK_PILOT_STRATEGIES]
     lookup = _episode_lookup(roots)
+    source_replay_actions = _load_source_replay_actions(store, roots)
     policy, preprocess, postprocess = models.load_pi05()
     device = models.default_device()
     policy.model._pnp.num_steps = FORK_PILOT_STOCK_DENOISE_STEPS
@@ -509,7 +550,10 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
                     experiment=item["experiment"], collection_split="restoration_preflight",
                     manifest_hash=document["manifest_hash"],
                     model_revision=payload["policy_revision"],
-                    n_action_steps=FORK_PILOT_EXECUTED_ACTIONS)
+                    n_action_steps=FORK_PILOT_EXECUTED_ACTIONS,
+                    replay_actions_override=source_replay_actions[
+                        item["source_rollout_id"]][
+                            :int(item["chunk_idx"]) * FORK_PILOT_EXECUTED_ACTIONS])
                 if result is None:
                     raise RuntimeError("preflight source terminated before selected root")
                 runs.append(result)
@@ -523,17 +567,33 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
         env_error = float(np.max(np.abs(
             candidate_a["blobs"]["env_chunk"]["actions"]
             - candidate_b["blobs"]["env_chunk"]["actions"])))
+        metadata_a = group_a["metadata_json"]
+        metadata_b = group_b["metadata_json"]
+        restoration_fields = (
+            "parent_replay_actions_sha256", "root_sim_state_sha256",
+            "root_policy_input_sha256")
+        restoration_exact = all(
+            metadata_a[field] == metadata_b[field] for field in restoration_fields)
+        noise_exact = (
+            candidate_a["metadata_json"]["candidate_noise_sha256"]
+            == candidate_b["metadata_json"]["candidate_noise_sha256"])
+        prediction_repeat_exact = policy_error <= 1e-6 and env_error <= 1e-6
         passed = (
-            group_a["metadata_json"]["exact_sim_state_validated"]
-            and group_b["metadata_json"]["exact_sim_state_validated"]
-            and policy_error <= 1e-6 and env_error <= 1e-6
-            and candidate_a["success"] == candidate_b["success"]
-            and candidate_a["n_steps"] == candidate_b["n_steps"])
+            metadata_a["exact_sim_state_validated"]
+            and metadata_b["exact_sim_state_validated"]
+            and metadata_a["parent_replay_source"] == "stored_source_trajectory"
+            and metadata_b["parent_replay_source"] == "stored_source_trajectory"
+            and restoration_exact and noise_exact)
         report = {
             "strategy": item["strategy"], "suite": item["suite"],
             "task_idx": item["task_idx"], "episode_idx": item["episode_idx"],
             "chunk_idx": item["chunk_idx"], "policy_chunk_max_abs": policy_error,
             "env_chunk_max_abs": env_error,
+            "root_restoration_exact": bool(restoration_exact),
+            "root_noise_exact": bool(noise_exact),
+            "prediction_repeat_exact": bool(prediction_repeat_exact),
+            "outcomes_match": bool(candidate_a["success"] == candidate_b["success"]),
+            "step_counts_match": bool(candidate_a["n_steps"] == candidate_b["n_steps"]),
             "outcome": bool(candidate_a["success"]),
             "n_steps": int(candidate_a["n_steps"]), "passed": bool(passed),
         }

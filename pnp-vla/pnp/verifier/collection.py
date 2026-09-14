@@ -35,6 +35,34 @@ def _unwrap_sim(env):
     raise TypeError("environment does not expose a MuJoCo sim")
 
 
+def _content_digest(value) -> str:
+    """Stable diagnostic hash for nested policy inputs and replay arrays."""
+    digest = hashlib.sha256()
+
+    def update(item):
+        if torch.is_tensor(item):
+            item = (item.detach().to("cpu", torch.float32) if item.is_floating_point()
+                    else item.detach().cpu()).numpy()
+        if isinstance(item, np.ndarray):
+            array = np.ascontiguousarray(item)
+            digest.update(f"array:{array.dtype}:{array.shape}".encode())
+            digest.update(array.tobytes())
+        elif isinstance(item, dict):
+            digest.update(b"dict")
+            for key in sorted(item):
+                digest.update(str(key).encode())
+                update(item[key])
+        elif isinstance(item, (list, tuple)):
+            digest.update(f"sequence:{len(item)}".encode())
+            for child in item:
+                update(child)
+        else:
+            digest.update(repr(item).encode())
+
+    update(value)
+    return digest.hexdigest()
+
+
 def candidate_group_id(benchmark, suite, task_idx, episode_idx, chunk_idx, *, namespace="",
                        trajectory_seed=None) -> str:
     identity = f"{benchmark}|{suite}|{task_idx}|{episode_idx}|{chunk_idx}"
@@ -390,7 +418,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                                    manifest_hash: str = "",
                                    model_revision: str = "",
                                    n_action_steps: int | None = None,
-                                   candidate_num_inference_steps: int | None = None):
+                                   candidate_num_inference_steps: int | None = None,
+                                   replay_actions_override: np.ndarray | None = None):
     """Collect candidates at a mid-rollout state by deterministic action replay.
 
     Unlike simulator snapshots, replay reconstructs wrapper state, contacts, and
@@ -405,32 +434,50 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
     steps = 0
     chunk_stride = int(n_action_steps or policy.config.chunk_size)
     est_chunks = max(1, round(ep["max_steps"] / chunk_stride))
-    for ci in range(chunk_idx):
-        # Do not inherit time conditioning from a previous tree/branch. This
-        # is the same boundary position used by run_episode for a 10-action
-        # receding-horizon rollout.
-        policy.model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
-        batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
-        noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, ci))
-        chunk, _ = predict_clean_chunk(policy, batch, noise)
-        env_chunk = postprocess_chunk(chunk.squeeze(0).detach().cpu().numpy(), postprocess, device)
-        replay_chunk = (env_chunk if n_action_steps is None
-                        else env_chunk[:int(n_action_steps)])
-        for action in replay_chunk:
+    if replay_actions_override is not None:
+        supplied = np.asarray(replay_actions_override, dtype=np.float32)
+        expected = int(chunk_idx) * chunk_stride
+        if supplied.ndim != 2 or supplied.shape != (expected, 7):
+            raise ValueError(
+                f"stored parent replay must have shape ({expected}, 7), got {supplied.shape}")
+        replay_source = "stored_source_trajectory"
+        for action in supplied:
             obs, _, done, _ = env.step(action)
             replay_actions.append(action.copy()); steps += 1
             if env.check_success() or done:
                 return None
+    else:
+        replay_source = "regenerated_policy"
+        for ci in range(chunk_idx):
+            # Do not inherit time conditioning from a previous tree/branch. This
+            # is the same boundary position used by run_episode for a 10-action
+            # receding-horizon rollout.
+            policy.model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
+            batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
+            noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, ci))
+            chunk, _ = predict_clean_chunk(policy, batch, noise)
+            env_chunk = postprocess_chunk(
+                chunk.squeeze(0).detach().cpu().numpy(), postprocess, device)
+            replay_chunk = (env_chunk if n_action_steps is None
+                            else env_chunk[:int(n_action_steps)])
+            for action in replay_chunk:
+                obs, _, done, _ = env.step(action)
+                replay_actions.append(action.copy()); steps += 1
+                if env.check_success() or done:
+                    return None
 
     _, canonical_sim = _unwrap_sim(env)
     canonical_sim_state = copy.deepcopy(canonical_sim.get_state())
     canonical_state = np.asarray(canonical_sim_state.flatten()).copy()
     policy.model._pnp.chunk_pos = min(chunk_idx / est_chunks, 1.0)
-    batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
+    policy_observation = obs_to_policy(obs, ep["task_desc"])
+    batch = preprocess(policy_observation)
+    root_policy_input_digest = _content_digest(batch)
     policy_chunks = {}
     obs_enc = None
     previous_num_steps = policy.model._pnp.num_steps
     candidate_steps = {}
+    candidate_noise_digests = {}
     try:
         for index in range(candidate_count):
             kind = "default" if index == 0 else f"fresh_noise_{index}"
@@ -441,6 +488,7 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                 requested_steps or getattr(policy.config, "num_inference_steps", 10))
             noise_index = chunk_idx if index == 0 else chunk_idx * 1000 + index
             noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, noise_index))
+            candidate_noise_digests[kind] = _content_digest(noise)
             chunk, captured = predict_clean_chunk(
                 policy, batch, noise, capture_context=(index == 0))
             if captured is not None:
@@ -494,6 +542,7 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                 "sim_state_corrected": state_corrected,
                 "denoise_steps": candidate_steps[kind],
                 "executed_prefix_length": int(prefix_length),
+                "candidate_noise_sha256": candidate_noise_digests[kind],
             },
             "blobs": {
                 "policy_chunk": {"actions": policy_chunks[kind]},
@@ -526,6 +575,11 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                           "replay_state_max_abs_before_correction": max(
                               replay_state_errors, default=0.0),
                           "replay_action_count": len(replay_actions),
+                          "parent_replay_source": replay_source,
+                          "parent_replay_actions_sha256": _content_digest(
+                              np.asarray(replay_actions, dtype=np.float32)),
+                          "root_sim_state_sha256": _content_digest(canonical_state),
+                          "root_policy_input_sha256": root_policy_input_digest,
                           "chunk_position": float(policy.model._pnp.chunk_pos),
                           "trajectory_seed": trajectory_seed,
                           "collection_split": collection_split,

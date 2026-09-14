@@ -352,7 +352,8 @@ design above. The manifest contains exactly 64 trees for each of three pre-outco
 uniform random, highest four-boundary U20, and failed-source-episode priority. It uses only the
 immutable snapshot's training split and only non-position PRO training suites. The two ten-state
 milk suites are excluded from this pilot so every selected source trajectory uses behavior seed
-zero and can be replayed exactly; the position-perturbation evaluation category remains excluded.
+zero; roots are reconstructed from the exact stored environment actions rather than regenerated
+policy predictions. The position-perturbation evaluation category remains excluded.
 
 Every root stores one ordinary 10-integration-step stock candidate and eight three-step proposal
 candidates. Each branch executes ten actions and then continues with the ordinary ten-step policy;
