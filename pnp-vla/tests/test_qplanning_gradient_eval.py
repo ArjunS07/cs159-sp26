@@ -8,8 +8,8 @@ import torch
 from pnp.config import ALL_METHODS, Method
 from pnp.qplanning_critic.inference import direct_latent_q_update
 from pnp.qplanning_gradient_eval_experiment import (
-    QGUIDE_DENOISE_STEPS, QGUIDE_EULER_STEP, QGUIDE_METHODS,
-    QGUIDE_UPDATE_RMS, build_qguide_method)
+    QGUIDE_DENOISE_STEPS, QGUIDE_EULER_STEP, QGUIDE_FIVE_SHARDS,
+    QGUIDE_METHODS, QGUIDE_UPDATE_RMS, build_qguide_method)
 
 
 ROOT = Path(__file__).parents[1]
@@ -85,3 +85,35 @@ def test_notebook_75_runs_three_guides_with_historical_stock():
             assert cell["execution_count"] is None
             assert cell["outputs"] == []
             ast.parse("".join(cell["source"]), filename=f"{path.name}:cell{index}")
+
+
+def test_worker_76_is_four_shards_times_five_guides_with_split_download_contract():
+    assert QGUIDE_FIVE_SHARDS == 4
+    for worker in range(4):
+        path = (
+            ROOT / "notebooks" / "workers"
+            / f"76_eval_q50_latent_guidance_five_worker_{worker}.ipynb")
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"])
+        assert f"SHARD_INDEX = {worker}" in source
+        assert "SHARD_COUNT = 4" in source
+        assert "EPISODE_LIMIT = None" in source
+        assert "new_rollouts': 200" in source
+        assert "periodic_print_every_complete_identities': 10" in source
+        assert "exact matched notebook-68 outcomes" in source
+        assert "run_qplanning_latent_guidance_heldout160(" in source
+        for argument in (
+                "original_checkpoint_path", "failure_checkpoint_path",
+                "episode_u20_checkpoint_path", "u20_4chunk_checkpoint_path",
+                "u20_8chunk_checkpoint_path"):
+            assert argument in source
+        assert ("hf_hub_download" in source) == (worker < 2)
+        assert ("drive.mount" in source) == (worker >= 2)
+        for index, cell in enumerate(notebook["cells"]):
+            if cell["cell_type"] == "code":
+                assert cell["execution_count"] is None
+                assert cell["outputs"] == []
+                ast.parse(
+                    "".join(cell["source"]),
+                    filename=f"{path.name}:cell{index}")

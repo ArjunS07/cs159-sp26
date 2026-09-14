@@ -1,6 +1,6 @@
 # Q-Planning Corrector: Experiment Log v2
 
-Last updated: 2026-09-12
+Last updated: 2026-09-14
 
 This is the current team handoff for the Q-Planning-inspired corrector work. It records what was
 implemented, what was run, what happened, and which follow-ups are in progress. It supersedes the
@@ -13,7 +13,9 @@ older `qplanning_corrector_training_plan.md`.
 | Q10/Q50 offline critics | Completed | Trained successfully on the immutable mixed LIBERO dataset |
 | Matched OOD PRO160 evaluation | Completed | Net neutral/slightly negative versus stock; no demonstrated SR benefit |
 | Q50 + future-U20 auxiliary head | Trained; evaluation stopped early | All tested uncertainty coefficients were degrading SR during the partial run |
-| Failure/U20-prioritized replay | Training in progress | Four fresh Q50 arms split across notebooks 72 |
+| Failure/U20-prioritized replay | Completed at 6,000 updates | Four fresh Q50 arms trained from step zero in notebooks 72 |
+| Priority-critic top-16 planning | Evaluation stopped early | Failure and four-chunk-U20 critics degraded early-suite SR during the partial notebook-74 run |
+| Five-critic latent guidance | Ready to run | Four notebook-76 shards compare the original Q50 and all four priority critics on the frozen PRO160 set |
 | LIBERO-only Q50 base | Completed | Notebook 73 trained the base checkpoint for a staged LIBERO → PRO continual experiment; staged adaptation has not been run |
 | Paper-style continual/online replay | Not yet implemented | Candidate next stage after replay-priority results |
 
@@ -207,7 +209,7 @@ accuracy continued to degrade. Treat this as a negative preliminary screen, not 
 effect estimate. It suggests that an episode-risk auxiliary target does not automatically produce
 candidate-level counterfactual rankings that are safe to optimize at inference.
 
-## Experiment 3: prioritized replay, currently running
+## Experiment 3: prioritized replay and deployment tests
 
 Notebooks 72 train four ordinary Q50 critics from step zero. Architecture, Bellman targets,
 optimizer, seed, 6,000-update stopping point, and validation split are fixed. These runs retain the
@@ -236,8 +238,21 @@ Files:
 - `notebooks/workers/72_train_q50_priority_worker_1.ipynb`
 - `pnp/qplanning_critic/replay_priority.py`
 
-These runs ask whether uncertainty is more useful for allocating critic-training updates than as
-a quantity directly optimized during candidate selection. No outcome is available yet.
+All four runs completed at 6,000 updates. They ask whether uncertainty is more useful for allocating
+critic-training updates than as a quantity directly optimized during candidate selection.
+
+Notebook 74 began a matched held-out PRO160 evaluation of the failure-prioritized and four-chunk-U20
+critics using the paper-style 64-candidate, top-16 Q-softmax planner. The run was canceled after both
+arms degraded stock SR across the early suites. This is a negative screen rather than a completed
+160-episode estimate.
+
+The next deployment test is deliberately different: notebooks 76 apply one normalized gradient-
+ascent update to the action latent at zero-based Euler step 3 of the ordinary 10-step decoder. The
+update has RMS 0.005; the VLA and critic weights remain frozen; the resulting 50-action chunk still
+executes only its first 10 actions. Four shards cover the frozen PRO160 partition, and every shard
+runs all five critics: original Q50, failure-prioritized, episode-U20-prioritized, four-chunk-U20,
+and eight-chunk-U20. Each worker therefore evaluates 40 matched identities x 5 critics = 200 new
+rollouts. Periodic output compares against the exact historical stock outcomes from notebook 68.
 
 ## Experiment 4: LIBERO-only base for staged adaptation
 
@@ -364,6 +379,9 @@ idea is only worth a brief later investigation rather than displacing the curren
 | Q50 + future-U20 training | `notebooks/70_train_qplanning_q50_u20.ipynb` |
 | Q50 + future-U20 evaluation | `notebooks/workers/71_eval_qplanning_q50_u20_heldout160_worker_*.ipynb` |
 | Replay-priority training | `notebooks/workers/72_train_q50_priority_worker_*.ipynb` |
+| Partial priority-critic top-16 evaluation | `notebooks/74_eval_q50_priority_heldout160.ipynb` |
+| Three-critic latent-guidance pilot | `notebooks/75_eval_q50_latent_guidance_heldout160.ipynb` |
+| Five-critic, four-shard latent-guidance evaluation | `notebooks/workers/76_eval_q50_latent_guidance_five_worker_*.ipynb` |
 | LIBERO-only base training | `notebooks/73_train_q50_libero_only_base.ipynb` |
 | Core Q model/training/inference | `pnp/qplanning_critic/` |
 | Replay-priority implementation | `pnp/qplanning_critic/replay_priority.py` |

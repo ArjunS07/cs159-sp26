@@ -14,6 +14,8 @@ from .qplanning_eval_experiment import (
 
 
 QGUIDE_EVAL_EXPERIMENT = "pi05-q50-latent-guidance-pro-heldout160-v1"
+QGUIDE_FIVE_EVAL_EXPERIMENT = "pi05-q50-latent-guidance-five-pro-heldout160-v1"
+QGUIDE_FIVE_SHARDS = 4
 QGUIDE_DENOISE_STEPS = 10
 QGUIDE_EULER_STEP = 3
 QGUIDE_UPDATE_RMS = 0.005
@@ -21,13 +23,20 @@ QGUIDE_ACTION_STEPS = 10
 QGUIDE_METHODS = {
     "original": Method.QGUIDE_Q50_ORIGINAL,
     "failure": Method.QGUIDE_Q50_PRIORITY_FAILURE,
+    "episode_u20": Method.QGUIDE_Q50_PRIORITY_EPISODE_U20,
     "u20_4chunk": Method.QGUIDE_Q50_PRIORITY_U20_4CHUNK,
+    "u20_8chunk": Method.QGUIDE_Q50_PRIORITY_U20_8CHUNK,
 }
 QGUIDE_REQUIRED_UPDATES = {
     "original": 8_000,
     "failure": 6_000,
+    "episode_u20": 6_000,
     "u20_4chunk": 6_000,
+    "u20_8chunk": 6_000,
 }
+QGUIDE_V1_STRATEGIES = ("original", "failure", "u20_4chunk")
+QGUIDE_FIVE_STRATEGIES = (
+    "original", "failure", "episode_u20", "u20_4chunk", "u20_8chunk")
 
 
 def build_qguide_method(strategy: str, source_id: str, scorer,
@@ -56,12 +65,16 @@ def run_qplanning_latent_guidance_heldout160(
         *, original_checkpoint_path: str | Path,
         failure_checkpoint_path: str | Path,
         u20_4chunk_checkpoint_path: str | Path,
+        episode_u20_checkpoint_path: str | Path | None = None,
+        u20_8chunk_checkpoint_path: str | Path | None = None,
+        shard_count: int = 1, shard_index: int = 0,
         episode_limit: int | None = None,
         update_rms: float = QGUIDE_UPDATE_RMS,
         experiment: str = QGUIDE_EVAL_EXPERIMENT):
-    """Run three frozen critics as single-latent Q guides; reuse matched stock."""
+    """Run three or five frozen critics as single-latent Q guides."""
     from . import models, sampler
     from .experiments import _run_collection
+    from .pcp_search.collection import manifest_shard
     from .store import SupabaseStore, gather_provenance
 
     if episode_limit is not None:
@@ -71,17 +84,58 @@ def run_qplanning_latent_guidance_heldout160(
         episode_limit = int(episode_limit)
     if not 0 < float(update_rms) <= 0.05:
         raise ValueError("update_rms must lie in (0, 0.05]")
+    five_critic = (
+        episode_u20_checkpoint_path is not None
+        or u20_8chunk_checkpoint_path is not None)
+    if five_critic and (
+            episode_u20_checkpoint_path is None
+            or u20_8chunk_checkpoint_path is None):
+        raise ValueError(
+            "five-critic evaluation requires both episode-U20 and 8-chunk-U20 checkpoints")
+    expected_shards = QGUIDE_FIVE_SHARDS if five_critic else 1
+    if (isinstance(shard_count, bool) or int(shard_count) != shard_count
+            or int(shard_count) != expected_shards):
+        raise ValueError(
+            f"{'five' if five_critic else 'three'}-critic evaluation requires "
+            f"shard_count={expected_shards}")
+    shard_count = int(shard_count)
+    if (isinstance(shard_index, bool) or int(shard_index) != shard_index
+            or not 0 <= int(shard_index) < shard_count):
+        raise ValueError(f"shard_index must lie in [0, {shard_count})")
+    shard_index = int(shard_index)
+    strategies = QGUIDE_FIVE_STRATEGIES if five_critic else QGUIDE_V1_STRATEGIES
 
     frozen, all_episodes = _qplanning_heldout_episodes()
-    episodes = all_episodes if episode_limit is None else all_episodes[:episode_limit]
-    if episode_limit is None and len(episodes) != QPLANNING_HELDOUT_IDENTITIES:
-        raise AssertionError("Q-guidance evaluation requires all 160 held-out identities")
+    if five_critic:
+        by_key = {
+            (episode["suite"], int(episode["task_idx"]), int(episode["ep_idx"])): episode
+            for episode in all_episodes}
+        shard_items = manifest_shard(frozen.items, shard_count, shard_index)
+        episodes = [
+            by_key[(item.suite, int(item.task_idx), int(item.init_state_index))]
+            for item in shard_items]
+        if len(episodes) != QPLANNING_HELDOUT_IDENTITIES // shard_count:
+            raise AssertionError("five-critic shard does not contain exactly 40 identities")
+    else:
+        episodes = list(all_episodes)
+    if episode_limit is not None:
+        episodes = episodes[:episode_limit]
+    if (episode_limit is None and len(episodes)
+            != QPLANNING_HELDOUT_IDENTITIES // shard_count):
+        raise AssertionError("Q-guidance evaluation has the wrong identity count")
 
     checkpoint_paths = {
         "original": Path(original_checkpoint_path).expanduser(),
         "failure": Path(failure_checkpoint_path).expanduser(),
         "u20_4chunk": Path(u20_4chunk_checkpoint_path).expanduser(),
     }
+    if five_critic:
+        checkpoint_paths.update({
+            "episode_u20": Path(episode_u20_checkpoint_path).expanduser(),
+            "u20_8chunk": Path(u20_8chunk_checkpoint_path).expanduser(),
+        })
+    checkpoint_paths = {
+        strategy: checkpoint_paths[strategy] for strategy in strategies}
     device = models.default_device()
     scorers = {
         strategy: load_qplanning_scorer(
@@ -94,18 +148,20 @@ def run_qplanning_latent_guidance_heldout160(
     if any(scorer.source_policy != expected_source for scorer in scorers.values()):
         raise ValueError("a Q-guidance critic was trained for a different source policy")
     if len({scorer.snapshot_id for scorer in scorers.values()}) != 1:
-        raise ValueError("all three critics must use the same immutable dataset snapshot")
+        raise ValueError("all critics must use the same immutable dataset snapshot")
     found_updates = {strategy: scorer.update for strategy, scorer in scorers.items()}
-    if found_updates != QGUIDE_REQUIRED_UPDATES:
+    required_updates = {
+        strategy: QGUIDE_REQUIRED_UPDATES[strategy] for strategy in strategies}
+    if found_updates != required_updates:
         raise ValueError(
-            f"Q-guidance requires checkpoints {QGUIDE_REQUIRED_UPDATES}; "
+            f"Q-guidance requires checkpoints {required_updates}; "
             f"found {found_updates}")
 
     source_id = f"{frozen.policy_repo_id}@{frozen.policy_revision}"
     methods = [
         build_qguide_method(strategy, source_id, scorers[strategy],
                             update_rms=update_rms)
-        for strategy in QGUIDE_METHODS]
+        for strategy in strategies]
     store = SupabaseStore()
     config_hashes = {
         method: store.config_hash(store._logical_key(method, config))
@@ -138,6 +194,8 @@ def run_qplanning_latent_guidance_heldout160(
         "heldout_category": "position_perturb",
         "target_identities": QPLANNING_HELDOUT_IDENTITIES,
         "evaluated_identities": len(episodes),
+        "shard_count": shard_count,
+        "shard_index": shard_index,
         "checkpoint_ids": {
             strategy: scorer.checkpoint_id for strategy, scorer in scorers.items()},
         "checkpoint_paths": {
@@ -160,11 +218,8 @@ def run_qplanning_latent_guidance_heldout160(
         "split": "same frozen position-perturbation PRO160 as notebook 68",
         "identities": len(episodes),
         "new_rollouts": len(episodes) * len(methods),
-        "arms": [
-            "latent guidance by original Q50",
-            "latent guidance by failure-priority Q50",
-            "latent guidance by 4-chunk-U20-priority Q50",
-        ],
+        "shard": f"{shard_index}/{shard_count}",
+        "arms": [f"latent guidance by {strategy} Q50" for strategy in strategies],
         "guidance": (
             f"one Q-ascent update at zero-based Euler step {QGUIDE_EULER_STEP}; "
             f"latent RMS={float(update_rms):g}"),
@@ -191,9 +246,11 @@ def run_qplanning_latent_guidance_heldout160(
     _run_collection(
         store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
         device=device, experiment=experiment, episodes=episodes, methods=methods,
-        cohort="q50_latent_guidance_pro_heldout160",
-        shard_count=1, shard_index=0, benchmark="libero_pro",
-        driver="pi05_q50_latent_guidance_pro_heldout160",
+        cohort=("q50_latent_guidance_five_pro_heldout160"
+                if five_critic else "q50_latent_guidance_pro_heldout160"),
+        shard_count=shard_count, shard_index=shard_index, benchmark="libero_pro",
+        driver=("pi05_q50_latent_guidance_five_pro_heldout160"
+                if five_critic else "pi05_q50_latent_guidance_pro_heldout160"),
         run_metadata=metadata,
         provenance=gather_provenance(
             model_repo_id=frozen.policy_repo_id,
@@ -211,6 +268,8 @@ def run_qplanning_latent_guidance_heldout160(
         "manifest_id": frozen.manifest_id,
         "identities_requested": len(episodes),
         "rollouts_requested": len(episodes) * len(methods),
+        "shard_count": shard_count,
+        "shard_index": shard_index,
         "checkpoint_ids": {
             strategy: scorer.checkpoint_id for strategy, scorer in scorers.items()},
         "config_hashes": config_hashes,
@@ -221,7 +280,7 @@ def run_qplanning_latent_guidance_heldout160(
 def validate_qplanning_latent_guidance_sentinel(
         *, checkpoint_ids: dict,
         experiment: str = QGUIDE_EVAL_EXPERIMENT, store=None) -> dict:
-    """Audit persisted settings and guidance telemetry for all three arms."""
+    """Audit persisted settings and guidance telemetry for requested arms."""
     from .store import SupabaseStore
 
     store = store or SupabaseStore()
@@ -232,7 +291,11 @@ def validate_qplanning_latent_guidance_sentinel(
             "status", "completed"),
         order_by=("rollout_id",))
     audits = {}
-    for strategy, method in QGUIDE_METHODS.items():
+    unknown = sorted(set(checkpoint_ids) - set(QGUIDE_METHODS))
+    if unknown:
+        raise ValueError(f"unknown Q-guidance strategies: {unknown}")
+    for strategy, checkpoint_id in checkpoint_ids.items():
+        method = QGUIDE_METHODS[strategy]
         matched = []
         for row in rows:
             if row.get("method") != method:
@@ -240,7 +303,7 @@ def validate_qplanning_latent_guidance_sentinel(
             config = row.get("config_json")
             if isinstance(config, str):
                 config = json.loads(config)
-            if (config or {}).get("q_guidance_ckpt_id") == checkpoint_ids[strategy]:
+            if (config or {}).get("q_guidance_ckpt_id") == checkpoint_id:
                 matched.append((row, config))
         if not matched:
             raise ValueError(f"no completed Q-guidance rollout for {strategy}")
