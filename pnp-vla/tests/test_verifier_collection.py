@@ -149,6 +149,21 @@ def test_run_continuation_replans_every_n_action_steps():
         def check_success(self):
             return False
 
+    class PNP:
+        chunk_pos = -1.0
+
+    class Model:
+        _pnp = PNP()
+
+    class Config:
+        chunk_size = 3
+
+    class Policy:
+        model = Model()
+        config = Config()
+
+    policy = Policy()
+
     chunk = torch.zeros((1, 3, 7))  # generated chunk_size = 3
     ep = {"task_desc": "t", "max_steps": 6}
     calls = {"predict": 0}
@@ -163,12 +178,23 @@ def test_run_continuation_replans_every_n_action_steps():
           patch.object(C, "postprocess_chunk", lambda arr, *a, **k: np.asarray(arr))):
         calls["predict"] = 0
         success, steps = C._run_continuation(
-            FakeEnv(), {}, ep, None, lambda o: o, lambda a: a, torch.device("cpu"),
+            FakeEnv(), {}, ep, policy, lambda o: o, lambda a: a, torch.device("cpu"),
             prefix=[], branch_seed=1, steps_already=0)
         assert not success and steps == 6 and calls["predict"] == 2  # replan every full chunk (3)
+        assert policy.model._pnp.chunk_pos == .5
 
         calls["predict"] = 0
-        success, steps = C._run_continuation(
-            FakeEnv(), {}, ep, None, lambda o: o, lambda a: a, torch.device("cpu"),
-            prefix=[], branch_seed=1, steps_already=0, n_action_steps=1)
-        assert not success and steps == 6 and calls["predict"] == 6  # replan every executed action
+        positions = []
+
+        def record_position(_policy, _batch, _noise):
+            calls["predict"] += 1
+            positions.append(_policy.model._pnp.chunk_pos)
+            return chunk, None
+
+        with patch.object(C, "predict_clean_chunk", record_position):
+            success, steps = C._run_continuation(
+                FakeEnv(), {}, ep, policy, lambda o: o, lambda a: a,
+                torch.device("cpu"), prefix=[], branch_seed=1,
+                steps_already=0, n_action_steps=1)
+        assert not success and steps == 6 and calls["predict"] == 6
+        assert positions == [0, 1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6]

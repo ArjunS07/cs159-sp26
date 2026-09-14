@@ -442,8 +442,11 @@ def _prepare_libero_pro_expanded_episodes(episodes_per_task=PRO_EXPANDED_EPISODE
         print("explicit frozen cohort includes historically 0%-SR suites: "
               f"{', '.join(zero_sr_in_cohort)}")
     else:
-        print(f"excluded (0% SR, no F->S transitions to learn from): "
-              f"{', '.join(libero_pro.ZERO_SR_PRO_SUITES)}")
+        # Absence does not imply that the caller excluded these suites because
+        # of their historical SR; many callers pass an explicit train/heldout
+        # suite partition. Keep this descriptive rather than asserting an
+        # obsolete selection rationale.
+        print("historically 0%-SR suites present in requested cohort: none")
     print(f"LIBERO-PRO expanded manifest: {len(episodes)} identities "
           f"across {len(suites)} suites")
     return episodes

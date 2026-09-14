@@ -316,6 +316,8 @@ def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
                       prefix, branch_seed, steps_already, n_action_steps=None):
     success = False
     steps = steps_already
+    chunk_stride = int(n_action_steps or policy.config.chunk_size)
+    est_chunks = max(1, round(ep["max_steps"] / chunk_stride))
     for action in prefix:
         obs, _, done, _ = env.step(action)
         steps += 1
@@ -326,6 +328,11 @@ def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
     queue, replan = [], 0
     while steps < ep["max_steps"]:
         if not queue:
+            # Match run_episode's time conditioning. Derive it from the
+            # environment step count so every independently restored branch is
+            # insensitive to whatever chunk_pos a previous branch left behind.
+            chunk_index = steps // chunk_stride
+            policy.model._pnp.chunk_pos = min(chunk_index / est_chunks, 1.0)
             batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
             noise = _draw_chunk_noise(policy, device, chunk_noise_seed(branch_seed, replan))
             chunk, _ = predict_clean_chunk(policy, batch, noise)
@@ -383,7 +390,13 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
     obs = _reset_and_replay_actions(env, ep, policy, [])
     replay_actions = []
     steps = 0
+    chunk_stride = int(n_action_steps or policy.config.chunk_size)
+    est_chunks = max(1, round(ep["max_steps"] / chunk_stride))
     for ci in range(chunk_idx):
+        # Do not inherit time conditioning from a previous tree/branch. This
+        # is the same boundary position used by run_episode for a 10-action
+        # receding-horizon rollout.
+        policy.model._pnp.chunk_pos = min(ci / est_chunks, 1.0)
         batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
         noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, ci))
         chunk, _ = predict_clean_chunk(policy, batch, noise)
@@ -399,8 +412,6 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
     _, canonical_sim = _unwrap_sim(env)
     canonical_sim_state = copy.deepcopy(canonical_sim.get_state())
     canonical_state = np.asarray(canonical_sim_state.flatten()).copy()
-    chunk_stride = int(n_action_steps or policy.config.chunk_size)
-    est_chunks = max(1, round(ep["max_steps"] / chunk_stride))
     policy.model._pnp.chunk_pos = min(chunk_idx / est_chunks, 1.0)
     batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
     policy_chunks = {}
