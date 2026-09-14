@@ -369,7 +369,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                                    collection_split: str = "development",
                                    manifest_hash: str = "",
                                    model_revision: str = "",
-                                   n_action_steps: int | None = None):
+                                   n_action_steps: int | None = None,
+                                   candidate_num_inference_steps: int | None = None):
     """Collect candidates at a mid-rollout state by deterministic action replay.
 
     Unlike simulator snapshots, replay reconstructs wrapper state, contacts, and
@@ -387,7 +388,9 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, ci))
         chunk, _ = predict_clean_chunk(policy, batch, noise)
         env_chunk = postprocess_chunk(chunk.squeeze(0).detach().cpu().numpy(), postprocess, device)
-        for action in env_chunk:
+        replay_chunk = (env_chunk if n_action_steps is None
+                        else env_chunk[:int(n_action_steps)])
+        for action in replay_chunk:
             obs, _, done, _ = env.step(action)
             replay_actions.append(action.copy()); steps += 1
             if env.check_success() or done:
@@ -396,21 +399,32 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
     _, canonical_sim = _unwrap_sim(env)
     canonical_sim_state = copy.deepcopy(canonical_sim.get_state())
     canonical_state = np.asarray(canonical_sim_state.flatten()).copy()
-    chunk_size = policy.config.chunk_size
-    est_chunks = max(1, round(ep["max_steps"] / chunk_size))
+    chunk_stride = int(n_action_steps or policy.config.chunk_size)
+    est_chunks = max(1, round(ep["max_steps"] / chunk_stride))
     policy.model._pnp.chunk_pos = min(chunk_idx / est_chunks, 1.0)
     batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
     policy_chunks = {}
     obs_enc = None
-    for index in range(candidate_count):
-        kind = "default" if index == 0 else f"fresh_noise_{index}"
-        noise_index = chunk_idx if index == 0 else chunk_idx * 1000 + index
-        noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, noise_index))
-        chunk, captured = predict_clean_chunk(
-            policy, batch, noise, capture_context=(index == 0))
-        if captured is not None:
-            obs_enc = captured
-        policy_chunks[kind] = chunk.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    previous_num_steps = policy.model._pnp.num_steps
+    candidate_steps = {}
+    try:
+        for index in range(candidate_count):
+            kind = "default" if index == 0 else f"fresh_noise_{index}"
+            requested_steps = (previous_num_steps if index == 0
+                               else candidate_num_inference_steps)
+            policy.model._pnp.num_steps = requested_steps
+            effective_steps = int(
+                requested_steps or getattr(policy.config, "num_inference_steps", 10))
+            noise_index = chunk_idx if index == 0 else chunk_idx * 1000 + index
+            noise = _draw_chunk_noise(policy, device, chunk_noise_seed(seed, noise_index))
+            chunk, captured = predict_clean_chunk(
+                policy, batch, noise, capture_context=(index == 0))
+            if captured is not None:
+                obs_enc = captured
+            policy_chunks[kind] = chunk.squeeze(0).detach().cpu().numpy().astype(np.float32)
+            candidate_steps[kind] = effective_steps
+    finally:
+        policy.model._pnp.num_steps = previous_num_steps
     env_chunks = {kind: postprocess_chunk(chunk, postprocess, device)
                   for kind, chunk in policy_chunks.items()}
 
@@ -454,6 +468,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                 "source_episode_seed": seed, "chunk_idx": chunk_idx,
                 "replay_state_max_abs_before_correction": replay_state_error,
                 "sim_state_corrected": state_corrected,
+                "denoise_steps": candidate_steps[kind],
+                "executed_prefix_length": int(prefix_length),
             },
             "blobs": {
                 "policy_chunk": {"actions": policy_chunks[kind]},
@@ -492,6 +508,9 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                           "collection_manifest_hash": manifest_hash,
                           "model_revision": model_revision,
                           "candidate_count": candidate_count,
+                          "default_candidate_denoise_steps": candidate_steps.get("default"),
+                          "alternative_candidate_denoise_steps": candidate_num_inference_steps,
+                          "parent_replay_n_action_steps": n_action_steps,
                           "continuation_n_action_steps": n_action_steps},
     }
     return group, candidates

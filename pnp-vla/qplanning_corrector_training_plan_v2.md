@@ -16,6 +16,7 @@ older `qplanning_corrector_training_plan.md`.
 | Failure/U20-prioritized replay | Completed at 6,000 updates | Four fresh Q50 arms trained from step zero in notebooks 72 |
 | Priority-critic top-16 planning | Evaluation stopped early | Failure and four-chunk-U20 critics degraded early-suite SR during the partial notebook-74 run |
 | Five-critic latent guidance | Ready to run | Four notebook-76 shards compare the original Q50 and all four priority critics on the frozen PRO160 set |
+| Same-state fork acquisition pilot | Ready to run | Notebook 77 validates replay/restoration; four notebook-78 workers collect 64 random, 64 U20, and 64 failure-prioritized trees |
 | LIBERO-only Q50 base | Completed | Notebook 73 trained the base checkpoint for a staged LIBERO → PRO continual experiment; staged adaptation has not been run |
 | Paper-style continual/online replay | Not yet implemented | Candidate next stage after replay-priority results |
 
@@ -344,6 +345,24 @@ but it should be compared at matched simulator-transition cost against uniform a
 allocation. Candidate outcomes must never be used to select the state whose branches supply its
 training label.
 
+#### Implemented fixed-budget acquisition pilot
+
+Notebooks 77–79 implement a first acquisition screen alongside, rather than replacing, the bounded
+design above. The manifest contains exactly 64 trees for each of three pre-outcome root rules:
+uniform random, highest four-boundary U20, and failed-source-episode priority. It uses only the
+immutable snapshot's training split and only non-position PRO training suites. The two ten-state
+milk suites are excluded from this pilot so every selected source trajectory uses behavior seed
+zero and can be replayed exactly; the position-perturbation evaluation category remains excluded.
+
+Every root stores one ordinary 10-integration-step stock candidate and eight three-step proposal
+candidates. Each branch executes ten actions and then continues with the ordinary ten-step policy;
+matched continuation seeds are reused across alternatives. The existing verifier candidate-group
+tables persist root provenance, the complete source U20 profile, candidate chunks, replay-state
+correction telemetry, and terminal branch outcomes. Notebook 79 compares mixed-outcome-tree rate,
+any-branch oracle gain over the stock branch, suite effects, and selected U20. No fork-aware critic
+is trained by this pilot. If acquisition is informative, the declared follow-up training mix is
+65% selected tree replay and 35% ordinary replay.
+
 ### Longer-term: settings without an environment failure signal
 
 The Q-Planning paper notes settings without a readily available environment failure signal as a
@@ -382,6 +401,10 @@ idea is only worth a brief later investigation rather than displacing the curren
 | Partial priority-critic top-16 evaluation | `notebooks/74_eval_q50_priority_heldout160.ipynb` |
 | Three-critic latent-guidance pilot | `notebooks/75_eval_q50_latent_guidance_heldout160.ipynb` |
 | Five-critic, four-shard latent-guidance evaluation | `notebooks/workers/76_eval_q50_latent_guidance_five_worker_*.ipynb` |
+| Fork manifest and restoration preflight | `notebooks/77_qplanning_fork_pilot_preflight.ipynb` |
+| Fixed random/U20/failure fork collection | `notebooks/workers/78_collect_qplanning_fork_pilot_worker_*.ipynb` |
+| Fork acquisition analysis | `notebooks/79_analyze_qplanning_fork_pilot.ipynb` |
+| Fork pilot implementation | `pnp/qplanning_fork_pilot.py` |
 | LIBERO-only base training | `notebooks/73_train_q50_libero_only_base.ipynb` |
 | Core Q model/training/inference | `pnp/qplanning_critic/` |
 | Replay-priority implementation | `pnp/qplanning_critic/replay_priority.py` |
