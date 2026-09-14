@@ -97,6 +97,9 @@ class RolloutTap:
         self._chunk_idx = -1
         self._gradient_records: list[dict] = []
         self._gradient_action_gate_records: list[dict] = []
+        self._q_guidance_records: list[dict] = []
+        self._q_guidance_context = None
+        self._q_guidance_applied = 0
         self._action_postprocess = action_postprocess
         # correction telemetry (only when the action is a PCP correction)
         self._corr = CorrectTelemetry() if self._correcting else None
@@ -110,7 +113,8 @@ class RolloutTap:
     def invasive(self) -> bool:
         """Whether the action changes inference (drives the sampler's measure-only path)."""
         return (self.config.refine or self._correcting
-                or self.config.uncertainty_gradient_mode is not None)
+                or self.config.uncertainty_gradient_mode is not None
+                or self.config.q_guidance_ckpt_id is not None)
 
     @property
     def needs_baseline_fallback(self) -> bool:
@@ -119,11 +123,15 @@ class RolloutTap:
             (self.config.refine and (
                 self.config.refine_threshold is not None
                 or self.config.refine_start_chunk is not None))
-            or self.config.uncertainty_gradient_action_rms_max is not None)
+            or self.config.uncertainty_gradient_action_rms_max is not None
+            or self.config.q_guidance_ckpt_id is not None)
 
     def begin_chunk(self) -> None:
         self._chunk_idx += 1
         self._chunk_refine_applied = 0
+
+    def set_q_guidance_context(self, robot_state, policy_proprio) -> None:
+        self._q_guidance_context = (robot_state, policy_proprio)
 
     @property
     def chunk_intervened(self) -> bool:
@@ -149,6 +157,31 @@ class RolloutTap:
 
     def finalize_action(self, baseline_action, candidate_action):
         """Choose between exact-stock and candidate after both chunks are fully decoded."""
+        if self.config.q_guidance_ckpt_id is not None:
+            if self._q_guidance_applied < 1 or not self._q_guidance_records:
+                return baseline_action
+            horizon = min(10, baseline_action.shape[-2], candidate_action.shape[-2])
+            action_dim = min(self.adim, baseline_action.shape[-1], candidate_action.shape[-1])
+            policy_delta = (
+                candidate_action[..., :horizon, :action_dim]
+                - baseline_action[..., :horizon, :action_dim])
+            full_width = min(baseline_action.shape[-2], candidate_action.shape[-2])
+            full_policy_delta = (
+                candidate_action[..., :full_width, :action_dim]
+                - baseline_action[..., :full_width, :action_dim])
+            stock = self._environment_action(baseline_action, horizon)
+            candidate = self._environment_action(candidate_action, horizon)
+            motion_dim = min(6, self.adim, stock.shape[-1], candidate.shape[-1])
+            env_delta = candidate[..., :horizon, :motion_dim] - stock[..., :horizon, :motion_dim]
+            self._q_guidance_records[-1].update({
+                "final_first10_policy_action_rms": float(
+                    policy_delta.float().square().mean().sqrt()),
+                "final_full50_policy_action_rms": float(
+                    full_policy_delta.float().square().mean().sqrt()),
+                "final_first10_env_motion_rms": float(
+                    env_delta.float().square().mean().sqrt()),
+            })
+            return candidate_action
         threshold = self.config.uncertainty_gradient_action_rms_max
         if threshold is None:
             return candidate_action if self.chunk_intervened else baseline_action
@@ -186,12 +219,29 @@ class RolloutTap:
         return candidate_action if accepted else baseline_action
 
     def selected(self, step: int, s: float) -> bool:
+        if self.config.q_guidance_ckpt_id is not None:
+            return int(step) == int(self.config.q_guidance_step)
         return self.config.has_probe and self.config.probe_selected(step, s)
 
     def step(self, x_t, s, vf, ctx):
         cfg = self.config
         gradient_updated = None
         temporal_weights = None
+        if cfg.q_guidance_ckpt_id is not None:
+            if self._q_guidance_context is None:
+                raise RuntimeError("Q-guidance has no live robot/proprio context")
+            from .qplanning_critic.inference import direct_latent_q_update
+            robot_state, policy_proprio = self._q_guidance_context
+            updated, telemetry, _, _ = direct_latent_q_update(
+                x_t, s, vf, scorer=cfg.q_guidance_scorer,
+                prefix=ctx.prefix_embeddings, prefix_valid=ctx.prefix_pad_masks,
+                robot_state=robot_state, policy_proprio=policy_proprio,
+                step_size=float(cfg.q_guidance_step_size))
+            telemetry.update({
+                "chunk_idx": self._chunk_idx, "euler_step": int(ctx.step), "s": float(s)})
+            self._q_guidance_records.append(telemetry)
+            self._q_guidance_applied += 1
+            return updated
         if cfg.refine_prefix_only:
             temporal_weights = temporal_prefix_weights(
                 x_t.shape[-2], int(cfg.n_action_steps),
@@ -324,6 +374,33 @@ class RolloutTap:
                 "n_action_gate_accepted": sum(
                     row["accepted"] for row in self._gradient_action_gate_records),
             } if self.config.uncertainty_gradient_action_rms_max is not None else {}),
+        }
+
+    @property
+    def q_guidance_telemetry(self):
+        if self.config.q_guidance_ckpt_id is None:
+            return None
+        records = list(self._q_guidance_records)
+        if not records:
+            return {"records": [], "n_updates": 0}
+
+        def mean(field):
+            values = [row[field] for row in records if field in row]
+            return sum(values) / len(values) if values else None
+
+        return {
+            "records": records,
+            "n_updates": len(records),
+            "mean_pre_q": mean("pre_q"),
+            "mean_post_q": mean("post_q"),
+            "mean_delta_q": mean("delta_q"),
+            "mean_update_rms": mean("update_rms"),
+            "mean_first10_policy_action_rms": mean(
+                "final_first10_policy_action_rms"),
+            "mean_full50_policy_action_rms": mean(
+                "final_full50_policy_action_rms"),
+            "mean_first10_env_motion_rms": mean(
+                "final_first10_env_motion_rms"),
         }
 
     @property

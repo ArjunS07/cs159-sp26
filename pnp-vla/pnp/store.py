@@ -530,6 +530,9 @@ class SupabaseStore:
         if result.get("uncertainty_gradient_telemetry"):
             row["ms_candidate_u"] = {
                 "uncertainty_gradient": result["uncertainty_gradient_telemetry"]}
+        if result.get("q_guidance_telemetry"):
+            row["ms_candidate_u"] = {
+                "q_guidance": result["q_guidance_telemetry"]}
         if result.get("ms_selections"):
             sels = result["ms_selections"]
             row["ms_chosen_idx"] = sels[0]["chosen"]

@@ -80,6 +80,52 @@ class QPlanningScorer:
             values.append(value.float())
         return torch.cat(values)
 
+    def score_with_grad(self, prefix, prefix_valid, robot, proprio,
+                        actions) -> torch.Tensor:
+        """Differentiable one-batch Q score used only for latent guidance.
+
+        Critic parameters remain frozen; autograd is retained solely from Q
+        through the candidate action and the live flow latent that produced it.
+        """
+        actions = torch.as_tensor(actions, device=self.device)
+        if actions.ndim != 3:
+            raise ValueError("candidate actions must be [candidates, time, action_dim]")
+        n = len(actions)
+        horizon = self.horizon
+        action_dim = self.model.config.action_dim
+        if actions.shape[1] < horizon or actions.shape[2] < action_dim:
+            raise ValueError(
+                f"Q{horizon} needs [{horizon},{action_dim}] candidate actions, "
+                f"found {tuple(actions.shape[1:])}")
+        prefix = torch.as_tensor(prefix, device=self.device)
+        prefix_valid = torch.as_tensor(prefix_valid, device=self.device).bool()
+        if prefix.ndim == 2:
+            prefix = prefix[None]
+        if prefix_valid.ndim == 1:
+            prefix_valid = prefix_valid[None]
+        if len(prefix) != 1 or len(prefix_valid) != 1:
+            raise ValueError("online scorer expects one shared observation prefix")
+        robot = torch.as_tensor(
+            robot, device=self.device, dtype=torch.float32).reshape(1, -1)
+        proprio = torch.as_tensor(
+            proprio, device=self.device, dtype=torch.float32).reshape(1, -1)
+        if robot.shape[1] != self.model.robot_dim:
+            raise ValueError(
+                f"critic expects robot_dim={self.model.robot_dim}, found {robot.shape[1]}")
+        if proprio.shape[1] != self.model.proprio_dim:
+            raise ValueError(
+                f"critic expects proprio_dim={self.model.proprio_dim}, "
+                f"found {proprio.shape[1]}")
+        use_amp = self.device.type == "cuda" and torch.cuda.is_bf16_supported()
+        with torch.autocast(
+                device_type=self.device.type, dtype=torch.bfloat16,
+                enabled=use_amp):
+            return self.model.expected_value(
+                prefix.expand(n, -1, -1), prefix_valid.expand(n, -1),
+                robot.expand(n, -1), proprio.expand(n, -1),
+                actions[:, :horizon, :action_dim],
+                torch.ones((n, horizon), dtype=torch.bool, device=self.device))
+
 
 class _QPlanningPrefixTap:
     """Capture the live PI prefix while leaving candidate denoising unchanged."""
@@ -215,6 +261,65 @@ def _diversity_summary(actions: torch.Tensor, horizon: int, action_dim: int = 7)
         "max_pairwise_rms": float(rms[mask].max()),
         "mean_pairwise_cosine": float(cosine[mask].mean()),
     }
+
+
+def direct_latent_q_update(
+        x_t, s, vf, *, scorer: QPlanningScorer, prefix, prefix_valid,
+        robot_state, policy_proprio, step_size: float, checkpoint_vfield: bool = True):
+    """Take one equal-RMS ascent step on Q through the live denoising latent.
+
+    The VLA and critic weights are frozen. The critic scores the current clean
+    action estimate x - s*v(x,s) and autograd updates only x. A second clean
+    estimate measures whether that local update actually raised Q.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    def differentiable_vf(value):
+        if checkpoint_vfield:
+            return checkpoint(vf, value, use_reentrant=False)
+        return vf(value)
+
+    with torch.enable_grad():
+        x = x_t.detach().clone().requires_grad_(True)
+        clean = x - float(s) * differentiable_vf(x)
+        q_before = scorer.score_with_grad(
+            prefix, prefix_valid, robot_state, policy_proprio, clean)
+        gradient = torch.autograd.grad(q_before.sum(), x)[0]
+    if not bool(torch.isfinite(gradient).all()):
+        raise FloatingPointError("non-finite direct Q gradient")
+    gradient_rms = gradient.float().square().mean().sqrt().clamp_min(1e-12)
+    direction = gradient / gradient_rms.to(gradient.dtype)
+    updated = (x_t + float(step_size) * direction).detach()
+
+    with torch.no_grad():
+        post_clean = updated - float(s) * vf(updated)
+        q_after = scorer.score(
+            prefix, prefix_valid, robot_state, policy_proprio, post_clean,
+            batch_size=1)
+    pre_clean = clean.detach()
+    action_dim = int(scorer.model.config.action_dim)
+
+    def action_rms(horizon):
+        width = min(int(horizon), pre_clean.shape[1], post_clean.shape[1])
+        delta = (
+            post_clean[:, :width, :action_dim]
+            - pre_clean[:, :width, :action_dim])
+        return float(delta.float().square().mean().sqrt())
+
+    before = float(q_before.detach().float().mean())
+    after = float(q_after.detach().float().mean())
+    telemetry = {
+        "pre_q": before,
+        "post_q": after,
+        "delta_q": after - before,
+        "gradient_rms": float(gradient_rms),
+        "update_rms": float((updated - x_t).float().square().mean().sqrt()),
+        "first10_policy_action_rms": action_rms(10),
+        "full50_policy_action_rms": action_rms(50),
+        "gradient_finite": True,
+    }
+    del clean, q_before, gradient, direction, x
+    return updated, telemetry, pre_clean, post_clean.detach()
 
 
 def qplanning_select(policy, batch, candidate_noises: torch.Tensor, *,

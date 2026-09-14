@@ -178,7 +178,7 @@ def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int,
               action_postprocess=None):
     """A tap exists iff the rollout has a probe. Vanilla / extra_steps / multi-sample (which
     probes at the chunk level) run with no tap installed."""
-    if not config.has_probe:
+    if not config.has_probe and config.q_guidance_ckpt_id is None:
         return None
     return RolloutTap(config, recorder, device, adim, action_postprocess=action_postprocess)
 
@@ -491,6 +491,13 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                         queue_postprocess = postprocess
                 else:
                     batch = preprocess(policy_observation)
+                    if config.q_guidance_ckpt_id is not None:
+                        policy_proprio = policy_observation["observation.state"]
+                        if torch.is_tensor(policy_proprio):
+                            policy_proprio = policy_proprio.detach().cpu().numpy()
+                        tap.set_q_guidance_context(
+                            _raw_robot_state(obs),
+                            np.asarray(policy_proprio, dtype=np.float32))
                     with torch.no_grad():
                         chunk = policy.predict_action_chunk(batch, noise=noise)
                     queue_postprocess = postprocess
@@ -692,6 +699,8 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
             result["refinement_gate_telemetry"] = tap.refinement_gate_telemetry
         if tap.uncertainty_gradient_telemetry is not None:
             result["uncertainty_gradient_telemetry"] = tap.uncertainty_gradient_telemetry
+        if tap.q_guidance_telemetry is not None:
+            result["q_guidance_telemetry"] = tap.q_guidance_telemetry
     if ms_selections is not None:
         result["ms_selections"] = ms_selections
     if qplanning_selections is not None:
@@ -766,9 +775,12 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
         return [_run_episode_serial(envs[0], episodes[0], policy, preprocess,
                                     postprocess, device, config)]
     if (config.num_samples is not None or config.correction_lambda is not None
-            or config.uncertainty_gradient_mode is not None):
+            or config.uncertainty_gradient_mode is not None
+            or config.q_guidance_ckpt_id is not None):
         reason = ("multi-sample selection" if config.num_samples is not None
                   else "learned PCP correction" if config.correction_lambda is not None
+                  else "Q latent-gradient guidance"
+                  if config.q_guidance_ckpt_id is not None
                   else "U20 latent-gradient correction")
         print(f"[rollout] {reason} is not batch-enabled; using serial runner for this collection")
         return [_run_episode_serial(env, ep, policy, preprocess, postprocess, device, config)

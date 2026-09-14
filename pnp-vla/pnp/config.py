@@ -110,6 +110,9 @@ class Method:
     QPLANNING_Q50_U100 = "qplanning_q50_u20_beta100"
     QPLANNING_Q50_PRIORITY_FAILURE = "qplanning_q50_priority_failure"
     QPLANNING_Q50_PRIORITY_U20_4CHUNK = "qplanning_q50_priority_u20_4chunk"
+    QGUIDE_Q50_ORIGINAL = "qguide_q50_original"
+    QGUIDE_Q50_PRIORITY_FAILURE = "qguide_q50_priority_failure"
+    QGUIDE_Q50_PRIORITY_U20_4CHUNK = "qguide_q50_priority_u20_4chunk"
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
@@ -132,6 +135,9 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.QPLANNING_Q50_U050, Method.QPLANNING_Q50_U100,
                Method.QPLANNING_Q50_PRIORITY_FAILURE,
                Method.QPLANNING_Q50_PRIORITY_U20_4CHUNK,
+               Method.QGUIDE_Q50_ORIGINAL,
+               Method.QGUIDE_Q50_PRIORITY_FAILURE,
+               Method.QGUIDE_Q50_PRIORITY_U20_4CHUNK,
                Method.PNP_ONLY, Method.PCP, Method.COLLECT, Method.PCP_SEARCH_COLLECT)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 
@@ -216,6 +222,12 @@ class RolloutConfig:
     qplanning_temperature: Optional[float] = None
     qplanning_candidate_batch_size: Optional[int] = None
     qplanning_scorer: object = field(default=None, repr=False, compare=False)
+    # One-step denoising-time Q ascent. This is deliberately separate from Q-Planning's
+    # multi-candidate aggregation: a single stock latent is updated at one Euler boundary.
+    q_guidance_ckpt_id: Optional[str] = None
+    q_guidance_step: Optional[int] = None
+    q_guidance_step_size: Optional[float] = None  # RMS of the live-latent update
+    q_guidance_scorer: object = field(default=None, repr=False, compare=False)
     # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
     # None intentionally preserves the legacy full-generated-chunk behavior. Production drivers
@@ -251,9 +263,11 @@ class RolloutConfig:
 
     def __post_init__(self):
         n_actions = int(self.refine) + int(self.correction_lambda is not None) \
-            + int(self.num_samples is not None) + int(self.uncertainty_gradient_mode is not None)
+            + int(self.num_samples is not None) + int(self.uncertainty_gradient_mode is not None) \
+            + int(self.q_guidance_ckpt_id is not None)
         if n_actions > 1:
-            raise ValueError("at most one action: refine / correction / samples / U-gradient")
+            raise ValueError(
+                "at most one action: refine / correction / samples / U-gradient / Q-guidance")
         # Refine/correction feed off the probe, so a probe is mandatory for them.
         if (self.refine or self.correction_lambda is not None) and not self.has_probe:
             raise ValueError("refine/correction requires a probe (set pnp_steps or pnp_time_min)")
@@ -342,6 +356,30 @@ class RolloutConfig:
                     or not 1 <= self.qplanning_candidate_batch_size <= self.num_samples):
                 raise ValueError(
                     "qplanning_candidate_batch_size must lie in [1, num_samples]")
+        q_guidance = self.q_guidance_ckpt_id is not None
+        q_guidance_fields = (
+            self.q_guidance_step, self.q_guidance_step_size, self.q_guidance_scorer)
+        if not q_guidance and any(value is not None for value in q_guidance_fields):
+            raise ValueError("Q-guidance settings require q_guidance_ckpt_id")
+        if q_guidance:
+            if not str(self.q_guidance_ckpt_id).strip():
+                raise ValueError("q_guidance_ckpt_id must be non-empty")
+            if self.q_guidance_scorer is None:
+                raise ValueError("Q-guidance requires a loaded q_guidance_scorer")
+            if self.num_inference_steps is None:
+                raise ValueError("Q-guidance requires explicit num_inference_steps")
+            if (isinstance(self.q_guidance_step, bool)
+                    or self.q_guidance_step is None
+                    or int(self.q_guidance_step) != self.q_guidance_step
+                    or not 0 <= int(self.q_guidance_step) < int(self.num_inference_steps)):
+                raise ValueError(
+                    "q_guidance_step must lie in [0, num_inference_steps)")
+            if (self.q_guidance_step_size is None
+                    or not math.isfinite(float(self.q_guidance_step_size))
+                    or float(self.q_guidance_step_size) <= 0):
+                raise ValueError("q_guidance_step_size must be finite and positive")
+            if self.has_probe:
+                raise ValueError("Q-guidance is separate from P&P probing")
         if self.refine_average and not self.refine:
             raise ValueError("refine_average=True requires refine=True")
         if self.refine_horizon_m is not None:
@@ -472,6 +510,10 @@ class RolloutConfig:
             logical.pop("qplanning_n_elites")
             logical.pop("qplanning_temperature")
             logical.pop("qplanning_candidate_batch_size")
+        if logical.get("q_guidance_ckpt_id") is None:
+            logical.pop("q_guidance_ckpt_id")
+            logical.pop("q_guidance_step")
+            logical.pop("q_guidance_step_size")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
@@ -513,6 +555,7 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "multi_sample_refine_selected",
                   "qplanning_ckpt_id", "qplanning_n_elites",
                   "qplanning_temperature", "qplanning_candidate_batch_size",
+                  "q_guidance_ckpt_id", "q_guidance_step", "q_guidance_step_size",
                   "num_inference_steps",
                   "n_action_steps", "suffix_probe_samples")
 
