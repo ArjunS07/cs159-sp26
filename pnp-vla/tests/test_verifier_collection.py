@@ -198,3 +198,38 @@ def test_run_continuation_replans_every_n_action_steps():
                 steps_already=0, n_action_steps=1)
         assert not success and steps == 6 and calls["predict"] == 6
         assert positions == [0, 1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6]
+
+
+def test_context_capture_is_noninvasive_and_restores_attention_backend():
+    from types import SimpleNamespace
+    import numpy as np
+    import torch
+    from pnp.verifier.collection import predict_clean_chunk
+
+    language_config = SimpleNamespace(_attn_implementation="sdpa")
+    language_model = SimpleNamespace(config=language_config)
+    paligemma_model = SimpleNamespace(language_model=language_model)
+    paligemma = SimpleNamespace(model=paligemma_model)
+    expert = SimpleNamespace(paligemma=paligemma)
+    model = SimpleNamespace(
+        _pnp=SimpleNamespace(strategy=None),
+        paligemma_with_expert=expert)
+
+    class FakePolicy:
+        def __init__(self):
+            self.model = model
+
+        def predict_action_chunk(self, _batch, *, noise):
+            tap = self.model._pnp.strategy
+            assert tap is not None and not tap.invasive
+            language_config._attn_implementation = "eager"
+            tap.finish(SimpleNamespace(obs_enc=torch.tensor([[1.0, 2.0]])))
+            return noise + 1
+
+    noise = torch.zeros((1, 2, 3))
+    chunk, obs_enc = predict_clean_chunk(
+        FakePolicy(), {}, noise, capture_context=True)
+    assert torch.equal(chunk, torch.ones_like(noise))
+    np.testing.assert_array_equal(obs_enc, [[1.0, 2.0]])
+    assert language_config._attn_implementation == "sdpa"
+    assert model._pnp.strategy is None

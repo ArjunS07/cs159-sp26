@@ -279,7 +279,11 @@ def build_targeted_manifests(
 
 class _ContextCapture:
     """Run the hooked vanilla Euler loop once and retain its observation embedding."""
-    invasive = True
+    # The hooked loop is used only to expose obs_enc. Returning its separately
+    # reconstructed action would make candidate zero subtly different from the
+    # stock policy; the sampler's non-invasive path returns the saved original
+    # sampler result instead.
+    invasive = False
 
     def __init__(self):
         self.obs_enc = None
@@ -296,8 +300,17 @@ def predict_clean_chunk(policy, batch, noise, *, capture_context=False):
         with torch.no_grad():
             return policy.predict_action_chunk(batch, noise=noise), None
     tap = _ContextCapture()
-    with _temp_strategy(policy.model, tap), torch.no_grad():
-        chunk = policy.predict_action_chunk(batch, noise=noise)
+    # The hooked sampler temporarily requires eager attention. It mutates this
+    # config internally, so restore it here; otherwise every policy call after
+    # the first captured chunk uses a different attention backend.
+    language_config = (
+        policy.model.paligemma_with_expert.paligemma.model.language_model.config)
+    previous_attention = language_config._attn_implementation
+    try:
+        with _temp_strategy(policy.model, tap), torch.no_grad():
+            chunk = policy.predict_action_chunk(batch, noise=noise)
+    finally:
+        language_config._attn_implementation = previous_attention
     return chunk, tap.obs_enc
 
 
