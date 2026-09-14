@@ -108,8 +108,16 @@ def test_worker_76_is_four_shards_times_five_guides_with_split_download_contract
                 "episode_u20_checkpoint_path", "u20_4chunk_checkpoint_path",
                 "u20_8chunk_checkpoint_path"):
             assert argument in source
-        assert ("hf_hub_download" in source) == (worker < 2)
-        assert ("drive.mount" in source) == (worker >= 2)
+        assert "hf_hub_download" in source
+        assert "drive.mount" in source
+        assert "HF_REPO_ID = 'Lilac2302/pnp-ckpts'" in source
+        if worker < 2:
+            assert "ORIGINAL_Q50_CHECKPOINT_PATH = exactly_one(" in source
+            assert "FAILURE_CHECKPOINT_PATH = download(" in source
+            assert "ORIGINAL_Q50_CHECKPOINT_PATH = download(" not in source
+        else:
+            assert "ORIGINAL_Q50_CHECKPOINT_PATH = download(" in source
+            assert "FAILURE_CHECKPOINT_PATH = exactly_one(" in source
         for index, cell in enumerate(notebook["cells"]):
             if cell["cell_type"] == "code":
                 assert cell["execution_count"] is None
