@@ -115,6 +115,9 @@ class Method:
     QGUIDE_Q50_PRIORITY_EPISODE_U20 = "qguide_q50_priority_episode_u20"
     QGUIDE_Q50_PRIORITY_U20_4CHUNK = "qguide_q50_priority_u20_4chunk"
     QGUIDE_Q50_PRIORITY_U20_8CHUNK = "qguide_q50_priority_u20_8chunk"
+    QGUIDE_U20_GATE_Q50_ORIGINAL = "qguide_u20_gate_q50_original"
+    QGUIDE_U20_GATE_Q50_PRIORITY_U20_8CHUNK = (
+        "qguide_u20_gate_q50_priority_u20_8chunk")
     PNP_ONLY = "pnp_only"                   # PCP correction, lambda == 0
     PCP = "pcp"                             # PCP correction, lambda > 0
     COLLECT = "collect"                     # vanilla rollout w/ save_pcp_features (training data)
@@ -142,6 +145,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.QGUIDE_Q50_PRIORITY_EPISODE_U20,
                Method.QGUIDE_Q50_PRIORITY_U20_4CHUNK,
                Method.QGUIDE_Q50_PRIORITY_U20_8CHUNK,
+               Method.QGUIDE_U20_GATE_Q50_ORIGINAL,
+               Method.QGUIDE_U20_GATE_Q50_PRIORITY_U20_8CHUNK,
                Method.PNP_ONLY, Method.PCP, Method.COLLECT, Method.PCP_SEARCH_COLLECT)
 PCP_3WAY = (Method.VANILLA, Method.PNP_ONLY, Method.PCP)   # the paired 3-way eval arms
 
@@ -232,6 +237,12 @@ class RolloutConfig:
     q_guidance_step: Optional[int] = None
     q_guidance_step_size: Optional[float] = None  # RMS of the live-latent update
     q_guidance_scorer: object = field(default=None, repr=False, compare=False)
+    # Optional measurement-only P&P gate around Q guidance. The stock chunk and gate score are
+    # produced from the same policy noise; a non-firing gate returns that exact stock chunk.
+    q_guidance_gate_threshold: Optional[float] = None
+    q_guidance_gate_horizon: Optional[int] = None
+    q_guidance_gate_pnp_k: Optional[int] = None
+    q_guidance_gate_probe_steps: Optional[Sequence[int]] = None
     # ── base + sinks (each persists one thing independently) ──
     num_inference_steps: Optional[int] = None   # base sampler step override (matched-compute)
     # None intentionally preserves the legacy full-generated-chunk behavior. Production drivers
@@ -361,8 +372,12 @@ class RolloutConfig:
                 raise ValueError(
                     "qplanning_candidate_batch_size must lie in [1, num_samples]")
         q_guidance = self.q_guidance_ckpt_id is not None
+        q_guidance_gate_fields = (
+            self.q_guidance_gate_threshold, self.q_guidance_gate_horizon,
+            self.q_guidance_gate_pnp_k, self.q_guidance_gate_probe_steps)
         q_guidance_fields = (
-            self.q_guidance_step, self.q_guidance_step_size, self.q_guidance_scorer)
+            self.q_guidance_step, self.q_guidance_step_size, self.q_guidance_scorer,
+            *q_guidance_gate_fields)
         if not q_guidance and any(value is not None for value in q_guidance_fields):
             raise ValueError("Q-guidance settings require q_guidance_ckpt_id")
         if q_guidance:
@@ -384,6 +399,36 @@ class RolloutConfig:
                 raise ValueError("q_guidance_step_size must be finite and positive")
             if self.has_probe:
                 raise ValueError("Q-guidance is separate from P&P probing")
+            gate_enabled = self.q_guidance_gate_threshold is not None
+            if (any(value is not None for value in q_guidance_gate_fields)
+                    and not all(value is not None for value in q_guidance_gate_fields)):
+                raise ValueError(
+                    "Q-guidance uncertainty gating requires threshold, horizon, pnp_k, "
+                    "and probe_steps together")
+            if gate_enabled:
+                if (not math.isfinite(float(self.q_guidance_gate_threshold))
+                        or float(self.q_guidance_gate_threshold) < 0):
+                    raise ValueError(
+                        "q_guidance_gate_threshold must be finite and non-negative")
+                if (isinstance(self.q_guidance_gate_horizon, bool)
+                        or int(self.q_guidance_gate_horizon)
+                        != self.q_guidance_gate_horizon
+                        or int(self.q_guidance_gate_horizon) < 1):
+                    raise ValueError(
+                        "q_guidance_gate_horizon must be a positive integer")
+                if (isinstance(self.q_guidance_gate_pnp_k, bool)
+                        or int(self.q_guidance_gate_pnp_k) != self.q_guidance_gate_pnp_k
+                        or int(self.q_guidance_gate_pnp_k) < 2):
+                    raise ValueError("q_guidance_gate_pnp_k must be an integer >= 2")
+                probe_steps = tuple(self.q_guidance_gate_probe_steps)
+                if (not probe_steps or any(
+                        isinstance(step, bool) or int(step) != step
+                        or not 0 <= int(step) < int(self.num_inference_steps)
+                        for step in probe_steps)):
+                    raise ValueError(
+                        "q_guidance_gate_probe_steps must be valid Euler-step indices")
+                if len(set(map(int, probe_steps))) != len(probe_steps):
+                    raise ValueError("q_guidance_gate_probe_steps must be unique")
         if self.refine_average and not self.refine:
             raise ValueError("refine_average=True requires refine=True")
         if self.refine_horizon_m is not None:
@@ -518,6 +563,11 @@ class RolloutConfig:
             logical.pop("q_guidance_ckpt_id")
             logical.pop("q_guidance_step")
             logical.pop("q_guidance_step_size")
+        if logical.get("q_guidance_gate_threshold") is None:
+            logical.pop("q_guidance_gate_threshold")
+            logical.pop("q_guidance_gate_horizon")
+            logical.pop("q_guidance_gate_pnp_k")
+            logical.pop("q_guidance_gate_probe_steps")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
@@ -560,6 +610,8 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
                   "qplanning_ckpt_id", "qplanning_n_elites",
                   "qplanning_temperature", "qplanning_candidate_batch_size",
                   "q_guidance_ckpt_id", "q_guidance_step", "q_guidance_step_size",
+                  "q_guidance_gate_threshold", "q_guidance_gate_horizon",
+                  "q_guidance_gate_pnp_k", "q_guidance_gate_probe_steps",
                   "num_inference_steps",
                   "n_action_steps", "suffix_probe_samples")
 

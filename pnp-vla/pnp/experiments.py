@@ -270,7 +270,10 @@ _METHOD_LABELS = {Method.VANILLA: "stock VLA",
                    Method.QGUIDE_Q50_PRIORITY_FAILURE: "Q-guide failure-priority",
                    Method.QGUIDE_Q50_PRIORITY_EPISODE_U20: "Q-guide episode-U20-priority",
                    Method.QGUIDE_Q50_PRIORITY_U20_4CHUNK: "Q-guide 4-chunk-U20-priority",
-                   Method.QGUIDE_Q50_PRIORITY_U20_8CHUNK: "Q-guide 8-chunk-U20-priority"}
+                   Method.QGUIDE_Q50_PRIORITY_U20_8CHUNK: "Q-guide 8-chunk-U20-priority",
+                   Method.QGUIDE_U20_GATE_Q50_ORIGINAL: "U20-gated original Q50",
+                   Method.QGUIDE_U20_GATE_Q50_PRIORITY_U20_8CHUNK:
+                       "U20-gated 8-chunk Q50"}
 
 
 def format_progress_table(tally, method_names, historical_sr=None, *, include_overall=False,

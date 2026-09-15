@@ -100,6 +100,7 @@ class RolloutTap:
         self._q_guidance_records: list[dict] = []
         self._q_guidance_context = None
         self._q_guidance_applied = 0
+        self._q_guidance_gate_pending = None
         self._action_postprocess = action_postprocess
         # correction telemetry (only when the action is a PCP correction)
         self._corr = CorrectTelemetry() if self._correcting else None
@@ -129,9 +130,31 @@ class RolloutTap:
     def begin_chunk(self) -> None:
         self._chunk_idx += 1
         self._chunk_refine_applied = 0
+        if self.config.q_guidance_gate_threshold is None:
+            self._q_guidance_gate_pending = None
 
     def set_q_guidance_context(self, robot_state, policy_proprio) -> None:
         self._q_guidance_context = (robot_state, policy_proprio)
+
+    def set_q_guidance_gate(self, score: float, details: dict, *, fired: bool,
+                            chunk_idx: int) -> None:
+        """Record the precomputed stock-U gate and arm or skip the next Q update."""
+        if self.config.q_guidance_gate_threshold is None:
+            raise RuntimeError("cannot set a gate on ungated Q-guidance")
+        gate = {
+            "chunk_idx": int(chunk_idx),
+            "gate_score_u20": float(score),
+            "gate_threshold": float(self.config.q_guidance_gate_threshold),
+            "gate_fired": bool(fired),
+            "gate_details": {key: float(value) for key, value in details.items()},
+        }
+        self._q_guidance_gate_pending = gate
+        # A firing gate enters the hooked sampler, whose begin_chunk increments once.
+        # A rejected gate directly returns the measured stock chunk and never enters it.
+        self._chunk_idx = int(chunk_idx) - int(bool(fired))
+        if not fired:
+            gate["guidance_applied"] = False
+            self._q_guidance_records.append(gate)
 
     @property
     def chunk_intervened(self) -> bool:
@@ -230,6 +253,10 @@ class RolloutTap:
         if cfg.q_guidance_ckpt_id is not None:
             if self._q_guidance_context is None:
                 raise RuntimeError("Q-guidance has no live robot/proprio context")
+            if (cfg.q_guidance_gate_threshold is not None
+                    and (self._q_guidance_gate_pending is None
+                         or not self._q_guidance_gate_pending["gate_fired"])):
+                raise RuntimeError("Q-guidance step reached without a firing U20 gate")
             from .qplanning_critic.inference import direct_latent_q_update
             robot_state, policy_proprio = self._q_guidance_context
             updated, telemetry, _, _ = direct_latent_q_update(
@@ -239,6 +266,9 @@ class RolloutTap:
                 step_size=float(cfg.q_guidance_step_size))
             telemetry.update({
                 "chunk_idx": self._chunk_idx, "euler_step": int(ctx.step), "s": float(s)})
+            if self._q_guidance_gate_pending is not None:
+                telemetry.update(self._q_guidance_gate_pending)
+            telemetry["guidance_applied"] = True
             self._q_guidance_records.append(telemetry)
             self._q_guidance_applied += 1
             return updated
@@ -390,7 +420,18 @@ class RolloutTap:
 
         return {
             "records": records,
-            "n_updates": len(records),
+            "n_updates": self._q_guidance_applied,
+            **({
+                "n_gate_considered": len(records),
+                "n_gate_fired": sum(bool(row.get("gate_fired")) for row in records),
+                "gate_fire_rate": (
+                    sum(bool(row.get("gate_fired")) for row in records) / len(records)),
+                "mean_gate_u20": mean("gate_score_u20"),
+                "gate_threshold": float(self.config.q_guidance_gate_threshold),
+                "gate_horizon": int(self.config.q_guidance_gate_horizon),
+                "gate_pnp_k": int(self.config.q_guidance_gate_pnp_k),
+                "gate_probe_steps": list(self.config.q_guidance_gate_probe_steps),
+            } if self.config.q_guidance_gate_threshold is not None else {}),
             "mean_pre_q": mean("pre_q"),
             "mean_post_q": mean("post_q"),
             "mean_delta_q": mean("delta_q"),

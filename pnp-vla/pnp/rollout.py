@@ -498,8 +498,30 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                         tap.set_q_guidance_context(
                             _raw_robot_state(obs),
                             np.asarray(policy_proprio, dtype=np.float32))
-                    with torch.no_grad():
-                        chunk = policy.predict_action_chunk(batch, noise=noise)
+                    if (config.q_guidance_ckpt_id is not None
+                            and config.q_guidance_gate_threshold is not None):
+                        stock_chunk, gate_score, gate_details = (
+                            _sampler.measure_chunk_uncertainty(
+                                policy, batch, noise,
+                                probe_steps=tuple(config.q_guidance_gate_probe_steps),
+                                num_iterations=int(config.q_guidance_gate_pnp_k),
+                                uncertainty_horizon=int(config.q_guidance_gate_horizon),
+                                return_details=True))
+                        gate_fired = (
+                            float(gate_score)
+                            >= float(config.q_guidance_gate_threshold))
+                        tap.set_q_guidance_gate(
+                            gate_score, gate_details, fired=gate_fired, chunk_idx=ci)
+                        if gate_fired:
+                            with torch.no_grad():
+                                chunk = policy.predict_action_chunk(batch, noise=noise)
+                        else:
+                            # Exact ordinary-sampler chunk returned by the measurement pass,
+                            # not a reconstruction from the instrumented Euler loop.
+                            chunk = stock_chunk
+                    else:
+                        with torch.no_grad():
+                            chunk = policy.predict_action_chunk(batch, noise=noise)
                     queue_postprocess = postprocess
                 chunk_noise_seeds.append(int(executed_chunk_noise_seed))
                 full_arr = chunk.squeeze(0).detach().cpu().numpy()
