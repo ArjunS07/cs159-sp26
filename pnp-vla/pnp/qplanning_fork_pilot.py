@@ -656,6 +656,10 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
                 metadata_b["replay_state_max_abs_after_correction"])),
             "parent_actions_repeat_exact": bool(
                 repeat_equal["parent_replay_actions_sha256"]),
+            "parent_terminal_events_a": len(
+                metadata_a["canonical_parent_replay_reported_terminal_events"]),
+            "parent_terminal_events_b": len(
+                metadata_b["canonical_parent_replay_reported_terminal_events"]),
             "root_sim_repeat_exact": bool(
                 repeat_equal["root_sim_state_sha256"]),
             "root_policy_input_repeat_exact": bool(

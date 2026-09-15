@@ -250,6 +250,45 @@ def test_sparse_rendering_warms_two_steps_before_each_policy_observation():
     assert camera["enabled"] is True
 
 
+def test_fixed_parent_replay_logs_but_does_not_truncate_terminal_flags():
+    import numpy as np
+    from unittest.mock import patch
+    from pnp.verifier import collection as C
+
+    class FakeEnv:
+        def __init__(self):
+            self.action_steps = 0
+
+        def reset(self):
+            self.action_steps = 0
+
+        def set_init_state(self, _state):
+            return {"step": 0}
+
+        def step(self, _action):
+            self.action_steps += 1
+            return {"step": self.action_steps}, 0.0, self.action_steps == 2, {}
+
+        def check_success(self):
+            return self.action_steps == 1
+
+    class FakePolicy:
+        def reset(self):
+            pass
+
+    env = FakeEnv()
+    with patch.object(C, "NUM_STEPS_WAIT", 0):
+        obs, events = C._reset_and_replay_actions(
+            env, {"init_state": np.zeros(1)}, FakePolicy(),
+            np.zeros((3, 7), dtype=np.float32))
+    assert env.action_steps == 3
+    assert obs == {"step": 3}
+    assert events == [
+        {"replay_action_index": 0, "success": True, "done": False},
+        {"replay_action_index": 1, "success": False, "done": True},
+    ]
+
+
 def test_context_capture_is_noninvasive_and_restores_attention_backend():
     from types import SimpleNamespace
     import numpy as np

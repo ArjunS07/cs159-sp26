@@ -416,8 +416,16 @@ def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
 def _reset_and_replay_actions(env, ep, policy, replay_actions, *,
                               skip_unused_renders: bool = False,
                               render_lead: int = 2):
-    """Reach a branch state through the public environment API using fixed actions."""
+    """Reach a branch state through fixed actions and report transient terminal flags.
+
+    A restored replay can cross the task-success predicate slightly earlier than
+    the source run because independent MuJoCo replays are not bit-exact. The
+    selected root is defined by the full stored action count, and callers correct
+    every branch to one canonical root state afterward, so these flags are
+    diagnostics rather than reasons to truncate parent restoration.
+    """
     replay_actions = list(replay_actions)
+    terminal_events = []
     lead = max(1, int(render_lead))
     skipping = bool(skip_unused_renders and set_camera_observables(env, True))
 
@@ -438,9 +446,14 @@ def _reset_and_replay_actions(env, ep, policy, replay_actions, *,
         for index, action in enumerate(replay_actions):
             _render_next(len(replay_actions) - index <= lead)
             obs, _, done, _ = env.step(action)
-            if env.check_success() or done:
-                return None
-        return obs
+            reported_success = bool(env.check_success())
+            if reported_success or done:
+                terminal_events.append({
+                    "replay_action_index": int(index),
+                    "success": reported_success,
+                    "done": bool(done),
+                })
+        return obs, terminal_events
     finally:
         if skipping:
             set_camera_observables(env, True)
@@ -481,14 +494,12 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                 f"stored parent replay must have shape ({expected}, 7), got {supplied.shape}")
         replay_source = "stored_source_trajectory"
         replay_actions = [action.copy() for action in supplied]
-        obs = _reset_and_replay_actions(
+        obs, canonical_parent_terminal_events = _reset_and_replay_actions(
             env, ep, policy, replay_actions,
             skip_unused_renders=skip_unused_renders, render_lead=render_lead)
-        if obs is None:
-            return None
         steps = len(replay_actions)
     else:
-        obs = _reset_and_replay_actions(
+        obs, canonical_parent_terminal_events = _reset_and_replay_actions(
             env, ep, policy, [], skip_unused_renders=skip_unused_renders,
             render_lead=render_lead)
         replay_source = "regenerated_policy"
@@ -549,12 +560,12 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         ep.get("ep_idx", ep.get("episode_idx", 0)), chunk_idx, namespace=experiment,
         trajectory_seed=trajectory_seed)
     candidates, replay_state_errors, post_correction_errors = [], [], []
+    branch_parent_terminal_events = []
     for kind in policy_chunks:
-        branch_obs = _reset_and_replay_actions(
+        branch_obs, replay_terminal_events = _reset_and_replay_actions(
             env, ep, policy, replay_actions,
             skip_unused_renders=skip_unused_renders, render_lead=render_lead)
-        if branch_obs is None:
-            raise RuntimeError("fixed replay terminated before the branch state")
+        branch_parent_terminal_events.append(replay_terminal_events)
         _, branch_sim = _unwrap_sim(env)
         branch_state = np.asarray(branch_sim.get_state().flatten())
         replay_state_error = float(np.max(np.abs(branch_state - canonical_state)))
@@ -595,6 +606,7 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                 "denoise_steps": candidate_steps[kind],
                 "executed_prefix_length": int(prefix_length),
                 "candidate_noise_sha256": candidate_noise_digests[kind],
+                "parent_replay_reported_terminal_events": replay_terminal_events,
             },
             "blobs": {
                 "policy_chunk": {"actions": policy_chunks[kind]},
@@ -633,6 +645,10 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                           "parent_replay_source": replay_source,
                           "parent_replay_actions_sha256": _content_digest(
                               np.asarray(replay_actions, dtype=np.float32)),
+                          "canonical_parent_replay_reported_terminal_events":
+                              canonical_parent_terminal_events,
+                          "branch_parent_replay_terminal_event_count": sum(
+                              len(events) for events in branch_parent_terminal_events),
                           "root_sim_state_sha256": _content_digest(canonical_state),
                           "root_policy_input_sha256": root_policy_input_digest,
                           "chunk_position": float(policy.model._pnp.chunk_pos),
