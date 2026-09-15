@@ -378,6 +378,14 @@ Both cameras are re-enabled for two full simulator steps before every observatio
 policy. Videos and frame sequences remain off. These render settings are frozen in the version-4
 manifest, and each completed tree prints its own outcome summary, duration, and ETA.
 
+An isolated 20-action intervention variant was added after early notebook-78 output suggested that
+mixed-outcome trees may be rare. It keeps the source and continuation policy on the correct
+10-action replan cadence, but executes the first 20 actions of each candidate before replanning.
+Roots require four complete source boundaries, giving 20 intervention actions plus at least 20
+ordinary continuation actions. Its manifest retains the exact notebook-78 root, ordinal, and shard
+whenever that root meets the stricter condition, then deterministically fills ineligible slots.
+This supports a matched 10-vs-20 horizon comparison without mixing the experiment namespaces.
+
 ### Longer-term: settings without an environment failure signal
 
 The Q-Planning paper notes settings without a readily available environment failure signal as a
@@ -420,6 +428,10 @@ idea is only worth a brief later investigation rather than displacing the curren
 | Fixed random/U20/failure fork collection | `notebooks/workers/78_collect_qplanning_fork_pilot_worker_*.ipynb` |
 | Fork acquisition analysis | `notebooks/79_analyze_qplanning_fork_pilot.ipynb` |
 | Fork pilot implementation | `pnp/qplanning_fork_pilot.py` |
+| 20-action fork manifest/preflight | `notebooks/80_qplanning_fork20_pilot_preflight.ipynb` |
+| Four-shard 20-action collection | `notebooks/workers/81_collect_qplanning_fork20_pilot_worker_*.ipynb` |
+| Partial/full matched 10-vs-20 analysis | `notebooks/82_analyze_qplanning_fork20_pilot.ipynb` |
+| 20-action fork implementation | `pnp/qplanning_fork20_pilot.py` |
 | LIBERO-only base training | `notebooks/73_train_q50_libero_only_base.ipynb` |
 | Core Q model/training/inference | `pnp/qplanning_critic/` |
 | Replay-priority implementation | `pnp/qplanning_critic/replay_priority.py` |

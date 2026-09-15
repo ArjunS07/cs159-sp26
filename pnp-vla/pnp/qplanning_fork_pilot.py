@@ -433,7 +433,10 @@ def _progress(store, items: list[dict]) -> tuple[set[str], str]:
 def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHARDS,
                           tree_limit_per_strategy: int | None = None,
                           manifest_path: str = FORK_PILOT_MANIFEST_PATH,
-                          store=None) -> dict:
+                          store=None, _manifest_loader=None,
+                          _intervention_actions: int = FORK_PILOT_EXECUTED_ACTIONS,
+                          _replan_actions: int = FORK_PILOT_EXECUTED_ACTIONS,
+                          _run_name: str = "qplanning_fork_pilot") -> dict:
     """Collect one resume-safe shard of all three root-selection strategies."""
     from . import libero_env, models
     from .store import SupabaseStore
@@ -441,7 +444,8 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
     if shard_count != FORK_PILOT_SHARDS or not 0 <= int(shard_index) < shard_count:
         raise ValueError("fork pilot requires shard_count=4 and shard_index in [0,4)")
     store = store or SupabaseStore()
-    document = load_fork_pilot_manifest(store, manifest_path)
+    manifest_loader = _manifest_loader or load_fork_pilot_manifest
+    document = manifest_loader(store, manifest_path)
     payload = document["payload"]
     items = [dict(item) for item in payload["trees"]
              if int(item["shard_index"]) == int(shard_index)]
@@ -472,13 +476,15 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
     policy.model._pnp.num_steps = FORK_PILOT_STOCK_DENOISE_STEPS
     experiments = sorted({item["experiment"] for item in items})
     store.start_run(
-        "qplanning_fork_pilot", "libero_pro", experiments[0],
+        _run_name, "libero_pro", experiments[0],
         config={
             "manifest_path": manifest_path,
             "manifest_hash": document["manifest_hash"],
             "shard_count": shard_count, "shard_index": int(shard_index),
             "trees": len(items), "candidate_count": FORK_PILOT_CANDIDATES,
-            "executed_actions": FORK_PILOT_EXECUTED_ACTIONS,
+            "executed_actions": int(_intervention_actions),
+            "candidate_intervention_actions": int(_intervention_actions),
+            "continuation_replan_actions": int(_replan_actions),
             "stock_denoise_steps": FORK_PILOT_STOCK_DENOISE_STEPS,
             "proposal_denoise_steps": FORK_PILOT_PROPOSAL_DENOISE_STEPS,
             "skip_unused_renders": FORK_PILOT_SKIP_UNUSED_RENDERS,
@@ -503,19 +509,19 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
                     env, ep, policy, preprocess, postprocess, device,
                     chunk_idx=int(item["chunk_idx"]),
                     uncertainty_stratum=item["strategy"],
-                    prefix_length=FORK_PILOT_EXECUTED_ACTIONS,
+                    prefix_length=int(_intervention_actions),
                     candidate_count=FORK_PILOT_CANDIDATES,
                     experiment=item["experiment"],
                     collection_split="fork_pilot",
                     manifest_hash=document["manifest_hash"],
                     model_revision=payload["policy_revision"],
-                    n_action_steps=FORK_PILOT_EXECUTED_ACTIONS,
+                    n_action_steps=int(_replan_actions),
                     candidate_num_inference_steps=FORK_PILOT_PROPOSAL_DENOISE_STEPS,
                     skip_unused_renders=FORK_PILOT_SKIP_UNUSED_RENDERS,
                     render_lead=FORK_PILOT_RENDER_LEAD,
                     replay_actions_override=source_replay_actions[
                         item["source_rollout_id"]][
-                            :int(item["chunk_idx"]) * FORK_PILOT_EXECUTED_ACTIONS])
+                            :int(item["chunk_idx"]) * int(_replan_actions)])
             finally:
                 env.close()
             if result is None:
@@ -531,6 +537,8 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
                 "source_u20_profile": item["source_u20_profile"],
                 "normalized_chunk_position": item["normalized_chunk_position"],
                 "future_training_priority_fraction": FORK_PILOT_TRAIN_PRIORITY_FRACTION,
+                "candidate_intervention_actions": int(_intervention_actions),
+                "continuation_replan_actions": int(_replan_actions),
             })
             store.register_candidate_group(group, candidates)
             new_trees += 1
@@ -563,13 +571,17 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
 
 
 def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_PATH,
-                                   store=None) -> list[dict]:
+                                   store=None, _manifest_loader=None,
+                                   _intervention_actions: int = FORK_PILOT_EXECUTED_ACTIONS,
+                                   _replan_actions: int = FORK_PILOT_EXECUTED_ACTIONS
+                                   ) -> list[dict]:
     """Replay one root per strategy twice and require identical stock branches."""
     from . import libero_env, models
     from .store import SupabaseStore
 
     store = store or SupabaseStore()
-    document = load_fork_pilot_manifest(store, manifest_path)
+    manifest_loader = _manifest_loader or load_fork_pilot_manifest
+    document = manifest_loader(store, manifest_path)
     payload = document["payload"]
     roots = [next(item for item in payload["trees"] if item["strategy"] == strategy)
              for strategy in FORK_PILOT_STRATEGIES]
@@ -589,17 +601,17 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
                 result = collect_replay_candidate_group(
                     env, ep, policy, preprocess, postprocess, device,
                     chunk_idx=item["chunk_idx"], uncertainty_stratum=item["strategy"],
-                    prefix_length=FORK_PILOT_EXECUTED_ACTIONS, candidate_count=2,
+                    prefix_length=int(_intervention_actions), candidate_count=2,
                     experiment=item["experiment"], collection_split="restoration_preflight",
                     manifest_hash=document["manifest_hash"],
                     model_revision=payload["policy_revision"],
-                    n_action_steps=FORK_PILOT_EXECUTED_ACTIONS,
+                    n_action_steps=int(_replan_actions),
                     candidate_num_inference_steps=FORK_PILOT_PROPOSAL_DENOISE_STEPS,
                     skip_unused_renders=FORK_PILOT_SKIP_UNUSED_RENDERS,
                     render_lead=FORK_PILOT_RENDER_LEAD,
                     replay_actions_override=source_replay_actions[
                         item["source_rollout_id"]][
-                            :int(item["chunk_idx"]) * FORK_PILOT_EXECUTED_ACTIONS])
+                            :int(item["chunk_idx"]) * int(_replan_actions)])
                 if result is None:
                     raise RuntimeError("preflight source terminated before selected root")
                 runs.append(result)
