@@ -16,7 +16,7 @@ older `qplanning_corrector_training_plan.md`.
 | Failure/U20-prioritized replay | Completed at 6,000 updates | Four fresh Q50 arms trained from step zero in notebooks 72 |
 | Priority-critic top-16 planning | Evaluation stopped early | Failure and four-chunk-U20 critics degraded early-suite SR during the partial notebook-74 run |
 | Five-critic latent guidance | Ready to run | Four notebook-76 shards compare the original Q50 and all four priority critics on the frozen PRO160 set |
-| Same-state fork acquisition pilot | Ready to run | Notebook 77 validates replay/restoration; four notebook-78 workers collect 64 random, 64 U20, and 64 failure-prioritized trees |
+| Same-state fork acquisition pilot | Corrected rerun ready | Notebook 77 validates persisted-source restoration; four notebook-78 workers collect 64 random, 64 U20, and 64 failure-prioritized trees under the clean v5 namespace |
 | LIBERO-only Q50 base | Completed | Notebook 73 trained the base checkpoint for a staged LIBERO → PRO continual experiment; staged adaptation has not been run |
 | Paper-style continual/online replay | Not yet implemented | Candidate next stage after replay-priority results |
 
@@ -352,8 +352,9 @@ design above. The manifest contains exactly 64 trees for each of three pre-outco
 uniform random, highest three-boundary U20, and failed-source-episode priority. It uses only the
 immutable snapshot's training split and only non-position PRO training suites. The two ten-state
 milk suites are excluded from this pilot so every selected source trajectory uses behavior seed
-zero; roots are reconstructed from the exact stored environment actions rather than regenerated
-policy predictions. The position-perturbation evaluation category remains excluded.
+zero; roots use the persisted source simulator state, policy boundary input, and exact stored
+environment actions rather than regenerated policy predictions. The position-perturbation
+evaluation category remains excluded.
 
 Every root stores one ordinary 10-integration-step stock candidate and eight three-step proposal
 candidates. Each branch executes ten actions and then continues with the ordinary ten-step policy;
@@ -367,24 +368,28 @@ any-branch oracle gain over the stock branch, suite effects, and selected U20. N
 is trained by this pilot. If acquisition is informative, the declared follow-up training mix is
 65% selected tree replay and 35% ordinary replay.
 
-Notebook 77's blocking invariant is within-tree restoration: exact stored parent actions are
-replayed, then every branch is checked after canonical MuJoCo state correction. Independent full
-episode replays and repeated GPU predictions are logged separately as reproducibility diagnostics;
-they are not required to be byte-identical for a persisted tree whose candidates are generated once.
+Notebook 77's blocking invariant is source fidelity. It checks identity and artifact consistency,
+replays the stored full episode and suffix outcome, measures action-only replay drift, then restores
+the exact persisted MuJoCo state and reconstructs the persisted policy input. Every branch starts
+from that stored state/input contract. The earlier v4 trees used an action-replay-derived root that
+could differ materially from the source state; those trees are invalid and excluded from resume,
+analysis, and future training.
 
 The collection workers use the rollout path's validated sparse-rendering schedule: physics still
 advances on every action, while unused camera observations are disabled between policy boundaries.
 Both cameras are re-enabled for two full simulator steps before every observation consumed by the
-policy. Videos and frame sequences remain off. These render settings are frozen in the version-4
-manifest, and each completed tree prints its own outcome summary, duration, and ETA.
+policy. Videos and frame sequences remain off. These render settings are frozen in the corrected
+version-5 manifest, and each completed tree prints its own outcome summary, duration, and ETA.
 
-An isolated 20-action intervention variant was added after early notebook-78 output suggested that
-mixed-outcome trees may be rare. It keeps the source and continuation policy on the correct
-10-action replan cadence, but executes the first 20 actions of each candidate before replanning.
+An isolated 20-action intervention variant provides a controlled horizon comparison. No conclusion
+about mixed-outcome frequency is retained from the invalid pre-fix collections. The variant keeps
+the source and continuation policy on the correct 10-action replan cadence, but executes the first
+20 actions of each candidate before replanning.
 Roots require four complete source boundaries, giving 20 intervention actions plus at least 20
 ordinary continuation actions. Its manifest retains the exact notebook-78 root, ordinal, and shard
 whenever that root meets the stricter condition, then deterministically fills ineligible slots.
-This supports a matched 10-vs-20 horizon comparison without mixing the experiment namespaces.
+This supports a matched 10-vs-20 horizon comparison without mixing experiment namespaces. Its
+corrected version-2 namespace excludes every earlier version-1 tree from resume and analysis.
 
 ### Longer-term: settings without an environment failure signal
 

@@ -684,7 +684,7 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
                     source_sim_state_override=source["sim_state"],
                     source_policy_observation_override=_source_policy_observation(
                         source_bundle["arrays"], source["boundary_index"],
-                        ep["task_desc"])),
+                        ep["task_desc"]))
             finally:
                 env.close()
             if result is None:

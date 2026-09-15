@@ -198,3 +198,28 @@ def test_priority_fraction_is_explicitly_sixty_five_percent():
 def test_corrected_pilot_uses_fresh_v5_namespace():
     assert FORK_PILOT_VERSION == 5
     assert FORK_PILOT_MANIFEST_PATH.endswith("fixed_three_priority_v5.json")
+
+
+def test_worker_assigns_collector_return_directly_not_as_singleton_tuple():
+    source = (ROOT / "pnp" / "qplanning_fork_pilot.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    direct = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "result"
+                for target in node.targets)
+        and isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "id", None) == "collect_replay_candidate_group"
+    ]
+    singleton_wrapped = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "result"
+                for target in node.targets)
+        and isinstance(node.value, ast.Tuple) and len(node.value.elts) == 1
+        and isinstance(node.value.elts[0], ast.Call)
+        and getattr(node.value.elts[0].func, "id", None)
+        == "collect_replay_candidate_group"
+    ]
+    assert direct
+    assert not singleton_wrapped
