@@ -13,6 +13,7 @@ from pnp.qplanning_fork_pilot import (
     FORK_PILOT_STRATEGIES,
     FORK_PILOT_TRAIN_PRIORITY_FRACTION,
     FORK_PILOT_TREES_PER_STRATEGY,
+    FORK_PILOT_U20_BOUNDARIES,
     _trajectory_actions_from_payload,
     _validate_manifest,
     build_fixed_fork_manifest,
@@ -74,6 +75,7 @@ def test_fixed_manifest_has_equal_tree_budgets_and_balanced_shards():
     payload = first["payload"]
     assert payload["candidate_count"] == FORK_PILOT_CANDIDATES == 9
     assert payload["future_training_priority_fraction"] == 0.65
+    assert payload["u20_boundaries"] == FORK_PILOT_U20_BOUNDARIES == 3
     assert "exact stored source-trajectory" in payload["source_scope"]
     counts = Counter(item["strategy"] for item in payload["trees"])
     assert counts == Counter({strategy: FORK_PILOT_TREES_PER_STRATEGY
@@ -84,6 +86,8 @@ def test_fixed_manifest_has_equal_tree_budgets_and_balanced_shards():
         FORK_PILOT_TREES_PER_STRATEGY // FORK_PILOT_SHARDS}
     assert not ({item["suite"] for item in payload["trees"]}
                 & set(PRO_TEN_STATE_SUITES))
+    assert all(item["chunk_idx"] + FORK_PILOT_U20_BOUNDARIES
+               <= item["chunk_count"] for item in payload["trees"])
 
 
 def test_fork_notebooks_are_clean_and_encode_the_frozen_contract():

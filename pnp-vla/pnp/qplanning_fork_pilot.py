@@ -1,7 +1,7 @@
 """Fixed-budget same-state fork pilot for Q-planning data acquisition.
 
 The pilot compares three ways to choose tree roots from the immutable critic
-training split: uniform random, terminal-failure priority, and four-boundary
+training split: uniform random, terminal-failure priority, and three-boundary
 U20 priority.  Every selected root receives one ordinary 10-step PI0.5
 candidate and eight 3-step proposal candidates; every branch executes ten
 actions and then continues with the ordinary 10-step policy.
@@ -27,9 +27,9 @@ from .verifier.collection import (
     candidate_group_id, collect_replay_candidate_group)
 
 
-FORK_PILOT_VERSION = 2
+FORK_PILOT_VERSION = 3
 FORK_PILOT_SNAPSHOT_ID = "pcpcds-98d1f32dff8213841529b3c6"
-FORK_PILOT_MANIFEST_PATH = "qplanning_forks/manifests/fixed_three_priority_v2.json"
+FORK_PILOT_MANIFEST_PATH = "qplanning_forks/manifests/fixed_three_priority_v3.json"
 FORK_PILOT_STRATEGIES = ("random", "u20", "failure")
 FORK_PILOT_TREES_PER_STRATEGY = 64
 FORK_PILOT_CANDIDATES = 9
@@ -37,6 +37,7 @@ FORK_PILOT_SHARDS = 4
 FORK_PILOT_EXECUTED_ACTIONS = 10
 FORK_PILOT_STOCK_DENOISE_STEPS = 10
 FORK_PILOT_PROPOSAL_DENOISE_STEPS = 3
+FORK_PILOT_U20_BOUNDARIES = 3
 FORK_PILOT_TRAIN_PRIORITY_FRACTION = .65
 FORK_PILOT_SEED = 20260914
 FORK_PILOT_PRINT_EVERY_TREES = 4
@@ -79,8 +80,11 @@ def u20_profile_from_ahats(payload: bytes) -> tuple[float, ...]:
     return values
 
 
-def _four_boundary_score(profile: tuple[float, ...], chunk_idx: int) -> float:
-    return float(np.mean(profile[chunk_idx:min(len(profile), chunk_idx + 4)]))
+def _three_boundary_score(profile: tuple[float, ...], chunk_idx: int) -> float:
+    values = profile[chunk_idx:chunk_idx + FORK_PILOT_U20_BOUNDARIES]
+    if len(values) != FORK_PILOT_U20_BOUNDARIES:
+        raise ValueError("U20 root does not have three complete boundaries remaining")
+    return float(np.mean(values))
 
 
 def _root_item(row: dict, profile: tuple[float, ...], chunk_idx: int,
@@ -99,7 +103,7 @@ def _root_item(row: dict, profile: tuple[float, ...], chunk_idx: int,
         "chunk_count": len(profile),
         "normalized_chunk_position": float(chunk_idx / max(len(profile) - 1, 1)),
         "source_current_u20": float(profile[chunk_idx]),
-        "source_four_boundary_u20": _four_boundary_score(profile, chunk_idx),
+        "source_three_boundary_u20": _three_boundary_score(profile, chunk_idx),
         "source_u20_profile": [float(value) for value in profile],
         "selection_tiebreak": _rank(
             seed, strategy, row["rollout_id"], chunk_idx),
@@ -113,7 +117,7 @@ def _balanced_take(candidates: list[dict], count: int, *, strategy: str) -> list
     for suite, values in buckets.items():
         if strategy == "u20":
             values.sort(key=lambda item: (
-                -item["source_four_boundary_u20"], item["selection_tiebreak"]))
+                -item["source_three_boundary_u20"], item["selection_tiebreak"]))
         else:
             values.sort(key=lambda item: item["selection_tiebreak"])
     selected = []
@@ -157,7 +161,10 @@ def build_fixed_fork_manifest(source_rows: list[dict], profiles: dict[str, tuple
         profile = tuple(profiles.get(str(row["rollout_id"]), ()))
         # Chunk zero is intentionally excluded: the acquisition question concerns
         # mid-trajectory correction rather than restarting the whole task.
-        eligible = list(range(1, len(profile)))
+        # Every arm gets the same intervention opportunity: the selected
+        # 10-action chunk plus two complete 10-action continuation chunks.
+        eligible = list(range(
+            1, len(profile) - FORK_PILOT_U20_BOUNDARIES + 1))
         if not eligible:
             continue
         random_chunk = eligible[int(_rank(
@@ -169,7 +176,7 @@ def build_fixed_fork_manifest(source_rows: list[dict], profiles: dict[str, tuple
                 _root_item(row, profile, random_chunk, "failure", seed=seed))
         u_chunk = min(
             eligible,
-            key=lambda index: (-_four_boundary_score(profile, index), index))
+            key=lambda index: (-_three_boundary_score(profile, index), index))
         candidates["u20"].append(
             _root_item(row, profile, u_chunk, "u20", seed=seed))
 
@@ -196,6 +203,7 @@ def build_fixed_fork_manifest(source_rows: list[dict], profiles: dict[str, tuple
         "executed_actions": FORK_PILOT_EXECUTED_ACTIONS,
         "stock_denoise_steps": FORK_PILOT_STOCK_DENOISE_STEPS,
         "proposal_denoise_steps": FORK_PILOT_PROPOSAL_DENOISE_STEPS,
+        "u20_boundaries": FORK_PILOT_U20_BOUNDARIES,
         "future_training_priority_fraction": FORK_PILOT_TRAIN_PRIORITY_FRACTION,
         "source_scope": (
             "Q-planning snapshot training split; LIBERO-PRO train suites only; "
@@ -497,7 +505,7 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
                 "source_rollout_id": item["source_rollout_id"],
                 "source_success": item["source_success"],
                 "source_current_u20": item["source_current_u20"],
-                "source_four_boundary_u20": item["source_four_boundary_u20"],
+                "source_three_boundary_u20": item["source_three_boundary_u20"],
                 "source_u20_profile": item["source_u20_profile"],
                 "normalized_chunk_position": item["normalized_chunk_position"],
                 "future_training_priority_fraction": FORK_PILOT_TRAIN_PRIORITY_FRACTION,
@@ -671,7 +679,7 @@ def load_fork_pilot_results(*, store=None,
                 if len(group) else np.nan,
             "mean_selected_current_u20": float(group.source_current_u20.mean())
                 if len(group) else np.nan,
-            "mean_selected_four_boundary_u20": float(group.source_four_boundary_u20.mean())
+            "mean_selected_three_boundary_u20": float(group.source_three_boundary_u20.mean())
                 if len(group) else np.nan,
         })
     return trees, pd.DataFrame(summary_rows)
