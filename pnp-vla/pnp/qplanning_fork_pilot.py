@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 import re
 import threading
+import time
 
 import numpy as np
 
@@ -27,9 +28,9 @@ from .verifier.collection import (
     candidate_group_id, collect_replay_candidate_group)
 
 
-FORK_PILOT_VERSION = 3
+FORK_PILOT_VERSION = 4
 FORK_PILOT_SNAPSHOT_ID = "pcpcds-98d1f32dff8213841529b3c6"
-FORK_PILOT_MANIFEST_PATH = "qplanning_forks/manifests/fixed_three_priority_v3.json"
+FORK_PILOT_MANIFEST_PATH = "qplanning_forks/manifests/fixed_three_priority_v4.json"
 FORK_PILOT_STRATEGIES = ("random", "u20", "failure")
 FORK_PILOT_TREES_PER_STRATEGY = 64
 FORK_PILOT_CANDIDATES = 9
@@ -41,6 +42,8 @@ FORK_PILOT_U20_BOUNDARIES = 3
 FORK_PILOT_TRAIN_PRIORITY_FRACTION = .65
 FORK_PILOT_SEED = 20260914
 FORK_PILOT_PRINT_EVERY_TREES = 4
+FORK_PILOT_SKIP_UNUSED_RENDERS = True
+FORK_PILOT_RENDER_LEAD = 2
 _U_TIME_KEY = re.compile(r"^c(?P<chunk>\d+)_s(?P<step>\d+)_u_time$")
 
 
@@ -204,6 +207,8 @@ def build_fixed_fork_manifest(source_rows: list[dict], profiles: dict[str, tuple
         "stock_denoise_steps": FORK_PILOT_STOCK_DENOISE_STEPS,
         "proposal_denoise_steps": FORK_PILOT_PROPOSAL_DENOISE_STEPS,
         "u20_boundaries": FORK_PILOT_U20_BOUNDARIES,
+        "skip_unused_renders": FORK_PILOT_SKIP_UNUSED_RENDERS,
+        "render_lead": FORK_PILOT_RENDER_LEAD,
         "future_training_priority_fraction": FORK_PILOT_TRAIN_PRIORITY_FRACTION,
         "source_scope": (
             "Q-planning snapshot training split; LIBERO-PRO train suites only; "
@@ -227,6 +232,10 @@ def _validate_manifest(document: dict) -> dict:
         raise ValueError("fork-pilot manifest hash mismatch")
     if payload.get("snapshot_id") != FORK_PILOT_SNAPSHOT_ID:
         raise ValueError("fork-pilot manifest uses the wrong immutable dataset snapshot")
+    if payload.get("skip_unused_renders") is not True:
+        raise ValueError("fork-pilot manifest must use validated sparse rendering")
+    if payload.get("render_lead") != FORK_PILOT_RENDER_LEAD:
+        raise ValueError("fork-pilot manifest uses the wrong camera render lead")
     expected = FORK_PILOT_TREES_PER_STRATEGY * len(FORK_PILOT_STRATEGIES)
     if len(payload.get("trees", [])) != expected:
         raise ValueError(f"fork-pilot manifest must contain {expected} trees")
@@ -453,8 +462,11 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
     if not pending:
         return {"new_trees": 0, "requested_trees": len(items), "complete": len(complete)}
 
+    print(f"[qfork] preparing {len(pending)} pending trees: resolving LIBERO-PRO tasks", flush=True)
     lookup = _episode_lookup(items)
+    print("[qfork] downloading compact stored parent trajectories", flush=True)
     source_replay_actions = _load_source_replay_actions(store, pending)
+    print("[qfork] loading PI0.5 policy", flush=True)
     policy, preprocess, postprocess = models.load_pi05()
     device = models.default_device()
     policy.model._pnp.num_steps = FORK_PILOT_STOCK_DENOISE_STEPS
@@ -469,11 +481,19 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
             "executed_actions": FORK_PILOT_EXECUTED_ACTIONS,
             "stock_denoise_steps": FORK_PILOT_STOCK_DENOISE_STEPS,
             "proposal_denoise_steps": FORK_PILOT_PROPOSAL_DENOISE_STEPS,
+            "skip_unused_renders": FORK_PILOT_SKIP_UNUSED_RENDERS,
+            "render_lead": FORK_PILOT_RENDER_LEAD,
             "videos": False,
         })
     new_trees = 0
+    collection_started = time.monotonic()
     try:
         for item in pending:
+            tree_started = time.monotonic()
+            print(
+                f"[qfork] starting tree {new_trees + 1}/{len(pending)} | "
+                f"{item['strategy']} | {item['suite']} | chunk {item['chunk_idx']}",
+                flush=True)
             ep = dict(lookup[(
                 item["suite"], int(item["task_idx"]), int(item["episode_idx"]))])
             ep["behavior_seed_index"] = 0
@@ -491,6 +511,8 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
                     model_revision=payload["policy_revision"],
                     n_action_steps=FORK_PILOT_EXECUTED_ACTIONS,
                     candidate_num_inference_steps=FORK_PILOT_PROPOSAL_DENOISE_STEPS,
+                    skip_unused_renders=FORK_PILOT_SKIP_UNUSED_RENDERS,
+                    render_lead=FORK_PILOT_RENDER_LEAD,
                     replay_actions_override=source_replay_actions[
                         item["source_rollout_id"]][
                             :int(item["chunk_idx"]) * FORK_PILOT_EXECUTED_ACTIONS])
@@ -512,6 +534,19 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
             })
             store.register_candidate_group(group, candidates)
             new_trees += 1
+            successes = [bool(candidate["success"]) for candidate in candidates]
+            stock_success = bool(candidates[0]["success"])
+            elapsed = time.monotonic() - collection_started
+            seconds_per_tree = elapsed / new_trees
+            eta_seconds = seconds_per_tree * (len(pending) - new_trees)
+            print(
+                f"[qfork] completed tree {new_trees}/{len(pending)} | "
+                f"branches={sum(successes)}/{len(successes)} success | "
+                f"stock={'S' if stock_success else 'F'} | "
+                f"mixed={len(set(successes)) > 1} | "
+                f"tree={time.monotonic() - tree_started:.1f}s | "
+                f"elapsed={elapsed / 60:.1f}m | ETA={eta_seconds / 60:.1f}m",
+                flush=True)
             if new_trees % FORK_PILOT_PRINT_EVERY_TREES == 0:
                 _, table = _progress(store, items)
                 print(table, flush=True)
@@ -560,6 +595,8 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
                     model_revision=payload["policy_revision"],
                     n_action_steps=FORK_PILOT_EXECUTED_ACTIONS,
                     candidate_num_inference_steps=FORK_PILOT_PROPOSAL_DENOISE_STEPS,
+                    skip_unused_renders=FORK_PILOT_SKIP_UNUSED_RENDERS,
+                    render_lead=FORK_PILOT_RENDER_LEAD,
                     replay_actions_override=source_replay_actions[
                         item["source_rollout_id"]][
                             :int(item["chunk_idx"]) * FORK_PILOT_EXECUTED_ACTIONS])

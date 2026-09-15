@@ -372,6 +372,12 @@ replayed, then every branch is checked after canonical MuJoCo state correction. 
 episode replays and repeated GPU predictions are logged separately as reproducibility diagnostics;
 they are not required to be byte-identical for a persisted tree whose candidates are generated once.
 
+The collection workers use the rollout path's validated sparse-rendering schedule: physics still
+advances on every action, while unused camera observations are disabled between policy boundaries.
+Both cameras are re-enabled for two full simulator steps before every observation consumed by the
+policy. Videos and frame sequences remain off. These render settings are frozen in the version-4
+manifest, and each completed tree prints its own outcome summary, duration, and ETA.
+
 ### Longer-term: settings without an environment failure signal
 
 The Q-Planning paper notes settings without a readily available environment failure signal as a

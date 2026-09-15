@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from ..config import LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT
-from ..libero_env import obs_to_policy
+from ..libero_env import obs_to_policy, set_camera_observables
 from ..rollout import _draw_chunk_noise, chunk_noise_seed, episode_seed
 from ..sampler import _temp_strategy
 
@@ -354,58 +354,96 @@ def postprocess_chunk(chunk, postprocess, device):
 
 
 def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
-                      prefix, branch_seed, steps_already, n_action_steps=None):
+                      prefix, branch_seed, steps_already, n_action_steps=None,
+                      skip_unused_renders: bool = False, render_lead: int = 2):
     success = False
     steps = steps_already
     chunk_stride = int(n_action_steps or policy.config.chunk_size)
     est_chunks = max(1, round(ep["max_steps"] / chunk_stride))
-    for action in prefix:
-        obs, _, done, _ = env.step(action)
-        steps += 1
-        if env.check_success():
-            return True, steps
-        if done or steps >= ep["max_steps"]:
-            return False, steps
-    queue, replan = [], 0
-    while steps < ep["max_steps"]:
-        if not queue:
-            # Match run_episode's time conditioning. Derive it from the
-            # environment step count so every independently restored branch is
-            # insensitive to whatever chunk_pos a previous branch left behind.
-            chunk_index = steps // chunk_stride
-            policy.model._pnp.chunk_pos = min(chunk_index / est_chunks, 1.0)
-            batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
-            noise = _draw_chunk_noise(policy, device, chunk_noise_seed(branch_seed, replan))
-            chunk, _ = predict_clean_chunk(policy, batch, noise)
-            # Closed-loop continuation: execute only the first n_action_steps of each generated
-            # chunk before replanning (mirrors run_episode). None => execute the full chunk
-            # (historical open-loop behavior), so existing callers are unchanged.
-            rows = list(chunk.squeeze(0).detach().cpu().numpy())
-            queue = rows if n_action_steps is None else rows[:int(n_action_steps)]
-            replan += 1
-        action = queue.pop(0)
-        action = postprocess_chunk(np.asarray(action)[None], postprocess, device)[0]
-        obs, _, done, _ = env.step(action)
-        steps += 1
-        if env.check_success():
-            success = True
-            break
-        if done:
-            break
-    return success, steps
+    lead = max(1, int(render_lead))
+    skipping = bool(skip_unused_renders and set_camera_observables(env, True))
+
+    def _render_next(needed: bool) -> None:
+        if skipping:
+            set_camera_observables(env, needed)
+
+    prefix = list(prefix)
+    try:
+        for index, action in enumerate(prefix):
+            # The observation after the prefix is the first one consumed by the
+            # continuation policy. Warm both cameras for the validated lead.
+            _render_next(len(prefix) - index <= lead)
+            obs, _, done, _ = env.step(action)
+            steps += 1
+            if env.check_success():
+                return True, steps
+            if done or steps >= ep["max_steps"]:
+                return False, steps
+        queue, replan = [], 0
+        while steps < ep["max_steps"]:
+            if not queue:
+                # Match run_episode's time conditioning. Derive it from the
+                # environment step count so every independently restored branch is
+                # insensitive to whatever chunk_pos a previous branch left behind.
+                chunk_index = steps // chunk_stride
+                policy.model._pnp.chunk_pos = min(chunk_index / est_chunks, 1.0)
+                batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
+                noise = _draw_chunk_noise(
+                    policy, device, chunk_noise_seed(branch_seed, replan))
+                chunk, _ = predict_clean_chunk(policy, batch, noise)
+                # Closed-loop continuation: execute only the first n_action_steps of each
+                # generated chunk before replanning (mirrors run_episode).
+                rows = list(chunk.squeeze(0).detach().cpu().numpy())
+                queue = rows if n_action_steps is None else rows[:int(n_action_steps)]
+                replan += 1
+            # This is equivalent to run_episode's `len(queue) < lead` check after pop().
+            _render_next(len(queue) <= lead)
+            action = queue.pop(0)
+            action = postprocess_chunk(np.asarray(action)[None], postprocess, device)[0]
+            obs, _, done, _ = env.step(action)
+            steps += 1
+            if env.check_success():
+                success = True
+                break
+            if done:
+                break
+        return success, steps
+    finally:
+        if skipping:
+            set_camera_observables(env, True)
 
 
-def _reset_and_replay_actions(env, ep, policy, replay_actions):
+def _reset_and_replay_actions(env, ep, policy, replay_actions, *,
+                              skip_unused_renders: bool = False,
+                              render_lead: int = 2):
     """Reach a branch state through the public environment API using fixed actions."""
-    env.reset(); policy.reset()
-    obs = env.set_init_state(ep["init_state"])
-    for _ in range(NUM_STEPS_WAIT):
-        obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
-    for action in replay_actions:
-        obs, _, done, _ = env.step(action)
-        if env.check_success() or done:
-            return None
-    return obs
+    replay_actions = list(replay_actions)
+    lead = max(1, int(render_lead))
+    skipping = bool(skip_unused_renders and set_camera_observables(env, True))
+
+    def _render_next(needed: bool) -> None:
+        if skipping:
+            set_camera_observables(env, needed)
+
+    try:
+        env.reset(); policy.reset()
+        obs = env.set_init_state(ep["init_state"])
+        for wait_step in range(NUM_STEPS_WAIT):
+            # If there is no parent replay, the final settling observation is
+            # consumed immediately. Otherwise the final parent actions provide
+            # the camera warm-up for the root observation.
+            _render_next(
+                not replay_actions and wait_step >= NUM_STEPS_WAIT - lead)
+            obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+        for index, action in enumerate(replay_actions):
+            _render_next(len(replay_actions) - index <= lead)
+            obs, _, done, _ = env.step(action)
+            if env.check_success() or done:
+                return None
+        return obs
+    finally:
+        if skipping:
+            set_camera_observables(env, True)
 
 
 def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, device, *,
@@ -419,7 +457,9 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                                    model_revision: str = "",
                                    n_action_steps: int | None = None,
                                    candidate_num_inference_steps: int | None = None,
-                                   replay_actions_override: np.ndarray | None = None):
+                                   replay_actions_override: np.ndarray | None = None,
+                                   skip_unused_renders: bool = False,
+                                   render_lead: int = 2):
     """Collect candidates at a mid-rollout state by deterministic action replay.
 
     Unlike simulator snapshots, replay reconstructs wrapper state, contacts, and
@@ -429,7 +469,6 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
     """
     seed = (int(trajectory_seed) if trajectory_seed is not None else
             episode_seed(ep["init_state"], ep.get("ep_idx", ep.get("episode_idx", 0))))
-    obs = _reset_and_replay_actions(env, ep, policy, [])
     replay_actions = []
     steps = 0
     chunk_stride = int(n_action_steps or policy.config.chunk_size)
@@ -441,12 +480,17 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
             raise ValueError(
                 f"stored parent replay must have shape ({expected}, 7), got {supplied.shape}")
         replay_source = "stored_source_trajectory"
-        for action in supplied:
-            obs, _, done, _ = env.step(action)
-            replay_actions.append(action.copy()); steps += 1
-            if env.check_success() or done:
-                return None
+        replay_actions = [action.copy() for action in supplied]
+        obs = _reset_and_replay_actions(
+            env, ep, policy, replay_actions,
+            skip_unused_renders=skip_unused_renders, render_lead=render_lead)
+        if obs is None:
+            return None
+        steps = len(replay_actions)
     else:
+        obs = _reset_and_replay_actions(
+            env, ep, policy, [], skip_unused_renders=skip_unused_renders,
+            render_lead=render_lead)
         replay_source = "regenerated_policy"
         for ci in range(chunk_idx):
             # Do not inherit time conditioning from a previous tree/branch. This
@@ -506,7 +550,9 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         trajectory_seed=trajectory_seed)
     candidates, replay_state_errors, post_correction_errors = [], [], []
     for kind in policy_chunks:
-        branch_obs = _reset_and_replay_actions(env, ep, policy, replay_actions)
+        branch_obs = _reset_and_replay_actions(
+            env, ep, policy, replay_actions,
+            skip_unused_renders=skip_unused_renders, render_lead=render_lead)
         if branch_obs is None:
             raise RuntimeError("fixed replay terminated before the branch state")
         _, branch_sim = _unwrap_sim(env)
@@ -535,7 +581,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
         success, n_steps = _run_continuation(
             env, branch_obs, ep, policy, preprocess, postprocess, device,
             prefix=env_chunks[kind][:prefix_length], branch_seed=seed ^ 0x51A7,
-            steps_already=steps, n_action_steps=n_action_steps)
+            steps_already=steps, n_action_steps=n_action_steps,
+            skip_unused_renders=skip_unused_renders, render_lead=render_lead)
         candidate_id = hashlib.sha256(f"{group_id}|{kind}".encode()).hexdigest()[:24]
         candidates.append({
             "candidate_id": candidate_id, "candidate_kind": kind, "success": success,
@@ -597,6 +644,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                           "default_candidate_denoise_steps": candidate_steps.get("default"),
                           "alternative_candidate_denoise_steps": candidate_num_inference_steps,
                           "parent_replay_n_action_steps": n_action_steps,
-                          "continuation_n_action_steps": n_action_steps},
+                          "continuation_n_action_steps": n_action_steps,
+                          "skip_unused_renders": bool(skip_unused_renders),
+                          "render_lead": int(render_lead)},
     }
     return group, candidates

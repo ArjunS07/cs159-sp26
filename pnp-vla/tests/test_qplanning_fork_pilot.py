@@ -10,10 +10,12 @@ from pnp.pcp_search.pro import PRO_TEN_STATE_SUITES, PRO_TRAIN_QUOTAS
 from pnp.qplanning_fork_pilot import (
     FORK_PILOT_CANDIDATES,
     FORK_PILOT_SHARDS,
+    FORK_PILOT_SKIP_UNUSED_RENDERS,
     FORK_PILOT_STRATEGIES,
     FORK_PILOT_TRAIN_PRIORITY_FRACTION,
     FORK_PILOT_TREES_PER_STRATEGY,
     FORK_PILOT_U20_BOUNDARIES,
+    FORK_PILOT_RENDER_LEAD,
     _trajectory_actions_from_payload,
     _validate_manifest,
     build_fixed_fork_manifest,
@@ -76,6 +78,8 @@ def test_fixed_manifest_has_equal_tree_budgets_and_balanced_shards():
     assert payload["candidate_count"] == FORK_PILOT_CANDIDATES == 9
     assert payload["future_training_priority_fraction"] == 0.65
     assert payload["u20_boundaries"] == FORK_PILOT_U20_BOUNDARIES == 3
+    assert payload["skip_unused_renders"] is FORK_PILOT_SKIP_UNUSED_RENDERS is True
+    assert payload["render_lead"] == FORK_PILOT_RENDER_LEAD == 2
     assert "exact stored source-trajectory" in payload["source_scope"]
     counts = Counter(item["strategy"] for item in payload["trees"])
     assert counts == Counter({strategy: FORK_PILOT_TREES_PER_STRATEGY

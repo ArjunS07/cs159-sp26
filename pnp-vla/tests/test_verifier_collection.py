@@ -200,6 +200,56 @@ def test_run_continuation_replans_every_n_action_steps():
         assert positions == [0, 1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6]
 
 
+def test_sparse_rendering_warms_two_steps_before_each_policy_observation():
+    import numpy as np
+    import torch
+    from unittest.mock import patch
+    from pnp.verifier import collection as C
+
+    camera = {"enabled": True}
+    rendered_steps = []
+
+    class FakeEnv:
+        def step(self, _action):
+            rendered_steps.append(camera["enabled"])
+            return {}, 0.0, False, {}
+
+        def check_success(self):
+            return False
+
+    class PNP:
+        chunk_pos = -1.0
+
+    class Model:
+        _pnp = PNP()
+
+    class Config:
+        chunk_size = 3
+
+    class Policy:
+        model = Model()
+        config = Config()
+
+    def toggle(_env, enabled):
+        camera["enabled"] = bool(enabled)
+        return True
+
+    chunk = torch.zeros((1, 3, 7))
+    ep = {"task_desc": "t", "max_steps": 6}
+    with (patch.object(C, "set_camera_observables", toggle),
+          patch.object(C, "obs_to_policy", lambda _obs, _desc: {}),
+          patch.object(C, "_draw_chunk_noise", lambda *a, **k: None),
+          patch.object(C, "predict_clean_chunk", lambda *a, **k: (chunk, None)),
+          patch.object(C, "postprocess_chunk", lambda arr, *a, **k: np.asarray(arr))):
+        success, steps = C._run_continuation(
+            FakeEnv(), {}, ep, Policy(), lambda o: o, lambda a: a,
+            torch.device("cpu"), prefix=[], branch_seed=1, steps_already=0,
+            skip_unused_renders=True, render_lead=2)
+    assert not success and steps == 6
+    assert rendered_steps == [False, True, True, False, True, True]
+    assert camera["enabled"] is True
+
+
 def test_context_capture_is_noninvasive_and_restores_attention_backend():
     from types import SimpleNamespace
     import numpy as np
