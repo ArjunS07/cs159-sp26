@@ -25,7 +25,9 @@ from .pcp_critic.registry import PCPCriticRegistry
 from .pcp_critic.resumable_snapshot import _download_with_retry
 from .pcp_search.pro import PRO_TRAIN_QUOTAS, PRO_TEN_STATE_SUITES
 from .verifier.collection import (
-    candidate_group_id, collect_replay_candidate_group)
+    _reset_and_replay_actions, _unwrap_sim,
+    candidate_group_id, collect_replay_candidate_group, postprocess_chunk,
+    predict_clean_chunk)
 
 
 FORK_PILOT_VERSION = 4
@@ -380,6 +382,159 @@ def _load_source_replay_actions(store, items: list[dict]) -> dict[str, np.ndarra
     return result
 
 
+_SOURCE_FIDELITY_ARRAYS = (
+    "initial_state", "episode_seed", "actions_env", "sim_state_t_plus_1", "chunk_start_steps",
+    "chunk_noise_seeds", "bellman/action", "boundary/step",
+    "boundary/raw_agentview", "boundary/raw_wrist", "boundary/raw_robot_state",
+    "boundary/policy_proprio", "boundary/sim_state",
+)
+
+
+def _load_selected_training_arrays(store, path: str,
+                                   names=_SOURCE_FIDELITY_ARRAYS
+                                   ) -> dict[str, np.ndarray]:
+    """Load only source-fidelity arrays from a legacy or multipart artifact."""
+    wanted = tuple(names)
+    payload = _download_with_retry(store, path)
+    if path.endswith(".npz"):
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+            missing = sorted(set(wanted) - set(archive.files))
+            if missing:
+                raise ValueError(f"training artifact is missing {missing}")
+            return {name: np.asarray(archive[name]).copy() for name in wanted}
+
+    manifest = json.loads(payload)
+    arrays = manifest.get("arrays")
+    if not isinstance(arrays, dict):
+        raise ValueError(f"invalid multipart training-data manifest at {path}")
+    missing = sorted(set(wanted) - set(arrays))
+    if missing:
+        raise ValueError(f"training artifact is missing {missing}")
+    part_cache: dict[str, dict[str, np.ndarray]] = {}
+    result = {}
+    for name in wanted:
+        spec = arrays[name]
+        shape, dtype = tuple(spec["shape"]), np.dtype(spec["dtype"])
+        output = np.empty(shape, dtype=dtype)
+        scalar = not shape
+        populated_scalar = False
+        for part in spec["parts"]:
+            key = str(part["path"])
+            if key not in part_cache:
+                part_payload = _download_with_retry(store, key)
+                with np.load(io.BytesIO(part_payload), allow_pickle=False) as archive:
+                    part_cache[key] = {
+                        item: np.asarray(archive[item]).copy() for item in archive.files}
+            value = part_cache[key][name]
+            start, stop = part.get("start"), part.get("stop")
+            if start is None:
+                output[...] = value
+                populated_scalar = scalar
+            else:
+                output[int(start):int(stop)] = value
+        if scalar and not populated_scalar:
+            raise ValueError(f"multipart scalar {name} has no payload")
+        result[name] = output
+    return result
+
+
+def _load_source_fidelity_bundles(store, items: list[dict]) -> dict[str, dict]:
+    rollout_ids = sorted({str(item["source_rollout_id"]) for item in items})
+    rows = []
+    for start in range(0, len(rollout_ids), 100):
+        batch = rollout_ids[start:start + 100]
+        rows.extend(store.fetch_all(
+            "rollouts",
+            "rollout_id,trajectory_path,training_data_path,success,n_steps,"
+            "init_state_hash,bddl_sha256",
+            configure=lambda query, batch=batch: query.in_("rollout_id", batch),
+            order_by=("rollout_id",)))
+    by_id = {str(row["rollout_id"]): row for row in rows}
+    missing = [rollout_id for rollout_id in rollout_ids
+               if rollout_id not in by_id
+               or not by_id[rollout_id].get("trajectory_path")
+               or not by_id[rollout_id].get("training_data_path")]
+    if missing:
+        raise ValueError(
+            "source-fidelity preflight requires trajectory and training artifacts; "
+            f"missing {missing[:3]}")
+    bundles = {}
+    for index, rollout_id in enumerate(rollout_ids, 1):
+        row = by_id[rollout_id]
+        compact_actions = _trajectory_actions_from_payload(
+            _download_with_retry(store, row["trajectory_path"]))
+        arrays = _load_selected_training_arrays(store, row["training_data_path"])
+        training_actions = np.asarray(arrays["actions_env"], np.float32)
+        if not np.array_equal(compact_actions, training_actions):
+            raise AssertionError(
+                f"source {rollout_id} compact/training actions differ")
+        bundles[rollout_id] = {
+            "row": row, "arrays": arrays, "actions": compact_actions}
+        print(f"[qfork] source-fidelity artifacts: {index}/{len(rollout_ids)}",
+              flush=True)
+    return bundles
+
+
+def _raw_robot_state_from_obs(obs) -> np.ndarray:
+    return np.concatenate([
+        obs["robot0_eef_pos"], obs["robot0_eef_quat"],
+        obs["robot0_gripper_qpos"],
+    ]).astype(np.float32, copy=True)
+
+
+def _source_policy_observation(arrays: dict, boundary_index: int,
+                               task_desc: str) -> dict:
+    """Recreate obs_to_policy's input from the exact stored source boundary."""
+    from .libero_env import obs_to_policy
+
+    robot = np.asarray(
+        arrays["boundary/raw_robot_state"][boundary_index], np.float32)
+    raw = {
+        "agentview_image": np.asarray(
+            arrays["boundary/raw_agentview"][boundary_index]).copy(),
+        "robot0_eye_in_hand_image": np.asarray(
+            arrays["boundary/raw_wrist"][boundary_index]).copy(),
+        "robot0_eef_pos": robot[:3].copy(),
+        "robot0_eef_quat": robot[3:7].copy(),
+        "robot0_gripper_qpos": robot[7:9].copy(),
+    }
+    return obs_to_policy(raw, task_desc)
+
+
+def _set_flat_sim_state(env, state: np.ndarray) -> float:
+    _, sim = _unwrap_sim(env)
+    value = np.asarray(state).copy()
+    setter = getattr(sim, "set_state_from_flattened", None)
+    if not callable(setter):
+        raise RuntimeError("MuJoCo simulator has no set_state_from_flattened")
+    setter(value)
+    sim.forward()
+    return float(np.max(np.abs(np.asarray(sim.get_state().flatten()) - value)))
+
+
+def _execute_source_actions(env, actions: np.ndarray, *, capture_frames=False,
+                            initial_frame=None) -> dict:
+    frames = []
+    if capture_frames and initial_frame is not None:
+        frames.append(np.ascontiguousarray(initial_frame[::-1, ::-1]))
+    success = False
+    done_at = None
+    obs = None
+    for index, action in enumerate(np.asarray(actions, np.float32)):
+        obs, _, done, _ = env.step(action)
+        success = bool(env.check_success())
+        if capture_frames:
+            frames.append(np.ascontiguousarray(
+                obs["agentview_image"][::-1, ::-1]))
+        if success or done:
+            done_at = index + 1
+            break
+    return {
+        "success": success, "steps": done_at or len(actions), "obs": obs,
+        "frames": frames,
+    }
+
+
 def _group_id(item: dict) -> str:
     return candidate_group_id(
         "libero_pro", item["suite"], item["task_idx"], item["episode_idx"],
@@ -677,6 +832,303 @@ def run_fork_restoration_preflight(*, manifest_path: str = FORK_PILOT_MANIFEST_P
             raise AssertionError(f"fork restoration preflight failed: {report}")
         reports.append(report)
     return reports
+
+
+def _source_boundary(bundle: dict, item: dict) -> dict:
+    arrays = bundle["arrays"]
+    chunk_index = int(item["chunk_idx"])
+    starts = np.asarray(arrays["chunk_start_steps"], np.int64)
+    boundary_steps = np.asarray(arrays["boundary/step"], np.int64)
+    if chunk_index >= len(starts):
+        raise ValueError(
+            f"source {item['source_rollout_id']} has no chunk {chunk_index}")
+    root_step = int(starts[chunk_index])
+    matches = np.flatnonzero(boundary_steps == root_step)
+    if len(matches) != 1:
+        raise ValueError(
+            f"source root step {root_step} maps to {len(matches)} boundaries")
+    boundary_index = int(matches[0])
+    if root_step != chunk_index * FORK_PILOT_EXECUTED_ACTIONS:
+        raise AssertionError(
+            f"source chunk stride is not 10: chunk={chunk_index}, step={root_step}")
+    return {
+        "root_step": root_step,
+        "boundary_index": boundary_index,
+        "sim_state": np.asarray(
+            arrays["sim_state_t_plus_1"][root_step]).copy(),
+        "boundary_sim_state": np.asarray(
+            arrays["boundary/sim_state"][boundary_index]).copy(),
+        "raw_agentview": np.asarray(
+            arrays["boundary/raw_agentview"][boundary_index]).copy(),
+        "raw_wrist": np.asarray(
+            arrays["boundary/raw_wrist"][boundary_index]).copy(),
+        "raw_robot": np.asarray(
+            arrays["boundary/raw_robot_state"][boundary_index], np.float32).copy(),
+        "policy_proprio": np.asarray(
+            arrays["boundary/policy_proprio"][boundary_index], np.float32).copy(),
+        "policy_chunk": np.asarray(
+            arrays["bellman/action"][boundary_index], np.float32).copy(),
+        "noise_seed": int(np.asarray(
+            arrays["chunk_noise_seeds"])[boundary_index]),
+    }
+
+
+def _reset_to_source_root(env, ep, policy, parent_actions: np.ndarray,
+                          source_state: np.ndarray, *, sparse_rendering: bool):
+    obs, terminal_events = _reset_and_replay_actions(
+        env, ep, policy, parent_actions,
+        skip_unused_renders=sparse_rendering,
+        render_lead=FORK_PILOT_RENDER_LEAD)
+    _, sim = _unwrap_sim(env)
+    replay_state = np.asarray(sim.get_state().flatten()).copy()
+    correction_error = _set_flat_sim_state(env, source_state)
+    return obs, terminal_events, replay_state, correction_error
+
+
+def _collector_continuation_video(env, obs, ep, policy, preprocess, postprocess,
+                                  device, *, prefix: np.ndarray,
+                                  branch_seed: int, steps_already: int,
+                                  initial_frame: np.ndarray) -> dict:
+    """Video-enabled mirror of the 10-action collector continuation."""
+    from .libero_env import obs_to_policy
+    from .rollout import _draw_chunk_noise, chunk_noise_seed
+
+    frames = [np.ascontiguousarray(initial_frame[::-1, ::-1])]
+    steps = int(steps_already)
+    success = False
+    for action in np.asarray(prefix, np.float32):
+        obs, _, done, _ = env.step(action)
+        steps += 1
+        frames.append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
+        if env.check_success():
+            success = True
+            return {"success": True, "steps": steps, "frames": frames}
+        if done or steps >= int(ep["max_steps"]):
+            return {"success": False, "steps": steps, "frames": frames}
+
+    est_chunks = max(1, round(int(ep["max_steps"]) / FORK_PILOT_EXECUTED_ACTIONS))
+    queue, replan = [], 0
+    while steps < int(ep["max_steps"]):
+        if not queue:
+            chunk_index = steps // FORK_PILOT_EXECUTED_ACTIONS
+            policy.model._pnp.chunk_pos = min(chunk_index / est_chunks, 1.0)
+            batch = preprocess(obs_to_policy(obs, ep["task_desc"]))
+            noise = _draw_chunk_noise(
+                policy, device, chunk_noise_seed(branch_seed, replan))
+            chunk, _ = predict_clean_chunk(policy, batch, noise)
+            queue = list(chunk.squeeze(0).detach().cpu().numpy()[
+                :FORK_PILOT_EXECUTED_ACTIONS])
+            replan += 1
+        action = postprocess_chunk(
+            np.asarray(queue.pop(0))[None], postprocess, device)[0]
+        obs, _, done, _ = env.step(action)
+        steps += 1
+        frames.append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
+        if env.check_success():
+            success = True
+            break
+        if done:
+            break
+    return {"success": success, "steps": steps, "frames": frames}
+
+
+def run_fork_source_fidelity_preflight(
+        *, manifest_path: str = FORK_PILOT_MANIFEST_PATH, store=None,
+        video_dir: str | Path | None = None, state_atol: float = 1e-6,
+        _manifest_loader=None) -> dict:
+    """Audit current fork restoration against the original stored source rollout.
+
+    Unlike :func:`run_fork_restoration_preflight`, this test does not merely ask
+    whether two fresh replays agree.  It compares each fresh root to the exact
+    source simulator state and action/policy tensors saved during collection,
+    checks both full and root-suffix source replay outcomes, and emits one video
+    pair that isolates the collector's newly sampled continuation.
+    """
+    from . import libero_env, models
+    from .libero_env import init_state_hash, obs_to_policy
+    from .rollout import _draw_chunk_noise, _encode_mp4, episode_seed
+    from .store import SupabaseStore
+
+    store = store or SupabaseStore()
+    manifest_loader = _manifest_loader or load_fork_pilot_manifest
+    document = manifest_loader(store, manifest_path)
+    payload = document["payload"]
+    roots = [next(item for item in payload["trees"] if item["strategy"] == strategy)
+             for strategy in FORK_PILOT_STRATEGIES]
+    video_item = next(
+        (item for item in payload["trees"]
+         if item["strategy"] == "random" and bool(item["source_success"])),
+        next(item for item in payload["trees"] if bool(item["source_success"])))
+    requested = roots + ([] if video_item in roots else [video_item])
+    lookup = _episode_lookup(requested)
+    bundles = _load_source_fidelity_bundles(store, requested)
+    policy, preprocess, postprocess = models.load_pi05()
+    device = models.default_device()
+    policy.model._pnp.num_steps = FORK_PILOT_STOCK_DENOISE_STEPS
+
+    reports = []
+    for item in roots:
+        key = (item["suite"], int(item["task_idx"]), int(item["episode_idx"]))
+        ep = dict(lookup[key]); ep["behavior_seed_index"] = 0
+        bundle = bundles[str(item["source_rollout_id"])]
+        arrays, actions, row = bundle["arrays"], bundle["actions"], bundle["row"]
+        source = _source_boundary(bundle, item)
+        root_step = source["root_step"]
+        source_success = bool(item["source_success"])
+        source_row_success_exact = bool(row["success"]) == source_success
+        identity_exact = (
+            str(ep.get("init_state_hash") or init_state_hash(ep["init_state"]))
+            == str(item["init_state_hash"])
+            == str(row.get("init_state_hash") or ""))
+        initial_state_exact = np.array_equal(
+            np.asarray(ep["init_state"]), np.asarray(arrays["initial_state"]))
+        bddl_exact = str(ep.get("bddl_sha256") or "") == str(
+            row.get("bddl_sha256") or "")
+        boundary_sim_exact = np.array_equal(
+            source["sim_state"], source["boundary_sim_state"])
+        source_seed = int(np.asarray(arrays["episode_seed"]))
+        expected_seed = episode_seed(ep["init_state"], int(ep["ep_idx"]))
+        source_seed_exact = source_seed == expected_seed
+
+        env = libero_env.make_env(ep["bddl_path"])
+        try:
+            replay_obs, root_events = _reset_and_replay_actions(
+                env, ep, policy, actions[:root_step],
+                skip_unused_renders=FORK_PILOT_SKIP_UNUSED_RENDERS,
+                render_lead=FORK_PILOT_RENDER_LEAD)
+            _, sim = _unwrap_sim(env)
+            replay_state = np.asarray(sim.get_state().flatten()).copy()
+            root_state_max_abs = float(np.max(np.abs(
+                replay_state - source["sim_state"])))
+            replay_robot = _raw_robot_state_from_obs(replay_obs)
+            robot_state_max_abs = float(np.max(np.abs(
+                replay_robot - source["raw_robot"])))
+            agentview_mae = float(np.mean(np.abs(
+                np.asarray(replay_obs["agentview_image"], np.float32)
+                - np.asarray(source["raw_agentview"], np.float32))))
+            wrist_mae = float(np.mean(np.abs(
+                np.asarray(replay_obs["robot0_eye_in_hand_image"], np.float32)
+                - np.asarray(source["raw_wrist"], np.float32))))
+
+            policy.model._pnp.chunk_pos = min(
+                int(item["chunk_idx"]) /
+                max(1, round(int(ep["max_steps"]) / FORK_PILOT_EXECUTED_ACTIONS)), 1.0)
+            noise = _draw_chunk_noise(policy, device, source["noise_seed"])
+            stored_batch = preprocess(_source_policy_observation(
+                arrays, source["boundary_index"], ep["task_desc"]))
+            replay_batch = preprocess(obs_to_policy(replay_obs, ep["task_desc"]))
+            stored_prediction, _ = predict_clean_chunk(policy, stored_batch, noise)
+            replay_prediction, _ = predict_clean_chunk(policy, replay_batch, noise)
+            stored_prediction = stored_prediction.squeeze(0).detach().cpu().numpy()
+            replay_prediction = replay_prediction.squeeze(0).detach().cpu().numpy()
+            source_chunk = source["policy_chunk"]
+            stored_input_chunk_rms = float(np.sqrt(np.mean(
+                (stored_prediction[:10] - source_chunk[:10]) ** 2)))
+            replay_input_chunk_rms = float(np.sqrt(np.mean(
+                (replay_prediction[:10] - source_chunk[:10]) ** 2)))
+
+            _reset_and_replay_actions(
+                env, ep, policy, [], skip_unused_renders=False,
+                render_lead=FORK_PILOT_RENDER_LEAD)
+            full = _execute_source_actions(env, actions)
+            full_replay_success = bool(full["success"])
+            full_replay_steps_exact = int(full["steps"]) == int(row["n_steps"])
+
+            _, _, _, snap_error = _reset_to_source_root(
+                env, ep, policy, actions[:root_step], source["sim_state"],
+                sparse_rendering=False)
+            suffix = _execute_source_actions(env, actions[root_step:])
+            suffix_replay_success = bool(suffix["success"])
+        finally:
+            env.close()
+
+        collector_root_exact = root_state_max_abs <= float(state_atol)
+        behavior_exact = (
+            full_replay_success == source_success
+            and suffix_replay_success == source_success
+            and full_replay_steps_exact and not root_events)
+        passed = (
+            source_row_success_exact and identity_exact and initial_state_exact
+            and bddl_exact and boundary_sim_exact and source_seed_exact
+            and collector_root_exact and snap_error <= float(state_atol)
+            and behavior_exact)
+        report = {
+            "strategy": item["strategy"], "suite": item["suite"],
+            "task_idx": int(item["task_idx"]),
+            "episode_idx": int(item["episode_idx"]),
+            "chunk_idx": int(item["chunk_idx"]), "root_step": root_step,
+            "source_success": source_success,
+            "source_row_success_exact": bool(source_row_success_exact),
+            "identity_exact": bool(identity_exact),
+            "initial_state_exact": bool(initial_state_exact),
+            "bddl_exact": bool(bddl_exact),
+            "artifact_boundary_sim_exact": bool(boundary_sim_exact),
+            "source_seed_exact": bool(source_seed_exact),
+            "source_full_replay_success": bool(full_replay_success),
+            "source_full_replay_steps": int(full["steps"]),
+            "source_logged_steps": int(row["n_steps"]),
+            "source_full_replay_steps_exact": bool(full_replay_steps_exact),
+            "source_suffix_from_exact_root_success": bool(suffix_replay_success),
+            "behavioral_replay_exact": bool(behavior_exact),
+            "collector_root_sim_max_abs_vs_source": root_state_max_abs,
+            "collector_root_robot_max_abs_vs_source": robot_state_max_abs,
+            "collector_root_agentview_mae_0_255": agentview_mae,
+            "collector_root_wrist_mae_0_255": wrist_mae,
+            "stored_input_prediction_rms_vs_logged_first10": stored_input_chunk_rms,
+            "collector_input_prediction_rms_vs_logged_first10": replay_input_chunk_rms,
+            "exact_source_state_snap_max_abs": float(snap_error),
+            "parent_replay_terminal_events": len(root_events),
+            "current_collector_source_fidelity_passed": bool(passed),
+            "passed": bool(passed),
+        }
+        print(report, flush=True)
+        reports.append(report)
+
+    video = None
+    if video_dir is not None:
+        item = video_item
+        key = (item["suite"], int(item["task_idx"]), int(item["episode_idx"]))
+        ep = dict(lookup[key]); ep["behavior_seed_index"] = 0
+        bundle = bundles[str(item["source_rollout_id"])]
+        source = _source_boundary(bundle, item)
+        actions = bundle["actions"]
+        root_step = source["root_step"]
+        env = libero_env.make_env(ep["bddl_path"])
+        try:
+            _reset_to_source_root(
+                env, ep, policy, actions[:root_step], source["sim_state"],
+                sparse_rendering=False)
+            fixed = _execute_source_actions(
+                env, actions[root_step:], capture_frames=True,
+                initial_frame=source["raw_agentview"])
+
+            branch_obs, _, _, _ = _reset_to_source_root(
+                env, ep, policy, actions[:root_step], source["sim_state"],
+                sparse_rendering=False)
+            branch = _collector_continuation_video(
+                env, branch_obs, ep, policy, preprocess, postprocess, device,
+                prefix=actions[root_step:root_step + FORK_PILOT_EXECUTED_ACTIONS],
+                branch_seed=int(np.asarray(bundle["arrays"]["episode_seed"])) ^ 0x51A7,
+                steps_already=root_step, initial_frame=source["raw_agentview"])
+        finally:
+            env.close()
+        output = Path(video_dir).expanduser()
+        output.mkdir(parents=True, exist_ok=True)
+        stem = (f"{item['strategy']}_{item['suite']}_t{item['task_idx']}_"
+                f"e{item['episode_idx']}_c{item['chunk_idx']}")
+        fixed_path = output / f"{stem}_stored_source_suffix.mp4"
+        branch_path = output / f"{stem}_collector_continuation.mp4"
+        fixed_path.write_bytes(_encode_mp4(fixed["frames"]))
+        branch_path.write_bytes(_encode_mp4(branch["frames"]))
+        video = {
+            "identity": stem,
+            "left_label": "stored source suffix from exact source root",
+            "left_path": str(fixed_path), "left_success": bool(fixed["success"]),
+            "right_label": "same first 10 actions, then collector continuation",
+            "right_path": str(branch_path), "right_success": bool(branch["success"]),
+        }
+        print(video, flush=True)
+    return {"reports": reports, "video": video}
 
 
 def load_fork_pilot_results(*, store=None,

@@ -16,11 +16,15 @@ from pnp.qplanning_fork_pilot import (
     FORK_PILOT_TREES_PER_STRATEGY,
     FORK_PILOT_U20_BOUNDARIES,
     FORK_PILOT_RENDER_LEAD,
+    _SOURCE_FIDELITY_ARRAYS,
+    _load_selected_training_arrays,
+    _source_boundary,
     _trajectory_actions_from_payload,
     _validate_manifest,
     build_fixed_fork_manifest,
     u20_profile_from_ahats,
 )
+from pnp.store import _training_data_payloads
 
 
 ROOT = Path(__file__).parents[1]
@@ -45,6 +49,65 @@ def test_compact_source_trajectory_actions_are_lossless():
     np.savez_compressed(payload, actions=actions, robot_state=np.zeros((20, 8)))
     loaded = _trajectory_actions_from_payload(payload.getvalue())
     np.testing.assert_array_equal(loaded, actions)
+
+
+def test_source_fidelity_loader_selects_arrays_from_multipart_artifact():
+    rng = np.random.default_rng(3)
+    arrays = {
+        "initial_state": rng.normal(size=12),
+        "episode_seed": np.asarray(11, np.int64),
+        "actions_env": rng.normal(size=(20, 7)).astype(np.float32),
+        "sim_state_t_plus_1": rng.normal(size=(21, 18)),
+        "chunk_start_steps": np.asarray([0, 10], np.int32),
+        "chunk_noise_seeds": np.asarray([4, 5, 6], np.int64),
+        "bellman/action": rng.normal(size=(2, 50, 7)).astype(np.float32),
+        "boundary/step": np.asarray([0, 10, 20], np.int32),
+        "boundary/raw_agentview": rng.integers(
+            0, 256, size=(3, 32, 32, 3), dtype=np.uint8),
+        "boundary/raw_wrist": rng.integers(
+            0, 256, size=(3, 32, 32, 3), dtype=np.uint8),
+        "boundary/raw_robot_state": rng.normal(size=(3, 9)).astype(np.float32),
+        "boundary/policy_proprio": rng.normal(size=(3, 8)).astype(np.float32),
+        "boundary/sim_state": rng.normal(size=(3, 18)),
+    }
+    manifest_path, payloads = _training_data_payloads(
+        "source", arrays, max_part_bytes=16384)
+    assert manifest_path.endswith("manifest.json")
+
+    class Store:
+        def __init__(self):
+            self.payloads = dict(payloads)
+
+        def _download(self, path):
+            return self.payloads[path]
+
+    loaded = _load_selected_training_arrays(Store(), manifest_path)
+    assert set(loaded) == set(_SOURCE_FIDELITY_ARRAYS)
+    for name in _SOURCE_FIDELITY_ARRAYS:
+        np.testing.assert_array_equal(loaded[name], arrays[name])
+
+
+def test_source_boundary_uses_persisted_boundary_index_and_ten_action_stride():
+    arrays = {
+        "chunk_start_steps": np.asarray([0, 10, 20], np.int32),
+        "boundary/step": np.asarray([0, 10, 20, 27], np.int32),
+        "sim_state_t_plus_1": np.arange(28 * 4).reshape(28, 4),
+        "boundary/raw_agentview": np.zeros((4, 2, 2, 3), np.uint8),
+        "boundary/raw_wrist": np.zeros((4, 2, 2, 3), np.uint8),
+        "boundary/raw_robot_state": np.zeros((4, 9), np.float32),
+        "boundary/policy_proprio": np.zeros((4, 8), np.float32),
+        "boundary/sim_state": np.asarray([
+            np.arange(0, 4), np.arange(40, 44),
+            np.arange(80, 84), np.arange(108, 112)]),
+        "bellman/action": np.zeros((4, 50, 7), np.float32),
+        "chunk_noise_seeds": np.asarray([1, 2, 3, 4], np.int64),
+    }
+    source = _source_boundary(
+        {"arrays": arrays}, {"chunk_idx": 2, "source_rollout_id": "r"})
+    assert source["root_step"] == 20
+    assert source["boundary_index"] == 2
+    np.testing.assert_array_equal(source["sim_state"], arrays["sim_state_t_plus_1"][20])
+    np.testing.assert_array_equal(source["boundary_sim_state"], source["sim_state"])
 
 
 def _source_fixture():
@@ -112,7 +175,9 @@ def test_fork_notebooks_are_clean_and_encode_the_frozen_contract():
                 assert cell["outputs"] == []
                 ast.parse("".join(cell["source"]), filename=f"{path.name}:{cell_index}")
     preflight = paths[0].read_text(encoding="utf-8")
-    assert "run_fork_restoration_preflight" in preflight
+    assert "run_fork_source_fidelity_preflight" in preflight
+    assert "source_fidelity_videos" in preflight
+    assert "DO NOT launch/resume fork collectors" in preflight
     for index, path in enumerate(paths[1:5]):
         source = path.read_text(encoding="utf-8")
         assert f"SHARD_INDEX = {index}" in source
