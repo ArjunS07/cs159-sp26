@@ -9,11 +9,13 @@ import numpy as np
 from pnp.pcp_search.pro import PRO_TEN_STATE_SUITES, PRO_TRAIN_QUOTAS
 from pnp.qplanning_fork_pilot import (
     FORK_PILOT_CANDIDATES,
+    FORK_PILOT_MANIFEST_PATH,
     FORK_PILOT_SHARDS,
     FORK_PILOT_SKIP_UNUSED_RENDERS,
     FORK_PILOT_STRATEGIES,
     FORK_PILOT_TRAIN_PRIORITY_FRACTION,
     FORK_PILOT_TREES_PER_STRATEGY,
+    FORK_PILOT_VERSION,
     FORK_PILOT_U20_BOUNDARIES,
     FORK_PILOT_RENDER_LEAD,
     _SOURCE_FIDELITY_ARRAYS,
@@ -143,7 +145,8 @@ def test_fixed_manifest_has_equal_tree_budgets_and_balanced_shards():
     assert payload["u20_boundaries"] == FORK_PILOT_U20_BOUNDARIES == 3
     assert payload["skip_unused_renders"] is FORK_PILOT_SKIP_UNUSED_RENDERS is True
     assert payload["render_lead"] == FORK_PILOT_RENDER_LEAD == 2
-    assert "exact stored source-trajectory" in payload["source_scope"]
+    assert "persisted source simulator states, policy inputs, and actions" in payload[
+        "source_scope"]
     counts = Counter(item["strategy"] for item in payload["trees"])
     assert counts == Counter({strategy: FORK_PILOT_TREES_PER_STRATEGY
                               for strategy in FORK_PILOT_STRATEGIES})
@@ -190,3 +193,8 @@ def test_fork_notebooks_are_clean_and_encode_the_frozen_contract():
 
 def test_priority_fraction_is_explicitly_sixty_five_percent():
     assert FORK_PILOT_TRAIN_PRIORITY_FRACTION == .65
+
+
+def test_corrected_pilot_uses_fresh_v5_namespace():
+    assert FORK_PILOT_VERSION == 5
+    assert FORK_PILOT_MANIFEST_PATH.endswith("fixed_three_priority_v5.json")

@@ -30,9 +30,9 @@ from .verifier.collection import (
     predict_clean_chunk)
 
 
-FORK_PILOT_VERSION = 4
+FORK_PILOT_VERSION = 5
 FORK_PILOT_SNAPSHOT_ID = "pcpcds-98d1f32dff8213841529b3c6"
-FORK_PILOT_MANIFEST_PATH = "qplanning_forks/manifests/fixed_three_priority_v4.json"
+FORK_PILOT_MANIFEST_PATH = "qplanning_forks/manifests/fixed_three_priority_v5.json"
 FORK_PILOT_STRATEGIES = ("random", "u20", "failure")
 FORK_PILOT_TREES_PER_STRATEGY = 64
 FORK_PILOT_CANDIDATES = 9
@@ -215,7 +215,7 @@ def build_fixed_fork_manifest(source_rows: list[dict], profiles: dict[str, tuple
         "source_scope": (
             "Q-planning snapshot training split; LIBERO-PRO train suites only; "
             "position and ten-state behavior-seed suites excluded; roots restored "
-            "from exact stored source-trajectory environment actions"),
+            "from persisted source simulator states, policy inputs, and actions"),
         "trees": trees,
     }
     manifest_hash = _digest(payload)
@@ -623,8 +623,8 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
 
     print(f"[qfork] preparing {len(pending)} pending trees: resolving LIBERO-PRO tasks", flush=True)
     lookup = _episode_lookup(items)
-    print("[qfork] downloading compact stored parent trajectories", flush=True)
-    source_replay_actions = _load_source_replay_actions(store, pending)
+    print("[qfork] downloading persisted source states, inputs, and actions", flush=True)
+    source_bundles = _load_source_fidelity_bundles(store, pending)
     print("[qfork] loading PI0.5 policy", flush=True)
     policy, preprocess, postprocess = models.load_pi05()
     device = models.default_device()
@@ -658,6 +658,11 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
             ep = dict(lookup[(
                 item["suite"], int(item["task_idx"]), int(item["episode_idx"]))])
             ep["behavior_seed_index"] = 0
+            source_bundle = source_bundles[str(item["source_rollout_id"])]
+            source = _source_boundary(source_bundle, item)
+            if str(ep.get("init_state_hash") or "") != str(item["init_state_hash"]):
+                raise AssertionError(
+                    f"source identity mismatch for {item['source_rollout_id']}")
             env = libero_env.make_env(ep["bddl_path"])
             try:
                 result = collect_replay_candidate_group(
@@ -674,9 +679,12 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
                     candidate_num_inference_steps=FORK_PILOT_PROPOSAL_DENOISE_STEPS,
                     skip_unused_renders=FORK_PILOT_SKIP_UNUSED_RENDERS,
                     render_lead=FORK_PILOT_RENDER_LEAD,
-                    replay_actions_override=source_replay_actions[
-                        item["source_rollout_id"]][
-                            :int(item["chunk_idx"]) * int(_replan_actions)])
+                    replay_actions_override=source_bundle["actions"][
+                        :int(item["chunk_idx"]) * int(_replan_actions)],
+                    source_sim_state_override=source["sim_state"],
+                    source_policy_observation_override=_source_policy_observation(
+                        source_bundle["arrays"], source["boundary_index"],
+                        ep["task_desc"])),
             finally:
                 env.close()
             if result is None:
@@ -694,6 +702,7 @@ def run_fork_pilot_worker(*, shard_index: int, shard_count: int = FORK_PILOT_SHA
                 "future_training_priority_fraction": FORK_PILOT_TRAIN_PRIORITY_FRACTION,
                 "candidate_intervention_actions": int(_intervention_actions),
                 "continuation_replan_actions": int(_replan_actions),
+                "source_restoration": "persisted_sim_state_and_policy_input",
             })
             store.register_candidate_group(group, candidates)
             new_trees += 1
@@ -935,7 +944,8 @@ def _collector_continuation_video(env, obs, ep, policy, preprocess, postprocess,
 def run_fork_source_fidelity_preflight(
         *, manifest_path: str = FORK_PILOT_MANIFEST_PATH, store=None,
         video_dir: str | Path | None = None, state_atol: float = 1e-6,
-        _manifest_loader=None) -> dict:
+        _manifest_loader=None,
+        _intervention_actions: int = FORK_PILOT_EXECUTED_ACTIONS) -> dict:
     """Audit current fork restoration against the original stored source rollout.
 
     Unlike :func:`run_fork_restoration_preflight`, this test does not merely ask
@@ -1014,8 +1024,15 @@ def run_fork_source_fidelity_preflight(
                 int(item["chunk_idx"]) /
                 max(1, round(int(ep["max_steps"]) / FORK_PILOT_EXECUTED_ACTIONS)), 1.0)
             noise = _draw_chunk_noise(policy, device, source["noise_seed"])
-            stored_batch = preprocess(_source_policy_observation(
-                arrays, source["boundary_index"], ep["task_desc"]))
+            source_policy_observation = _source_policy_observation(
+                arrays, source["boundary_index"], ep["task_desc"])
+            source_policy_proprio = source_policy_observation["observation.state"]
+            if hasattr(source_policy_proprio, "detach"):
+                source_policy_proprio = source_policy_proprio.detach().cpu().numpy()
+            source_policy_proprio_error = float(np.max(np.abs(
+                np.asarray(source_policy_proprio, np.float32)
+                - source["policy_proprio"])))
+            stored_batch = preprocess(source_policy_observation)
             replay_batch = preprocess(obs_to_policy(replay_obs, ep["task_desc"]))
             stored_prediction, _ = predict_clean_chunk(policy, stored_batch, noise)
             replay_prediction, _ = predict_clean_chunk(policy, replay_batch, noise)
@@ -1042,7 +1059,7 @@ def run_fork_source_fidelity_preflight(
         finally:
             env.close()
 
-        collector_root_exact = root_state_max_abs <= float(state_atol)
+        pre_snap_replay_exact = root_state_max_abs <= float(state_atol)
         behavior_exact = (
             full_replay_success == source_success
             and suffix_replay_success == source_success
@@ -1050,7 +1067,8 @@ def run_fork_source_fidelity_preflight(
         passed = (
             source_row_success_exact and identity_exact and initial_state_exact
             and bddl_exact and boundary_sim_exact and source_seed_exact
-            and collector_root_exact and snap_error <= float(state_atol)
+            and source_policy_proprio_error <= float(state_atol)
+            and snap_error <= float(state_atol)
             and behavior_exact)
         report = {
             "strategy": item["strategy"], "suite": item["suite"],
@@ -1074,9 +1092,12 @@ def run_fork_source_fidelity_preflight(
             "collector_root_robot_max_abs_vs_source": robot_state_max_abs,
             "collector_root_agentview_mae_0_255": agentview_mae,
             "collector_root_wrist_mae_0_255": wrist_mae,
+            "persisted_policy_proprio_reconstruction_max_abs":
+                source_policy_proprio_error,
             "stored_input_prediction_rms_vs_logged_first10": stored_input_chunk_rms,
             "collector_input_prediction_rms_vs_logged_first10": replay_input_chunk_rms,
             "exact_source_state_snap_max_abs": float(snap_error),
+            "pre_snap_action_replay_exact": bool(pre_snap_replay_exact),
             "parent_replay_terminal_events": len(root_events),
             "current_collector_source_fidelity_passed": bool(passed),
             "passed": bool(passed),
@@ -1107,7 +1128,7 @@ def run_fork_source_fidelity_preflight(
                 sparse_rendering=False)
             branch = _collector_continuation_video(
                 env, branch_obs, ep, policy, preprocess, postprocess, device,
-                prefix=actions[root_step:root_step + FORK_PILOT_EXECUTED_ACTIONS],
+                prefix=actions[root_step:root_step + int(_intervention_actions)],
                 branch_seed=int(np.asarray(bundle["arrays"]["episode_seed"])) ^ 0x51A7,
                 steps_already=root_step, initial_frame=source["raw_agentview"])
         finally:
@@ -1124,7 +1145,9 @@ def run_fork_source_fidelity_preflight(
             "identity": stem,
             "left_label": "stored source suffix from exact source root",
             "left_path": str(fixed_path), "left_success": bool(fixed["success"]),
-            "right_label": "same first 10 actions, then collector continuation",
+            "right_label": (
+                f"same first {int(_intervention_actions)} actions, "
+                "then collector continuation"),
             "right_path": str(branch_path), "right_success": bool(branch["success"]),
         }
         print(video, flush=True)

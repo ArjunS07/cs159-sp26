@@ -471,6 +471,8 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                                    n_action_steps: int | None = None,
                                    candidate_num_inference_steps: int | None = None,
                                    replay_actions_override: np.ndarray | None = None,
+                                   source_sim_state_override: np.ndarray | None = None,
+                                   source_policy_observation_override: dict | None = None,
                                    skip_unused_renders: bool = False,
                                    render_lead: int = 2):
     """Collect candidates at a mid-rollout state by deterministic action replay.
@@ -522,10 +524,32 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                     return None
 
     _, canonical_sim = _unwrap_sim(env)
+    replay_root_state = np.asarray(canonical_sim.get_state().flatten()).copy()
+    source_state_set_error = None
+    if source_sim_state_override is not None:
+        source_state = np.asarray(source_sim_state_override).copy()
+        setter = getattr(canonical_sim, "set_state_from_flattened", None)
+        if not callable(setter):
+            raise RuntimeError("MuJoCo simulator has no set_state_from_flattened")
+        setter(source_state)
+        canonical_sim.forward()
+        restored = np.asarray(canonical_sim.get_state().flatten()).copy()
+        if restored.shape != source_state.shape:
+            raise ValueError(
+                f"persisted source state shape {source_state.shape} does not match "
+                f"simulator state {restored.shape}")
+        source_state_set_error = float(np.max(np.abs(restored - source_state)))
+        if source_state_set_error > state_atol:
+            raise RuntimeError(
+                "persisted source simulator-state restoration failed "
+                f"(max_abs={source_state_set_error:.3g})")
     canonical_sim_state = copy.deepcopy(canonical_sim.get_state())
     canonical_state = np.asarray(canonical_sim_state.flatten()).copy()
     policy.model._pnp.chunk_pos = min(chunk_idx / est_chunks, 1.0)
-    policy_observation = obs_to_policy(obs, ep["task_desc"])
+    policy_observation = (
+        copy.deepcopy(source_policy_observation_override)
+        if source_policy_observation_override is not None
+        else obs_to_policy(obs, ep["task_desc"]))
     batch = preprocess(policy_observation)
     root_policy_input_digest = _content_digest(batch)
     policy_chunks = {}
@@ -643,6 +667,17 @@ def collect_replay_candidate_group(env, ep, policy, preprocess, postprocess, dev
                               post_correction_errors, default=0.0),
                           "replay_action_count": len(replay_actions),
                           "parent_replay_source": replay_source,
+                          "canonical_root_source": (
+                              "persisted_source_artifact"
+                              if source_sim_state_override is not None
+                              else "fresh_action_replay"),
+                          "policy_input_source": (
+                              "persisted_source_artifact"
+                              if source_policy_observation_override is not None
+                              else "fresh_action_replay"),
+                          "replay_root_max_abs_vs_canonical": float(np.max(np.abs(
+                              replay_root_state - canonical_state))),
+                          "persisted_source_state_set_max_abs": source_state_set_error,
                           "parent_replay_actions_sha256": _content_digest(
                               np.asarray(replay_actions, dtype=np.float32)),
                           "canonical_parent_replay_reported_terminal_events":

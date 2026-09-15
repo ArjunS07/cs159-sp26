@@ -289,6 +289,93 @@ def test_fixed_parent_replay_logs_but_does_not_truncate_terminal_flags():
     ]
 
 
+def test_candidate_collection_uses_persisted_source_state_and_policy_input():
+    from types import SimpleNamespace
+    import numpy as np
+    import torch
+    from unittest.mock import patch
+    from pnp.verifier import collection as C
+
+    class FakeState:
+        def __init__(self, values):
+            self.values = np.asarray(values, np.float64).copy()
+
+        def flatten(self):
+            return self.values.copy()
+
+    class FakeSim:
+        def __init__(self):
+            self.values = np.asarray([9.0, 9.0])
+
+        def get_state(self):
+            return FakeState(self.values)
+
+        def set_state_from_flattened(self, values):
+            self.values = np.asarray(values).copy()
+
+        def set_state(self, state):
+            self.values = state.flatten()
+
+        def forward(self):
+            pass
+
+    class FakeEnv:
+        def __init__(self):
+            self.sim = FakeSim()
+
+        def reset(self):
+            self.sim.values = np.asarray([9.0, 9.0])
+
+        def set_init_state(self, _state):
+            return {"fresh_replay": True}
+
+        def step(self, _action):
+            return {"fresh_replay": True}, 0.0, False, {}
+
+        def check_success(self):
+            return False
+
+    class Policy:
+        config = SimpleNamespace(chunk_size=2, max_action_dim=7)
+        model = SimpleNamespace(_pnp=SimpleNamespace(num_steps=10, chunk_pos=-1.0))
+
+        def reset(self):
+            pass
+
+    source_observation = {"persisted_source": True}
+    seen = []
+
+    def preprocess(observation):
+        seen.append(observation)
+        return observation
+
+    def predict(_policy, batch, _noise, capture_context=False):
+        assert batch is source_observation or batch == source_observation
+        return torch.zeros((1, 2, 7)), None
+
+    with (patch.object(C, "NUM_STEPS_WAIT", 0),
+          patch.object(C, "_draw_chunk_noise", lambda *a, **k: torch.zeros((1, 2, 7))),
+          patch.object(C, "predict_clean_chunk", predict),
+          patch.object(C, "postprocess_chunk", lambda value, *a, **k: np.asarray(value)),
+          patch.object(C, "_run_continuation", lambda *a, **k: (False, 0))):
+        group, _ = C.collect_replay_candidate_group(
+            FakeEnv(),
+            {"init_state": np.zeros(1), "task_desc": "task", "max_steps": 20,
+             "suite": "suite", "task_idx": 0, "ep_idx": 0},
+            Policy(), preprocess, lambda value: value, torch.device("cpu"),
+            chunk_idx=0, uncertainty_stratum="test", candidate_count=1,
+            n_action_steps=2,
+            replay_actions_override=np.zeros((0, 7), np.float32),
+            source_sim_state_override=np.asarray([3.0, 4.0]),
+            source_policy_observation_override=source_observation)
+
+    assert seen == [source_observation]
+    assert group["metadata_json"]["canonical_root_source"] == "persisted_source_artifact"
+    assert group["metadata_json"]["policy_input_source"] == "persisted_source_artifact"
+    assert group["metadata_json"]["persisted_source_state_set_max_abs"] == 0.0
+    assert group["metadata_json"]["replay_root_max_abs_vs_canonical"] == 6.0
+
+
 def test_context_capture_is_noninvasive_and_restores_attention_backend():
     from types import SimpleNamespace
     import numpy as np

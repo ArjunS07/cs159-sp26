@@ -13,8 +13,10 @@ from pnp.qplanning_fork_pilot import (
 )
 from pnp.qplanning_fork20_pilot import (
     FORK20_INTERVENTION_ACTIONS,
+    FORK20_MANIFEST_PATH,
     FORK20_REPLAN_ACTIONS,
     FORK20_REQUIRED_BOUNDARIES,
+    FORK20_VERSION,
     _validate_fork20_manifest,
     build_fixed_fork20_manifest,
 )
@@ -102,3 +104,8 @@ def test_fork20_notebooks_are_clean_and_encode_action_cadences():
     analysis = paths[-1].read_text(encoding="utf-8")
     assert "paired_with_10action_tree" in analysis
     assert "mixed_20action_pct" in analysis
+
+
+def test_corrected_fork20_pilot_uses_fresh_v2_namespace():
+    assert FORK20_VERSION == 2
+    assert FORK20_MANIFEST_PATH.endswith("fixed_three_priority_20action_v2.json")

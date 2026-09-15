@@ -42,14 +42,14 @@ from .qplanning_fork_pilot import (
     _three_boundary_score,
     load_fork_pilot_manifest,
     run_fork_pilot_worker,
-    run_fork_restoration_preflight,
+    run_fork_source_fidelity_preflight,
     u20_profile_from_ahats,
 )
 
 
-FORK20_VERSION = 1
+FORK20_VERSION = 2
 FORK20_MANIFEST_PATH = (
-    "qplanning_forks/manifests/fixed_three_priority_20action_v1.json")
+    "qplanning_forks/manifests/fixed_three_priority_20action_v2.json")
 FORK20_INTERVENTION_ACTIONS = 20
 FORK20_REPLAN_ACTIONS = 10
 FORK20_REQUIRED_BOUNDARIES = 4
@@ -67,7 +67,7 @@ def build_fixed_fork20_manifest(
         trees_per_strategy: int = FORK_PILOT_TREES_PER_STRATEGY,
         seed: int = FORK_PILOT_SEED,
         snapshot_id: str = FORK_PILOT_SNAPSHOT_ID) -> dict:
-    """Build a deterministic four-boundary manifest, retaining v4 roots when eligible."""
+    """Build a deterministic four-boundary manifest, retaining v5 roots when eligible."""
     if trees_per_strategy < 1 or trees_per_strategy % FORK_PILOT_SHARDS:
         raise ValueError("trees_per_strategy must be positive and divisible by four")
     by_identity = {}
@@ -169,7 +169,7 @@ def build_fixed_fork20_manifest(
         "source_scope": (
             "Q-planning snapshot training split; LIBERO-PRO train suites only; "
             "position and ten-state behavior-seed suites excluded; roots restored "
-            "from exact stored source-trajectory environment actions"),
+            "from persisted source simulator states, policy inputs, and actions"),
         "trees": trees,
     }
     initial_hash = _digest(payload)
@@ -228,7 +228,7 @@ def create_fork20_pilot_manifest(
         snapshot_id: str = FORK_PILOT_SNAPSHOT_ID,
         reference_manifest_path: str = FORK_PILOT_MANIFEST_PATH,
         download_workers: int = 8) -> dict:
-    """Publish a four-boundary manifest maximally paired to the 10-action v4 roots."""
+    """Publish a four-boundary manifest maximally paired to corrected 10-action v5 roots."""
     if snapshot_id != FORK_PILOT_SNAPSHOT_ID:
         raise ValueError("fork20 is frozen to the prior critic snapshot")
     if not 1 <= int(download_workers) <= 8:
@@ -317,12 +317,13 @@ def run_fork20_pilot_worker(
 
 
 def run_fork20_restoration_preflight(
-        *, manifest_path: str = FORK20_MANIFEST_PATH, store=None) -> list[dict]:
-    return run_fork_restoration_preflight(
+        *, manifest_path: str = FORK20_MANIFEST_PATH, store=None,
+        video_dir: str | Path | None = None) -> dict:
+    return run_fork_source_fidelity_preflight(
         manifest_path=manifest_path, store=store,
         _manifest_loader=load_fork20_pilot_manifest,
         _intervention_actions=FORK20_INTERVENTION_ACTIONS,
-        _replan_actions=FORK20_REPLAN_ACTIONS)
+        video_dir=video_dir)
 
 
 def load_fork20_pilot_results(
