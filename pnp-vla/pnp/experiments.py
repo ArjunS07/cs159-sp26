@@ -886,6 +886,9 @@ def run_smolvla_libero_worker(
         },
         report_every=0,
         report_every_identities=10,
+        # The generic default is the legacy pi0.5 LIBERO-PRO reference table,
+        # which is unrelated to this standard-LIBERO SmolVLA cohort.
+        historical_sr=False,
         progress_include_overall=True,
         progress_count_label="identities",
         rollout_batch_size=rollout_batch_size,

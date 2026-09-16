@@ -45,7 +45,7 @@ def test_two_smolvla_launchers_have_fixed_unique_indices():
         assert "SHARD_COUNT = 2" in source
         assert f"SHARD_INDEX = {index}" in source
         assert "run_smolvla_libero_worker" in source
-        assert "ROLLOUT_BATCH_SIZE = 2" in source
+        assert "ROLLOUT_BATCH_SIZE = 8" in source
         assert "'n_action_steps': 10" in source
         assert "'integration_steps': 10" in source
         assert "'video': 'off'" in source
