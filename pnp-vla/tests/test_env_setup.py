@@ -83,6 +83,45 @@ class LiberoConfigTests(unittest.TestCase):
                         self.assertFalse(env_setup._ensure_libero_config(config_dir))
                     find_spec.assert_not_called()
 
+    def test_asset_download_retries_and_requires_complete_markers(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as root:
+            package_root = os.path.join(root, "site", "libero")
+            inner_root = os.path.join(package_root, "libero")
+            os.makedirs(inner_root)
+            open(os.path.join(inner_root, "__init__.py"), "w").close()
+            spec = types.SimpleNamespace(submodule_search_locations=[package_root])
+            calls = []
+
+            def download(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise ConnectionError("transient")
+                for marker in env_setup._LIBERO_ASSET_MARKERS:
+                    path = os.path.join(kwargs["local_dir"], marker)
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    open(path, "w").close()
+
+            hub = types.ModuleType("huggingface_hub")
+            hub.snapshot_download = download
+            with (
+                mock.patch.object(
+                    env_setup.importlib.util, "find_spec", return_value=spec),
+                mock.patch.dict(sys.modules, {"huggingface_hub": hub}),
+                mock.patch.object(env_setup.time, "sleep") as sleep,
+            ):
+                self.assertTrue(env_setup._ensure_libero_assets(
+                    "token", max_attempts=3, max_workers=2))
+                self.assertFalse(env_setup._ensure_libero_assets(
+                    "token", max_attempts=3, max_workers=2))
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[-1]["repo_id"], env_setup.LIBERO_ASSETS_REPO)
+            self.assertEqual(calls[-1]["repo_type"], "dataset")
+            self.assertEqual(calls[-1]["max_workers"], 2)
+            sleep.assert_called_once()
+
 
 class RuntimeValidationTests(unittest.TestCase):
     def test_runtime_output_filters_only_known_noise(self):
@@ -129,7 +168,8 @@ class RuntimeValidationTests(unittest.TestCase):
                 mock.patch.dict(sys.modules, {"huggingface_hub": hub}):
             self.assertEqual(env_setup._require_hf_credentials(), "stored-token")
 
-    def test_model_import_failure_never_prints_ready(self):
+    @mock.patch.object(env_setup, "_ensure_libero_assets", return_value=False)
+    def test_model_import_failure_never_prints_ready(self, _assets):
         torch = types.SimpleNamespace(
             __version__="2.test",
             version=types.SimpleNamespace(cuda="13.test"),

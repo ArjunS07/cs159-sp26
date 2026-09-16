@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import warnings
 
 
@@ -30,6 +31,12 @@ _NVIDIA_EGL_ICD = {"file_format_version": "1.0.0",
                    "ICD": {"library_path": "libEGL_nvidia.so.0"}}
 _NVIDIA_EGL_SEARCH_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib",
                            "/usr/lib/aarch64-linux-gnu")
+LIBERO_ASSETS_REPO = "lerobot/libero-assets"
+_LIBERO_ASSET_MARKERS = (
+    "scenes/libero_living_room_tabletop_base_style.xml",
+    "scenes/libero_kitchen_tabletop_base_style.xml",
+    "wall.xml",
+)
 
 
 def _find_nvidia_egl_library(search_dirs=_NVIDIA_EGL_SEARCH_DIRS) -> str | None:
@@ -118,6 +125,69 @@ def _ensure_libero_config(config_dir: str | None = None) -> bool:
         json.dump(paths, handle, indent=2)
     print(f"Initialized LIBERO default paths at {config_file} (noninteractive).")
     return True
+
+
+def _ensure_libero_assets(token: str | None = None, *, max_attempts: int = 4,
+                          max_workers: int = 4) -> bool:
+    """Download a complete LIBERO asset tree, resuming interrupted transfers."""
+    spec = importlib.util.find_spec("libero")
+    locations = list(spec.submodule_search_locations or []) if spec else []
+    if not locations:
+        return False
+    package_root = locations[0]
+    inner_root = os.path.join(package_root, "libero")
+    benchmark_root = (
+        inner_root
+        if os.path.isfile(os.path.join(inner_root, "__init__.py"))
+        else package_root
+    )
+    assets_dir = os.path.join(benchmark_root, "assets")
+
+    def complete() -> bool:
+        return all(os.path.isfile(os.path.join(assets_dir, marker))
+                   for marker in _LIBERO_ASSET_MARKERS)
+
+    if complete():
+        return False
+    if max_attempts < 1 or max_workers < 1:
+        raise ValueError("asset download retries and workers must be positive")
+
+    from huggingface_hub import snapshot_download
+
+    os.makedirs(assets_dir, exist_ok=True)
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(
+                f"LIBERO assets incomplete; resumable download attempt "
+                f"{attempt}/{max_attempts} from {LIBERO_ASSETS_REPO}...")
+            snapshot_download(
+                repo_id=LIBERO_ASSETS_REPO,
+                repo_type="dataset",
+                local_dir=assets_dir,
+                token=token,
+                max_workers=max_workers,
+            )
+            if complete():
+                print(f"LIBERO assets complete at {assets_dir}")
+                return True
+            last_error = FileNotFoundError(
+                "asset snapshot returned without required scene files")
+        except Exception as exc:
+            last_error = exc
+            print(f"LIBERO asset attempt {attempt}/{max_attempts} failed: {exc}")
+        if attempt < max_attempts:
+            time.sleep(min(2 ** (attempt - 1), 8))
+
+    missing = [
+        marker for marker in _LIBERO_ASSET_MARKERS
+        if not os.path.isfile(os.path.join(assets_dir, marker))
+    ]
+    raise RuntimeError(
+        f"LIBERO assets remain incomplete after {max_attempts} resumable attempts; "
+        f"missing {missing}. Last error: {last_error}") from last_error
 
 
 def _fix_torch_quant_compat() -> tuple[str, ...]:
@@ -292,8 +362,9 @@ def setup_environment(hf_home: str = "/content/hf_home") -> None:
         print(f"Patched Torch quantization constants: {', '.join(patched)}")
     _remove_torchao()
     _remove_broken_optional_torchaudio()
-    _require_hf_credentials()
+    token = _require_hf_credentials()
     _ensure_libero_config()
+    _ensure_libero_assets(token)
     modules = _verify_model_and_sim_imports()
 
     try:
