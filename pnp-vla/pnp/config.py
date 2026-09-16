@@ -61,6 +61,7 @@ def resolve_max_steps(suite: str) -> int:
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 PI05_REPO_ID = "lerobot/pi05_libero_finetuned"
+SMOLVLA_REPO_ID = "HuggingFaceVLA/smolvla_libero"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RNG

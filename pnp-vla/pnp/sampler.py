@@ -123,6 +123,15 @@ def install_patch(model) -> None:
     model.sample_actions = types.MethodType(_sample_actions_hooked, model)
 
 
+def install_smolvla_patch(model) -> None:
+    """Swap SmolVLA's Euler sampler for the common tap-aware loop (idempotent)."""
+    if not hasattr(model, "_orig_sample_actions"):
+        model._orig_sample_actions = model.sample_actions
+    model._pnp = _SamplerState()
+    import types
+    model.sample_actions = types.MethodType(_sample_actions_smolvla_hooked, model)
+
+
 def set_strategy(model, strategy) -> None:
     model._pnp.strategy = strategy
 
@@ -258,6 +267,100 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
             return self.denoise_step(
                 prefix_pad_masks=prefix_pad_masks, past_key_values=past_key_values,
                 x_t=inp, timestep=_ts)
+
+        if strat.selected(step, s):
+            ctx.step = step
+            x_t = strat.step(x_t, s, vfield, ctx)
+        x_t = x_t + dt * vfield(x_t)
+
+    strat.finish(ctx)
+    if not strat.invasive:
+        return baseline_action
+    if needs_baseline_fallback:
+        finalize_action = getattr(strat, "finalize_action", None)
+        if finalize_action is None:
+            raise RuntimeError(
+                "strategy requested a baseline fallback without finalize_action")
+        return finalize_action(baseline_action, x_t)
+    return x_t
+
+
+@torch.no_grad()
+def _sample_actions_smolvla_hooked(
+        self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs):
+    """Tap-aware copy of the pinned LeRobot SmolVLA Euler loop.
+
+    A non-invasive tap returns the saved stock sampler output from the exact
+    same initial noise. Its custom loop only measures uncertainty.
+    """
+    from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
+
+    num_steps = int(self._pnp.num_steps or self.config.num_steps)
+    strat = self._pnp.strategy
+    if strat is None:
+        return self._orig_sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs)
+
+    bsize = state.shape[0]
+    device = state.device
+    if noise is None:
+        noise = self.sample_noise(
+            (bsize, self.config.chunk_size, self.config.max_action_dim), device)
+
+    baseline_action = None
+    needs_baseline_fallback = bool(
+        getattr(strat, "needs_baseline_fallback", False))
+    if not strat.invasive or needs_baseline_fallback:
+        baseline_action = self._orig_sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state,
+            noise=noise.clone(), **kwargs).clone()
+        self._pnp.vf_evals += num_steps
+
+    begin_chunk = getattr(strat, "begin_chunk", None)
+    if begin_chunk is not None:
+        begin_chunk()
+
+    prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        images, img_masks, lang_tokens, lang_masks, state=state)
+    prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+    prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+    _, past_key_values = self.vlm_with_expert.forward(
+        attention_mask=prefix_att_2d_masks,
+        position_ids=prefix_position_ids,
+        past_key_values=None,
+        inputs_embeds=[prefix_embs, None],
+        use_cache=self.config.use_cache,
+        fill_kv_cache=True,
+    )
+
+    positions = self._pnp.chunk_pos
+    ctx = ChunkContext(
+        num_steps=num_steps,
+        device=device,
+        obs_enc=prefix_embs.mean(dim=1).detach(),
+        chunk_pos=float(positions) if not isinstance(positions, (list, tuple)) else 0.0,
+        chunk_positions=positions,
+        prefix_embeddings=prefix_embs,
+        prefix_pad_masks=prefix_pad_masks,
+    )
+    if hasattr(strat, "recorders"):
+        ctx.records = [[] for _ in range(bsize)]
+
+    dt = -1.0 / num_steps
+    x_t = noise
+    for step in range(num_steps):
+        s = 1.0 + step * dt
+        time_tensor = torch.tensor(
+            s, dtype=torch.float32, device=device).expand(bsize)
+
+        def vfield(inp, _ts=time_tensor):
+            self._pnp.vf_evals += 1
+            return self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=inp,
+                timestep=_ts,
+            )
 
         if strat.selected(step, s):
             ctx.step = step

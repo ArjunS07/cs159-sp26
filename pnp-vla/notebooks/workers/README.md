@@ -4,6 +4,21 @@ These are stable launchers for stock LIBERO and the canonical LIBERO-PRO collect
 experiment logic lives in `pnp.experiments`; every launcher pulls `main` before importing it.
 Do not copy rollout logic into these notebooks.
 
+## SmolVLA standard LIBERO A10 pilot
+
+Notebook 83 restores SmolVLA to the current unified rollout framework and covers the standard
+400-identity slice (four suites x ten tasks x ten initial states) in two fixed shards. Each
+identity runs two arms: exact stock actions with measurement-only P&P telemetry, and always-on
+refine-last P&P. Both arms use 10 Euler integration steps, generate 50 actions, and execute only
+the first 10 before replanning. K=5 probes run at zero-based Euler steps (3,4), with U10/U20/U50,
+contraction, and per-action-dimension uncertainty persisted. Videos and observation frames are
+off; progress prints every 10 completed matched identities.
+
+| Shard | Launcher |
+| ---: | --- |
+| 0 | [Open SmolVLA worker 0 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/83_smolvla_libero_a10_worker_0.ipynb) |
+| 1 | [Open SmolVLA worker 1 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/83_smolvla_libero_a10_worker_1.ipynb) |
+
 ## Stock LIBERO (completed)
 
 | Shard | Launcher |

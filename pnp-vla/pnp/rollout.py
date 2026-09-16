@@ -640,7 +640,13 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
     vf_evals = sum(int(runtime_policy.model._pnp.vf_evals)
                    for runtime_policy in unique_policies)
     if vf_evals == 0:                                   # vanilla path (orig sampler doesn't count)
-        vf_evals = (config.num_inference_steps or policy.config.num_inference_steps) * max(ci, 1)
+        default_steps = getattr(policy.config, "num_inference_steps", None)
+        if default_steps is None:
+            default_steps = getattr(
+                getattr(policy.model, "config", None), "num_steps", None)
+        if default_steps is None:
+            raise AttributeError("policy config exposes no flow-matching integration-step count")
+        vf_evals = (config.num_inference_steps or default_steps) * max(ci, 1)
 
     # video sink: encode iff configured for this outcome ('all', or 'failures_only' on failure)
     video_bytes = None
@@ -889,8 +895,15 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 for lane, i in enumerate(infer_ids):
                     state = states[i]; arr = arrays[lane]
                     state["inference_ms"] += infer_ms
+                    default_steps = getattr(policy.config, "num_inference_steps", None)
+                    if default_steps is None:
+                        default_steps = getattr(
+                            getattr(policy.model, "config", None), "num_steps", None)
+                    if default_steps is None:
+                        raise AttributeError(
+                            "policy config exposes no flow-matching integration-step count")
                     state["vf_evals"] += vf_delta or (
-                        config.num_inference_steps or policy.config.num_inference_steps)
+                        config.num_inference_steps or default_steps)
                     # Closed-loop execution: execute only the first n_action_steps of the
                     # generated chunk, then replan (mirrors _run_episode_serial). Omitted =>
                     # execute the full generated chunk (historical open-loop behavior).

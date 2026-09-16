@@ -37,6 +37,11 @@ LIBERO_HORIZON_DIAGNOSTICS_EXPERIMENT = "libero-u-horizon-k5-steps34-a10-v1"
 LIBERO_HORIZON_DIAGNOSTIC_K = 5
 LIBERO_HORIZON_DIAGNOSTIC_STEPS = (3, 4)
 
+# Matched SmolVLA pilot on the same 400-identity standard-LIBERO manifest.
+SMOLVLA_LIBERO_EXPERIMENT = "smolvla-libero-a10-pnp-k5-steps34-v1"
+SMOLVLA_LIBERO_K = 5
+SMOLVLA_LIBERO_STEPS = (3, 4)
+
 LIBERO_SKIP_RENDERS = True
 LIBERO_RENDER_LEAD = 2
 PRO_EXPERIMENT = "libero-pro-canonical-core-k3-v1"
@@ -105,6 +110,28 @@ def build_libero_horizon_diagnostic_methods():
     if config.refine or config.refine_average:
         raise AssertionError("the horizon diagnostic must remain a no-op probe")
     return [(Method.UNCERTAINTY, config)]
+
+
+def build_smolvla_libero_methods():
+    """Stock+measurement and always-on refinement with identical P&P settings."""
+    common = dict(
+        pnp_steps=SMOLVLA_LIBERO_STEPS,
+        pnp_k=SMOLVLA_LIBERO_K,
+        n_action_steps=LIBERO_ACTION_STEPS,
+        save_time_uncertainty=True,
+        save_trajectory=True,
+        skip_unused_renders=LIBERO_SKIP_RENDERS,
+        render_lead=LIBERO_RENDER_LEAD,
+    )
+    methods = [
+        (Method.UNCERTAINTY, RolloutConfig(**common)),
+        (Method.REFINEMENT, RolloutConfig(**common, refine=True)),
+    ]
+    if methods[0][1].refine or not methods[1][1].refine:
+        raise AssertionError("SmolVLA arms must be no-op measurement then refinement")
+    if any(config.n_action_steps != 10 for _, config in methods):
+        raise AssertionError("SmolVLA pilot must execute exactly 10 actions per query")
+    return methods
 
 
 def build_broad_methods(full_methods=None):
@@ -789,6 +816,78 @@ def run_libero_horizon_diagnostic_worker(
             "contraction_horizons": [10, 20, 50],
             "save_pcp_features": True, "refinement": False},
         report_every=25, initial_tally=initial_tally, historical_sr=historical_sr)
+
+
+def run_smolvla_libero_worker(
+        *, shard_count: int = 2, shard_index: int = 0,
+        experiment: str = SMOLVLA_LIBERO_EXPERIMENT,
+        rollout_batch_size: int = 2):
+    """Run stock-measurement and refinement on a 400-identity LIBERO cohort."""
+    from . import models
+    from .config import SMOLVLA_REPO_ID
+    from .store import gather_provenance
+
+    all_episodes = _prepare_libero_episodes()
+    episodes = identity_shard(all_episodes, shard_count, shard_index)
+    methods = build_smolvla_libero_methods()
+    expected = len(episodes) * len(methods)
+    print({
+        "experiment": experiment,
+        "model": SMOLVLA_REPO_ID,
+        "cohort": "standard LIBERO: 4 suites x 10 tasks x 10 episodes",
+        "full_standard_libero_identities": 2000,
+        "pilot_identities": len(all_episodes),
+        "identities_in_shard": len(episodes),
+        "arms": ["stock + measurement-only P&P", "always-on P&P refinement"],
+        "rollouts_in_shard": expected,
+        "integration_steps": 10,
+        "n_action_steps": LIBERO_ACTION_STEPS,
+        "generated_chunk_size": 50,
+        "pnp_k": SMOLVLA_LIBERO_K,
+        "pnp_steps": list(SMOLVLA_LIBERO_STEPS),
+        "diagnostics": ["U10", "U20", "U50", "contraction10/20/50", "per-dimension U"],
+        "video": "off",
+    })
+    print("Periodic output: matched two-arm SR and uncertainty diagnostics every 10 identities.")
+
+    policy, preprocess, postprocess = models.load_smolvla()
+    provenance = gather_provenance(model_repo_id=SMOLVLA_REPO_ID)
+    provenance["policy_model"] = "smolvla"
+    store = SupabaseStore()
+    _run_collection(
+        store=store,
+        policy=policy,
+        preprocess=preprocess,
+        postprocess=postprocess,
+        device=models.default_device(),
+        experiment=experiment,
+        episodes=episodes,
+        methods=methods,
+        cohort="smolvla_libero_a10",
+        shard_count=shard_count,
+        shard_index=shard_index,
+        benchmark="libero",
+        driver="smolvla_libero_a10_pnp",
+        run_metadata={
+            "model_repo_id": SMOLVLA_REPO_ID,
+            "target_identities": len(all_episodes),
+            "n_action_steps": LIBERO_ACTION_STEPS,
+            "generated_chunk_size": 50,
+            "integration_steps": 10,
+            "pnp_k": SMOLVLA_LIBERO_K,
+            "pnp_steps": list(SMOLVLA_LIBERO_STEPS),
+            "uncertainty_horizons": [10, 20, 50],
+            "contraction_horizons": [10, 20, 50],
+            "refinement": "last P&P state, always on",
+            "video": "off",
+        },
+        report_every=0,
+        report_every_identities=10,
+        progress_include_overall=True,
+        progress_count_label="identities",
+        rollout_batch_size=rollout_batch_size,
+        provenance=provenance,
+    )
 
 
 def run_libero_pro_worker(*, shard_count: int, shard_index: int,

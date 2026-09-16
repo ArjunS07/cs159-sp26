@@ -1,8 +1,4 @@
-"""pi0.5 model loading + P&P patch application (pi0.5 only).
-
-The SmolVLA loader, RTC, and torch.compile dual-model branches (from the original core) are
-deliberately dropped — this is pi0.5 only.
-"""
+"""VLA model loading and model-specific P&P sampler patch application."""
 from __future__ import annotations
 
 import glob
@@ -10,7 +6,7 @@ import os
 
 import torch
 
-from .config import PI05_REPO_ID
+from .config import PI05_REPO_ID, SMOLVLA_REPO_ID
 from . import sampler as _sampler
 
 
@@ -63,6 +59,14 @@ def apply_pnp_patch(policy) -> None:
     print(f"Patched pi05 sample_actions (action_dim={adim})")
 
 
+def apply_smolvla_pnp_patch(policy) -> None:
+    """Install the unified hooked sampler on a SmolVLA policy model."""
+    _sampler.install_smolvla_patch(policy.model)
+    adim = _infer_action_dim(policy)
+    policy.model._pnp.action_dim = adim
+    print(f"Patched SmolVLA sample_actions (action_dim={adim})")
+
+
 def load_pi05(device=None, repo_id: str = PI05_REPO_ID,
               revision: str | None = None):
     """Load a pinned pi0.5 policy and its pre/post processors, patched for P&P."""
@@ -77,4 +81,33 @@ def load_pi05(device=None, repo_id: str = PI05_REPO_ID,
         preprocessor_overrides={"device_processor": {"device": str(device)}},
     )
     apply_pnp_patch(policy)
+    return policy, preprocess, postprocess
+
+
+def load_smolvla(device=None, repo_id: str = SMOLVLA_REPO_ID,
+                  revision: str | None = None):
+    """Load the LIBERO SmolVLA checkpoint and processors, patched for P&P.
+
+    The checkpoint currently stores n_action_steps=1. Rollout drivers must
+    set RolloutConfig.n_action_steps explicitly; this experiment uses 10
+    executed actions, 10 Euler steps, and a generated 50-action chunk.
+    """
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+    from lerobot.policies.factory import make_pre_post_processors
+
+    device = device or default_device()
+    snapshot_path = _ensure_hf_weights(repo_id, revision=revision)
+    policy = SmolVLAPolicy.from_pretrained(snapshot_path).to(device).eval()
+    preprocess, postprocess = make_pre_post_processors(
+        policy.config, snapshot_path,
+        preprocessor_overrides={"device_processor": {"device": str(device)}},
+    )
+    apply_smolvla_pnp_patch(policy)
+    print({
+        "model": "smolvla",
+        "repo_id": repo_id,
+        "generated_chunk_size": int(policy.config.chunk_size),
+        "integration_steps": int(policy.model.config.num_steps),
+        "checkpoint_n_action_steps": int(policy.config.n_action_steps),
+    })
     return policy, preprocess, postprocess
