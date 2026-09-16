@@ -842,11 +842,20 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                      generated=[] if config.save_generated_chunks else None,
                      frames=[] if (config.save_observations or config.video != "off") else None,
                      nan_count=0, inference_ms=0.0, vf_evals=0, perturb_gen=perturb_gen,
-                     started_at=now(), t0=time.time(), done=False)
+                     started_at=now(), t0=time.time(), done=False,
+                     skip_rendering=False)
         try:
             env.reset()
             state["obs"] = env.set_init_state(ep["init_state"])
-            for _ in range(NUM_STEPS_WAIT):
+            state["skip_rendering"] = bool(
+                config.skip_unused_renders
+                and state["frames"] is None
+                and set_camera_observables(env, True))
+            lead = max(1, int(config.render_lead))
+            for wait_step in range(NUM_STEPS_WAIT):
+                if state["skip_rendering"]:
+                    set_camera_observables(
+                        env, wait_step >= NUM_STEPS_WAIT - lead)
                 state["obs"], _, _, _ = env.step(LIBERO_DUMMY_ACTION)
             if config.save_training_data:
                 state["robot_states"].append(_raw_robot_state(state["obs"]))
@@ -953,6 +962,12 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 if not config.save_training_data:
                     state["robot_states"].append(_raw_robot_state(obs))
                 state["step"] += 1
+                # The returned observation is consumed at the next policy boundary. As in the
+                # serial runner, warm the cameras for only the final `render_lead` actions in
+                # the execution queue and skip every otherwise-discarded frame.
+                if state["skip_rendering"]:
+                    set_camera_observables(
+                        env, len(state["queue"]) < max(1, int(config.render_lead)))
                 state["obs"], reward, env_done, _ = env.step(a)
                 step_success = bool(env.check_success())
                 terminated = bool(env_done or step_success)
@@ -976,6 +991,12 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
             except Exception as exc:
                 state.update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
                              terminated_reason="error", done=True)
+
+    # `_run_collection` reuses each environment for later episodes. Restore camera observables
+    # even when an episode terminated while most of its queued actions remained unexecuted.
+    for env, state in zip(envs, states):
+        if state["skip_rendering"]:
+            set_camera_observables(env, True)
 
     # Capture all final decision boundaries together. This does not execute another action; it
     # supplies the terminal/truncated RL-token prefix and A_next required by the masked Bellman

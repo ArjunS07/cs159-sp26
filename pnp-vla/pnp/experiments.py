@@ -821,7 +821,7 @@ def run_libero_horizon_diagnostic_worker(
 def run_smolvla_libero_worker(
         *, shard_count: int = 2, shard_index: int = 0,
         experiment: str = SMOLVLA_LIBERO_EXPERIMENT,
-        rollout_batch_size: int = 2):
+        rollout_batch_size: int = 8):
     """Run stock-measurement and refinement on a 400-identity LIBERO cohort."""
     from . import models
     from .config import SMOLVLA_REPO_ID
@@ -845,6 +845,9 @@ def run_smolvla_libero_worker(
         "generated_chunk_size": 50,
         "pnp_k": SMOLVLA_LIBERO_K,
         "pnp_steps": list(SMOLVLA_LIBERO_STEPS),
+        "rollout_batch_size": rollout_batch_size,
+        "skip_unused_renders": LIBERO_SKIP_RENDERS,
+        "render_lead": LIBERO_RENDER_LEAD,
         "diagnostics": ["U10", "U20", "U50", "contraction10/20/50", "per-dimension U"],
         "video": "off",
     })

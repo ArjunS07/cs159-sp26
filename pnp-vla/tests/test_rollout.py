@@ -375,6 +375,28 @@ def test_run_episode_batch_executes_configured_horizon_then_replans():
         assert result["n_chunks"] == 4     # one chunk generated per executed action
 
 
+def test_run_episode_batch_skips_unused_renders_and_restores_cameras():
+    envs = [_TimedEnv(9), _TimedEnv(9)]
+    calls = {id(env): [] for env in envs}
+
+    def toggle(env, enabled):
+        calls[id(env)].append(bool(enabled))
+        return True
+
+    cfg = RolloutConfig(
+        n_action_steps=2, skip_unused_renders=True, render_lead=1)
+    with (patch("pnp.rollout.obs_to_policy", return_value={}),
+          patch("pnp.rollout.set_camera_observables", side_effect=toggle)):
+        run_episode_batch(
+            envs, _horizon_episodes(), _BatchPolicy(), lambda o: o,
+            lambda a: a, torch.device("cpu"), cfg)
+
+    for env in envs:
+        toggles = calls[id(env)]
+        assert False in toggles
+        assert toggles[-1] is True
+
+
 def test_run_episode_batch_matches_serial_under_closed_loop_horizon():
     cfg = RolloutConfig(n_action_steps=1, save_generated_chunks=True)
     with patch("pnp.rollout.obs_to_policy", return_value={}):
