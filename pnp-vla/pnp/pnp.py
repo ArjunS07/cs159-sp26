@@ -275,6 +275,88 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
     return result
 
 
+def extend_probe_with_final_prediction(
+        pr: ProbeResult, final_prediction_full: torch.Tensor, *, adim: int = ADIM,
+        compute_multimodal: bool = False):
+    """Append the sampler's already-computed post-perturbation clean prediction.
+
+    ``run_probe(k=K)`` records the K predictions immediately before each of its K
+    perturbations. The ordinary Euler evaluation that follows the probe supplies the
+    clean prediction after the final perturbation. Including it yields K disagreement
+    pairs (and, crucially, a real pair when K=1) without another velocity-field call.
+
+    Returns ``(a_hats, rec, lane_recs, z_hat_full)`` for telemetry sinks. The probe's
+    refinement state is intentionally unchanged.
+    """
+    final_prediction_full = torch.as_tensor(
+        final_prediction_full, device=pr.a_hats.device, dtype=pr.a_hats.dtype)
+    if tuple(final_prediction_full.shape) != tuple(pr.z_hat_full.shape):
+        raise ValueError("final prediction shape does not match the probe")
+    A = torch.cat(
+        [pr.a_hats, final_prediction_full[..., :adim].unsqueeze(0)], dim=0)
+    delta = (A[1:] - A[:-1]).abs()
+    uncertainty = delta.mean(dim=0)
+    action_std = A.std(dim=0)
+    u_time = uncertainty.mean(dim=(0, 2))
+
+    rec = dict(pr.rec)
+    rec.update({
+        "u_mean": float(uncertainty.mean()),
+        "u_max": float(uncertainty.max()),
+        "a_std_mean": float(action_std.mean()),
+        "u_vec": uncertainty.mean(dim=(0, 1)).detach().float().cpu().numpy(),
+        "a_std_vec": action_std.mean(dim=(0, 1)).detach().float().cpu().numpy(),
+        "a_mean_vec": A.mean(dim=(0, 1, 2)).detach().float().cpu().numpy(),
+        "u_time": u_time.detach().float().cpu().numpy(),
+        "u_iter_time": delta.mean(dim=(1, 3)).detach().float().cpu().numpy(),
+        "u_iter": delta.mean(dim=(1, 2, 3)).detach().float().cpu().numpy(),
+        "u_iter_vec": delta.mean(dim=(1, 2)).detach().float().cpu().numpy(),
+    })
+    for horizon in (10, 20):
+        if horizon <= len(u_time):
+            rec[f"u_prefix_{horizon}"] = float(u_time[:horizon].mean())
+
+    lane_recs = []
+    for lane in range(A.shape[1]):
+        lane_actions = A[:, lane]
+        lane_delta = (lane_actions[1:] - lane_actions[:-1]).abs()
+        lane_u = lane_delta.mean(dim=0)
+        lane_std = lane_actions.std(dim=0)
+        lane_u_time = lane_u.mean(dim=1)
+        lane_rec = {
+            "s": float(pr.s),
+            "u_mean": float(lane_u.mean()),
+            "u_max": float(lane_u.max()),
+            "a_std_mean": float(lane_std.mean()),
+            "u_vec": lane_u.mean(dim=0).detach().float().cpu().numpy(),
+            "a_std_vec": lane_std.mean(dim=0).detach().float().cpu().numpy(),
+            "a_mean_vec": lane_actions.mean(dim=(0, 1)).detach().float().cpu().numpy(),
+            "u_time": lane_u_time.detach().float().cpu().numpy(),
+            "u_iter_time": lane_delta.mean(dim=2).detach().float().cpu().numpy(),
+            "u_iter": lane_delta.mean(dim=(1, 2)).detach().float().cpu().numpy(),
+            "u_iter_vec": lane_delta.mean(dim=1).detach().float().cpu().numpy(),
+        }
+        for horizon in (10, 20):
+            if horizon <= len(lane_u_time):
+                lane_rec[f"u_prefix_{horizon}"] = float(
+                    lane_u_time[:horizon].mean())
+        if compute_multimodal and lane_actions.shape[0] >= 4:
+            bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(
+                lane_actions.detach().float().cpu().numpy())
+            lane_rec.update(bc_vec=bc_vec, mm_pc1_frac=float(pc1_frac),
+                            mm_bc_pc1=float(bc_pc1))
+        lane_recs.append(lane_rec)
+    if compute_multimodal and A.shape[0] >= 4:
+        bc_vec, pc1_frac, bc_pc1 = _multimodal_stats(
+            A.detach().float().cpu().numpy()[:, 0])
+        rec.update(bc_vec=bc_vec, mm_pc1_frac=float(pc1_frac),
+                   mm_bc_pc1=float(bc_pc1))
+
+    k = int(pr.a_hats.shape[0])
+    z_hat_full = (pr.z_hat_full * k + final_prediction_full) / float(k + 1)
+    return A, rec, lane_recs, z_hat_full
+
+
 def apply_refine(pr: ProbeResult, average: bool) -> torch.Tensor:
     """Refinement action: re-noise from the probe's clean estimate.
 

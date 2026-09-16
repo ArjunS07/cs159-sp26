@@ -36,6 +36,9 @@ def build_smolvla_schedule_method():
         pnp_k_by_step=SMOLVLA_SCHEDULE_K_BY_STEP,
         refine=True,
         n_action_steps=LIBERO_ACTION_STEPS,
+        # Persist separate per-action profiles at Euler steps 1, 2, and 3. The K=1
+        # probes use the sampler's post-perturbation Euler prediction as their second sample.
+        save_time_uncertainty=True,
         save_trajectory=True,
         skip_unused_renders=LIBERO_SKIP_RENDERS,
         render_lead=LIBERO_RENDER_LEAD,
@@ -109,6 +112,9 @@ def run_smolvla_schedule_eval_worker(
         "generated_chunk_size": 50,
         "pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
         "pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
+        "uncertainty_logging": (
+            "separate per-action U10/U20/full profiles at Euler steps 1, 2, and 3; "
+            "each K=1 probe includes its post-perturbation Euler prediction"),
         "rollout_batch_size": rollout_batch_size,
         "video": "off",
     })
@@ -140,6 +146,10 @@ def run_smolvla_schedule_eval_worker(
             "generated_chunk_size": 50,
             "pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
             "pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
+            "uncertainty_profile_steps": list(SMOLVLA_SCHEDULE_STEPS),
+            "uncertainty_profile_note": (
+                "K perturbations are logged as K disagreement pairs by reusing the "
+                "post-perturbation Euler prediction"),
             "historical_reference_experiment": SMOLVLA_LIBERO_EXPERIMENT,
             "video": "off",
         },

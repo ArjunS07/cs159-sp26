@@ -268,10 +268,16 @@ def _sample_actions_hooked(self, images, img_masks, tokens, masks, noise=None,
                 prefix_pad_masks=prefix_pad_masks, past_key_values=past_key_values,
                 x_t=inp, timestep=_ts)
 
-        if strat.selected(step, s):
+        selected = strat.selected(step, s)
+        if selected:
             ctx.step = step
             x_t = strat.step(x_t, s, vfield, ctx)
-        x_t = x_t + dt * vfield(x_t)
+        velocity = vfield(x_t)
+        if selected:
+            callback = getattr(strat, "after_selected_vfield", None)
+            if callback is not None:
+                callback(x_t, s, velocity, ctx)
+        x_t = x_t + dt * velocity
 
     strat.finish(ctx)
     if not strat.invasive:
@@ -362,10 +368,16 @@ def _sample_actions_smolvla_hooked(
                 timestep=_ts,
             )
 
-        if strat.selected(step, s):
+        selected = strat.selected(step, s)
+        if selected:
             ctx.step = step
             x_t = strat.step(x_t, s, vfield, ctx)
-        x_t = x_t + dt * vfield(x_t)
+        velocity = vfield(x_t)
+        if selected:
+            callback = getattr(strat, "after_selected_vfield", None)
+            if callback is not None:
+                callback(x_t, s, velocity, ctx)
+        x_t = x_t + dt * velocity
 
     strat.finish(ctx)
     if not strat.invasive:

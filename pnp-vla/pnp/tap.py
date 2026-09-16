@@ -17,8 +17,9 @@ import numpy as np
 import torch
 
 from .config import RolloutConfig, PERTURB_SEED_MASK
-from .pnp import (run_probe, apply_refine, apply_fractional_refine, PnPRecorder,
-                  temporal_decay_weights, temporal_prefix_weights)
+from .pnp import (run_probe, extend_probe_with_final_prediction, apply_refine,
+                  apply_fractional_refine, PnPRecorder, temporal_decay_weights,
+                  temporal_prefix_weights)
 from .pcp import apply_correct, CorrectTelemetry
 
 
@@ -108,6 +109,7 @@ class RolloutTap:
         self._pcp_chunks: list = []
         self._pcp_buf: list = []
         self._training_prefixes: list[dict] = []
+        self._pending_variable_probe = None
 
     # ── sampler-facing interface ────────────────────────────────────────────
     @property
@@ -246,6 +248,35 @@ class RolloutTap:
             return int(step) == int(self.config.q_guidance_step)
         return self.config.has_probe and self.config.probe_selected(step, s)
 
+    def _record_probe(self, pr, ctx, *, actions=None, rec=None, z_hat_full=None):
+        actions = pr.a_hats if actions is None else actions
+        rec = dict(pr.rec if rec is None else rec)
+        z_hat_full = pr.z_hat_full if z_hat_full is None else z_hat_full
+        if self.records_uncertainty or self.config.compute_multimodal:
+            rec["step"] = ctx.step
+            if self.save_ahats:
+                rec["a_hats"] = actions.detach().float().cpu().numpy()
+            ctx.records.append(rec)
+        if self.save_pcp:
+            self._pcp_buf.append({
+                "step_idx": ctx.step, "s": float(rec["s"]),
+                "z_hat": z_hat_full[0, :, :self.adim].detach().float().cpu().numpy(),
+            })
+
+    def after_selected_vfield(self, x_t, s, velocity, ctx):
+        """Finalize variable-K telemetry from the Euler evaluation already in hand."""
+        if self._pending_variable_probe is None:
+            return
+        pr, pending_step = self._pending_variable_probe
+        if int(pending_step) != int(ctx.step):
+            raise RuntimeError("variable-K probe was finalized at the wrong Euler step")
+        actions, rec, _, z_hat_full = extend_probe_with_final_prediction(
+            pr, x_t - float(s) * velocity, adim=self.config.action_dim,
+            compute_multimodal=self.config.compute_multimodal)
+        self._record_probe(
+            pr, ctx, actions=actions, rec=rec, z_hat_full=z_hat_full)
+        self._pending_variable_probe = None
+
     def step(self, x_t, s, vf, ctx):
         cfg = self.config
         gradient_updated = None
@@ -305,20 +336,15 @@ class RolloutTap:
                            prefix_horizon=(cfg.n_action_steps if cfg.suffix_probe_samples else None),
                            temporal_update_weights=temporal_weights)
 
-        # sink: per-step uncertainty (+ optional a_hats geometry stack)
-        if self.records_uncertainty or cfg.compute_multimodal:
-            rec = dict(pr.rec)
-            rec["step"] = ctx.step
-            if self.save_ahats:
-                rec["a_hats"] = pr.a_hats.detach().float().cpu().numpy()
-            ctx.records.append(rec)
-
-        # sink: pcp features (mean z_hat at this step; obs_enc flushed per-chunk in finish)
-        if self.save_pcp:
-            self._pcp_buf.append({
-                "step_idx": ctx.step, "s": float(s),
-                "z_hat": pr.z_hat_full[0, :, :self.adim].detach().float().cpu().numpy(),
-            })
+        # Variable-K follows the original video's convention: K perturbations produce K
+        # disagreements, with the final clean prediction coming from the ordinary Euler call.
+        # Defer only this new mode; historical fixed-K records remain byte-for-byte compatible.
+        if cfg.pnp_k_by_step is not None and gradient_updated is None:
+            if self._pending_variable_probe is not None:
+                raise RuntimeError("variable-K probe was not finalized")
+            self._pending_variable_probe = (pr, int(ctx.step))
+        else:
+            self._record_probe(pr, ctx)
 
         # action: at most one feedback path (measure-only when no action is set)
         if gradient_updated is not None:
@@ -356,6 +382,8 @@ class RolloutTap:
         return x_t
 
     def finish(self, ctx):
+        if self._pending_variable_probe is not None:
+            raise RuntimeError("variable-K probe was not finalized by the sampler")
         if self.records_uncertainty or self.config.compute_multimodal:
             self.recorder.log_chunk({"num_steps": ctx.num_steps, "steps": ctx.records})
         if self.save_pcp:
@@ -466,6 +494,7 @@ class BatchedRolloutTap:
         self._pcp_buf = [[] for _ in recorders]
         self.training_prefixes = [[] for _ in recorders]
         self.generators = []
+        self._pending_variable_probe = None
         for seed in seeds:
             if isinstance(seed, torch.Generator):
                 self.generators.append(seed)
@@ -482,11 +511,23 @@ class BatchedRolloutTap:
                        adim=self.config.action_dim,
                        compute_multimodal=self.config.compute_multimodal,
                        generators=self.generators)
-        for i, rec in enumerate(pr.lane_recs):
+        if self.config.pnp_k_by_step is not None:
+            if self._pending_variable_probe is not None:
+                raise RuntimeError("variable-K batched probe was not finalized")
+            self._pending_variable_probe = (pr, int(ctx.step))
+        else:
+            self._record_probe(pr, ctx)
+        return apply_refine(pr, self.config.refine_average) if self.config.refine else x_t
+
+    def _record_probe(self, pr, ctx, *, actions=None, lane_recs=None, z_hat_full=None):
+        actions = pr.a_hats if actions is None else actions
+        lane_recs = pr.lane_recs if lane_recs is None else lane_recs
+        z_hat_full = pr.z_hat_full if z_hat_full is None else z_hat_full
+        for i, rec in enumerate(lane_recs):
             rec = dict(rec); rec["step"] = ctx.step
             # The batched path must retain the same complete per-position/per-iteration P&P
             # trace as the serial collector; lane_recs alone only contains scalar summaries.
-            lane_ahats = pr.a_hats[:, i]
+            lane_ahats = actions[:, i]
             delta = (lane_ahats[1:] - lane_ahats[:-1]).abs()
             if len(delta):
                 u_time = delta.mean(dim=(0, 2))
@@ -504,11 +545,26 @@ class BatchedRolloutTap:
             if self.records_uncertainty:
                 ctx.records[i].append(rec)
             if self.save_pcp:
-                self._pcp_buf[i].append({"step_idx": ctx.step, "s": float(s),
-                    "z_hat": pr.z_hat_full[i, :, :self.adim].detach().float().cpu().numpy()})
-        return apply_refine(pr, self.config.refine_average) if self.config.refine else x_t
+                self._pcp_buf[i].append({"step_idx": ctx.step, "s": float(rec["s"]),
+                    "z_hat": z_hat_full[i, :, :self.adim].detach().float().cpu().numpy()})
+
+    def after_selected_vfield(self, x_t, s, velocity, ctx):
+        if self._pending_variable_probe is None:
+            return
+        pr, pending_step = self._pending_variable_probe
+        if int(pending_step) != int(ctx.step):
+            raise RuntimeError("variable-K batched probe was finalized at the wrong Euler step")
+        actions, _, lane_recs, z_hat_full = extend_probe_with_final_prediction(
+            pr, x_t - float(s) * velocity, adim=self.config.action_dim,
+            compute_multimodal=self.config.compute_multimodal)
+        self._record_probe(
+            pr, ctx, actions=actions, lane_recs=lane_recs,
+            z_hat_full=z_hat_full)
+        self._pending_variable_probe = None
 
     def finish(self, ctx):
+        if self._pending_variable_probe is not None:
+            raise RuntimeError("variable-K batched probe was not finalized by the sampler")
         for i, recorder in enumerate(self.recorders):
             if self.records_uncertainty:
                 recorder.log_chunk({"num_steps": ctx.num_steps, "steps": ctx.records[i]})

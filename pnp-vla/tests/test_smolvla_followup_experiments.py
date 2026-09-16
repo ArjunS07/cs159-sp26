@@ -2,8 +2,14 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from pnp.config import Method, RolloutConfig
+from pnp.pnp import (
+    _pnp_seed_perturb,
+    extend_probe_with_final_prediction,
+    run_probe,
+)
 from pnp.smolvla_followup_experiments import (
     SMOLVLA_SCHEDULE_K_BY_STEP,
     SMOLVLA_SCHEDULE_STEPS,
@@ -32,7 +38,25 @@ def test_schedule_method_contract():
     assert tuple(schedule.pnp_steps) == SMOLVLA_SCHEDULE_STEPS == (1, 2, 3)
     assert tuple(schedule.pnp_k_by_step) == SMOLVLA_SCHEDULE_K_BY_STEP == (3, 1, 1)
     assert schedule.n_action_steps == 10
+    assert schedule.save_time_uncertainty
     assert schedule.video == "off"
+
+
+def test_k1_uncertainty_uses_post_perturbation_euler_prediction():
+    _pnp_seed_perturb(123)
+    latent = torch.zeros((1, 20, 2), dtype=torch.float32)
+    probe = run_probe(
+        latent, 0.8, lambda value: torch.zeros_like(value), k=1, adim=2)
+    actions, rec, lane_recs, z_hat_full = extend_probe_with_final_prediction(
+        probe, probe.x_acc, adim=2)
+
+    assert actions.shape == (2, 1, 20, 2)
+    assert z_hat_full.shape == latent.shape
+    assert rec["u_mean"] > 0
+    assert rec["u_prefix_10"] > 0
+    assert rec["u_prefix_20"] > 0
+    assert len(rec["u_iter"]) == 1
+    assert lane_recs[0]["u_mean"] > 0
 
 
 def test_schedule_worker_notebook_is_thin_and_explicit():
@@ -44,6 +68,7 @@ def test_schedule_worker_notebook_is_thin_and_explicit():
     assert "run_smolvla_schedule_eval_worker" in source
     assert "'pnp_steps': [1, 2, 3]" in source
     assert "'pnp_k_by_step': [3, 1, 1]" in source
+    assert "separate U10/U20/full for Euler steps 1, 2, 3" in source
     assert "'integration_steps': 10" in source
     assert "'n_action_steps': 10" in source
     assert "'video': 'off'" in source
