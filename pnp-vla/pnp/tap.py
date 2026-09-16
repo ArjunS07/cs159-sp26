@@ -291,7 +291,7 @@ class RolloutTap:
                            ^ ((self._chunk_idx + 1) * 1_000_003)
                            ^ (int(ctx.step) * 9_176)) & ((1 << 63) - 1)
             gradient_updated, pr, telemetry = direct_latent_uncertainty_update(
-                x_t, s, vf, k=cfg.pnp_k,
+                x_t, s, vf, k=cfg.probe_k(ctx.step),
                 horizon=cfg.uncertainty_gradient_horizon,
                 step_size=cfg.uncertainty_gradient_step_size,
                 mode=cfg.uncertainty_gradient_mode, random_seed=random_seed)
@@ -299,7 +299,7 @@ class RolloutTap:
                 "chunk_idx": self._chunk_idx, "euler_step": int(ctx.step), "s": float(s)})
             self._gradient_records.append(telemetry)
         else:
-            pr = run_probe(x_t, s, vf, k=cfg.pnp_k, adim=cfg.action_dim,
+            pr = run_probe(x_t, s, vf, k=cfg.probe_k(ctx.step), adim=cfg.action_dim,
                            compute_multimodal=cfg.compute_multimodal,
                            suffix_probe_samples=cfg.suffix_probe_samples,
                            prefix_horizon=(cfg.n_action_steps if cfg.suffix_probe_samples else None),
@@ -478,7 +478,8 @@ class BatchedRolloutTap:
         return self.config.probe_selected(step, s)
 
     def step(self, x_t, s, vf, ctx):
-        pr = run_probe(x_t, s, vf, k=self.config.pnp_k, adim=self.config.action_dim,
+        pr = run_probe(x_t, s, vf, k=self.config.probe_k(ctx.step),
+                       adim=self.config.action_dim,
                        compute_multimodal=self.config.compute_multimodal,
                        generators=self.generators)
         for i, rec in enumerate(pr.lane_recs):

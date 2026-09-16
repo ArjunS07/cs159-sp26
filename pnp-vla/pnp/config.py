@@ -104,6 +104,7 @@ class Method:
     FIVE_STEP_SINGLE_REFINE = "five_step_single_refine"
     THREE_STEP_SINGLE_REFINE = "three_step_single_refine"
     THREE_STEP_SINGLE_QUERY = "three_step_single_query"
+    SMOLVLA_PNP_S123_K311 = "smolvla_pnp_steps123_k311"
     QPLANNING_Q10 = "qplanning_q10"
     QPLANNING_Q50 = "qplanning_q50"
     QPLANNING_Q50_U025 = "qplanning_q50_u20_beta025"
@@ -136,7 +137,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.CHUNK_SOURCE_M1, Method.FIVE_STEP_SINGLE_QUERY,
                Method.FIVE_STEP_LOWEST_U20, Method.FIVE_STEP_LOWEST_U20_REFINE,
                Method.FIVE_STEP_SINGLE_REFINE, Method.THREE_STEP_SINGLE_REFINE,
-               Method.THREE_STEP_SINGLE_QUERY, Method.QPLANNING_Q10,
+               Method.THREE_STEP_SINGLE_QUERY, Method.SMOLVLA_PNP_S123_K311,
+               Method.QPLANNING_Q10,
                Method.QPLANNING_Q50, Method.QPLANNING_Q50_U025,
                Method.QPLANNING_Q50_U050, Method.QPLANNING_Q50_U100,
                Method.QPLANNING_Q50_PRIORITY_FAILURE,
@@ -175,6 +177,10 @@ class RolloutConfig:
     # ── (B) probe — the P&P measurement (pnp_steps is None => no probe) ──
     pnp_steps: Optional[Sequence[int]] = None   # Euler steps to probe (unless pnp_time_min set)
     pnp_k: int = 3                              # K predict-and-perturb iterations
+    # Optional per-selected-step K schedule aligned with pnp_steps. For example,
+    # pnp_steps=(1, 2, 3), pnp_k_by_step=(3, 1, 1) performs three P&P iterations at Euler
+    # step 1 and one at steps 2 and 3. None preserves historical behavior and hashes.
+    pnp_k_by_step: Optional[Sequence[int]] = None
     pnp_time_min: Optional[float] = None        # alt selector: probe when s >= pnp_time_min
     compute_multimodal: bool = False            # per-dim Sarle BC + PC1 stats (needs pnp_k>=4)
     action_dim: int = ADIM                      # real (un-padded) dims used for uncertainty
@@ -278,6 +284,16 @@ class RolloutConfig:
     render_lead: int = 2
 
     def __post_init__(self):
+        if self.pnp_k_by_step is not None:
+            if self.pnp_steps is None or self.pnp_time_min is not None:
+                raise ValueError("pnp_k_by_step requires explicit pnp_steps")
+            if len(tuple(self.pnp_k_by_step)) != len(tuple(self.pnp_steps)):
+                raise ValueError("pnp_k_by_step must align one-to-one with pnp_steps")
+            if len(set(map(int, self.pnp_steps))) != len(tuple(self.pnp_steps)):
+                raise ValueError("pnp_steps must be unique when pnp_k_by_step is set")
+            for value in self.pnp_k_by_step:
+                if isinstance(value, bool) or int(value) != value or int(value) < 1:
+                    raise ValueError("every pnp_k_by_step value must be a positive integer")
         n_actions = int(self.refine) + int(self.correction_lambda is not None) \
             + int(self.num_samples is not None) + int(self.uncertainty_gradient_mode is not None) \
             + int(self.q_guidance_ckpt_id is not None)
@@ -528,6 +544,15 @@ class RolloutConfig:
             return s >= self.pnp_time_min
         return self.pnp_steps is not None and step in tuple(self.pnp_steps)
 
+    def probe_k(self, step: int) -> int:
+        """Return the P&P iteration count for one selected Euler step."""
+        if self.pnp_k_by_step is None:
+            return int(self.pnp_k)
+        schedule = dict(zip(map(int, self.pnp_steps), map(int, self.pnp_k_by_step)))
+        if int(step) not in schedule:
+            raise ValueError(f"Euler step {step} is not in the configured P&P schedule")
+        return schedule[int(step)]
+
     @property
     def records_uncertainty(self) -> bool:
         """Whether to persist per-step uncertainty rows (default: on iff a probe is set)."""
@@ -547,6 +572,8 @@ class RolloutConfig:
         # bound in their IDs.
         if logical.get("candidate_set_id") is None:
             logical.pop("candidate_set_id")
+        if logical.get("pnp_k_by_step") is None:
+            logical.pop("pnp_k_by_step")
         if logical.get("policy_source_id") is None:
             logical.pop("policy_source_id")
         if logical.get("candidate_seed_scheme") is None:
@@ -597,7 +624,7 @@ class RolloutConfig:
 
 
 # Behavior-defining fields of RolloutConfig (see RolloutConfig.logical_dict).
-LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_time_min", "action_dim",
+LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_k_by_step", "pnp_time_min", "action_dim",
                   "refine", "refine_average", "refine_horizon_m", "refine_threshold",
                   "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
                   "refine_prefix_only", "refine_inner_strength",
