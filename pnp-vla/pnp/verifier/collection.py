@@ -355,11 +355,18 @@ def postprocess_chunk(chunk, postprocess, device):
 
 def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
                       prefix, branch_seed, steps_already, n_action_steps=None,
-                      skip_unused_renders: bool = False, render_lead: int = 2):
+                      skip_unused_renders: bool = False, render_lead: int = 2,
+                      replan_start_index: int = 0,
+                      chunk_position_stride: int | None = None):
     success = False
     steps = steps_already
     chunk_stride = int(n_action_steps or policy.config.chunk_size)
-    est_chunks = max(1, round(ep["max_steps"] / chunk_stride))
+    # The deployed rollout conditions the policy by the generated chunk width, even when only
+    # a shorter prefix is executed before replanning. Keep that denominator configurable so a
+    # restored continuation can exactly match its source rollout while preserving the legacy
+    # verifier behavior for existing callers.
+    position_stride = int(chunk_position_stride or chunk_stride)
+    est_chunks = max(1, round(ep["max_steps"] / position_stride))
     lead = max(1, int(render_lead))
     skipping = bool(skip_unused_renders and set_camera_observables(env, True))
 
@@ -379,7 +386,7 @@ def _run_continuation(env, obs, ep, policy, preprocess, postprocess, device, *,
                 return True, steps
             if done or steps >= ep["max_steps"]:
                 return False, steps
-        queue, replan = [], 0
+        queue, replan = [], int(replan_start_index)
         while steps < ep["max_steps"]:
             if not queue:
                 # Match run_episode's time conditioning. Derive it from the

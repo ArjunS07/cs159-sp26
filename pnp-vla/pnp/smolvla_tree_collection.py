@@ -1,0 +1,734 @@
+"""Depth-1 SmolVLA tree collection from the immutable notebook-87 source cohort.
+
+Each tree contains the exact stored source continuation plus eight counterfactual branches:
+four rerun the same P&P policy with fresh initial flow noise, and four hold the source initial
+noise fixed while changing only the P&P perturbation stream. Roots are fixed before collection:
+65% choose the largest pair-weighted U10 boundary and 35% choose a deterministic uniform
+boundary, balanced across suite and source outcome.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+import copy
+import hashlib
+import io
+import json
+import time
+
+import numpy as np
+import torch
+
+from .config import RolloutConfig, SMOLVLA_REPO_ID
+from .pcp_critic.resumable_snapshot import _download_with_retry
+from .pnp import PnPRecorder, _pnp_gen
+from .qplanning_fork_pilot import (
+    _SOURCE_FIDELITY_ARRAYS,
+    _load_selected_training_arrays,
+    _source_boundary,
+    _source_policy_observation,
+    _trajectory_actions_from_payload,
+)
+from .rollout import _draw_chunk_noise, _stack_policy_batches
+from .sampler import _temp_strategy
+from .smolvla_followup_experiments import (
+    SMOLVLA_SCHEDULE_K_BY_STEP,
+    SMOLVLA_SCHEDULE_STEPS,
+)
+from .smolvla_tree_source_experiment import (
+    SMOLVLA_TREE_PRIORITY_FRACTION,
+    SMOLVLA_TREE_SOURCE_EXPERIMENT,
+    SMOLVLA_TREE_SOURCE_IDENTITIES,
+    prepare_smolvla_tree_source_episodes,
+)
+from .store import SupabaseStore
+from .tap import BatchedRolloutTap, RolloutTap
+from .verifier.collection import (
+    _content_digest,
+    _reset_and_replay_actions,
+    _run_continuation,
+    _unwrap_sim,
+    candidate_group_id,
+    postprocess_chunk,
+)
+
+
+SMOLVLA_TREE_COLLECTION_VERSION = 1
+SMOLVLA_TREE_EXPERIMENT = "smolvla-libero-depth1-hybrid-trees-v1"
+SMOLVLA_TREE_MANIFEST_PATH = "smolvla_trees/manifests/idx10_29_depth1_hybrid_v1.json"
+SMOLVLA_TREE_COUNT = 800
+SMOLVLA_TREE_SHARDS = 2
+SMOLVLA_TREE_CANDIDATES = 9
+SMOLVLA_TREE_FRESH_CANDIDATES = 4
+SMOLVLA_TREE_PERTURB_CANDIDATES = 4
+SMOLVLA_TREE_ACTIONS = 10
+SMOLVLA_TREE_INTEGRATION_STEPS = 10
+SMOLVLA_TREE_MIN_BOUNDARIES = 3
+SMOLVLA_TREE_PRINT_EVERY = 5
+_U_TIME_KEY = __import__("re").compile(r"^c(?P<chunk>\d+)_s(?P<step>\d+)_u_time$")
+_SMOLVLA_SOURCE_ARRAYS = tuple(_SOURCE_FIDELITY_ARRAYS) + ("perturb_seed",)
+
+
+def _canonical_json(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _digest(value) -> str:
+    return hashlib.sha256(_canonical_json(value)).hexdigest()[:20]
+
+
+def _rank(namespace: str, *values) -> str:
+    return hashlib.sha256("|".join(map(str, (namespace, *values))).encode()).hexdigest()
+
+
+def _seed(namespace: str, *values) -> int:
+    return int(_rank(namespace, *values)[:16], 16) & ((1 << 63) - 1)
+
+
+def _source_rows(store) -> list[dict]:
+    rows = store.fetch_all(
+        "rollouts",
+        "rollout_id,benchmark,suite,task_idx,episode_idx,init_state_hash,success,n_steps,"
+        "n_chunks,max_steps,episode_seed,config_hash,ahats_path,trajectory_path,"
+        "training_data_path,status",
+        configure=lambda query: query.eq(
+            "experiment", SMOLVLA_TREE_SOURCE_EXPERIMENT).eq(
+            "method", "smolvla_pnp_steps123_k311").eq("status", "completed"),
+        order_by=("rollout_id",),
+    )
+    identities = {
+        (row["suite"], int(row["task_idx"]), int(row["episode_idx"]), row["init_state_hash"])
+        for row in rows
+    }
+    if len(rows) != SMOLVLA_TREE_SOURCE_IDENTITIES or len(identities) != len(rows):
+        raise ValueError(
+            f"expected {SMOLVLA_TREE_SOURCE_IDENTITIES} unique notebook-87 v2 sources; "
+            f"found {len(rows)} rows/{len(identities)} identities")
+    if len({row["config_hash"] for row in rows}) != 1:
+        raise ValueError("source collection contains mixed behavior configurations")
+    required = ("ahats_path", "trajectory_path", "training_data_path")
+    missing = [row["rollout_id"] for row in rows
+               if any(not row.get(field) for field in required)]
+    if missing:
+        raise ValueError(f"source rows lack required artifacts: {missing[:3]}")
+    return rows
+
+
+def weighted_u10_profile(payload: bytes) -> tuple[float, ...]:
+    """Decode the notebook-86 (3,1,1)-pair-weighted U10 score per source chunk."""
+    by_chunk: dict[int, dict[int, float]] = defaultdict(dict)
+    with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+        for key in archive.files:
+            match = _U_TIME_KEY.match(key)
+            if match is None:
+                continue
+            profile = np.asarray(archive[key], np.float32).reshape(-1)
+            if len(profile) < 10:
+                raise ValueError(f"{key} has fewer than 10 action positions")
+            by_chunk[int(match.group("chunk"))][int(match.group("step"))] = float(
+                profile[:10].mean())
+    if not by_chunk:
+        raise ValueError("source uncertainty artifact contains no U-time profiles")
+    expected_chunks = list(range(max(by_chunk) + 1))
+    if sorted(by_chunk) != expected_chunks:
+        raise ValueError("source uncertainty chunks are not contiguous")
+    weights = dict(zip(SMOLVLA_SCHEDULE_STEPS, SMOLVLA_SCHEDULE_K_BY_STEP))
+    result = []
+    for chunk in expected_chunks:
+        if set(by_chunk[chunk]) != set(weights):
+            raise ValueError(
+                f"chunk {chunk} has Euler steps {sorted(by_chunk[chunk])}, "
+                f"expected {sorted(weights)}")
+        result.append(sum(weights[step] * by_chunk[chunk][step] for step in weights)
+                      / sum(weights.values()))
+    if not np.isfinite(result).all():
+        raise ValueError("source U10 profile contains non-finite values")
+    return tuple(map(float, result))
+
+
+def _balanced_priority_ids(rows: list[dict], count: int) -> set[str]:
+    buckets: dict[tuple[str, bool], list[dict]] = defaultdict(list)
+    for row in rows:
+        buckets[(str(row["suite"]), bool(row["success"]))].append(row)
+    for key, values in buckets.items():
+        values.sort(key=lambda row: _rank("priority-episode", row["rollout_id"]))
+    selected = []
+    keys = sorted(buckets)
+    while len(selected) < count:
+        advanced = False
+        for key in keys:
+            if buckets[key] and len(selected) < count:
+                selected.append(str(buckets[key].pop(0)["rollout_id"]))
+                advanced = True
+        if not advanced:
+            break
+    if len(selected) != count:
+        raise ValueError(f"could select only {len(selected)}/{count} priority episodes")
+    return set(selected)
+
+
+def _eligible_roots(profile: tuple[float, ...]) -> tuple[list[int], bool]:
+    # Prefer a mid-trajectory root with itself plus two complete source boundaries remaining.
+    preferred = list(range(1, len(profile) - SMOLVLA_TREE_MIN_BOUNDARIES + 1))
+    if preferred:
+        return preferred, False
+    # Very short successful episodes still contribute one valid, explicitly flagged root.
+    fallback = list(range(max(1, len(profile) - 1)))
+    return fallback, True
+
+
+def build_smolvla_tree_manifest(store=None) -> dict:
+    store = store or SupabaseStore()
+    rows = _source_rows(store)
+    priority_count = int(round(SMOLVLA_TREE_PRIORITY_FRACTION * len(rows)))
+    priority_ids = _balanced_priority_ids(rows, priority_count)
+    items = []
+    for index, row in enumerate(rows, 1):
+        profile = weighted_u10_profile(
+            _download_with_retry(store, str(row["ahats_path"])))
+        if len(profile) != int(row["n_chunks"]):
+            raise ValueError(
+                f"source {row['rollout_id']} has {len(profile)} U10 chunks but "
+                f"n_chunks={row['n_chunks']}")
+        eligible, fallback = _eligible_roots(profile)
+        if not eligible:
+            raise ValueError(f"source {row['rollout_id']} has no branchable boundary")
+        strategy = "u10_priority" if str(row["rollout_id"]) in priority_ids else "uniform"
+        if strategy == "u10_priority":
+            root = min(eligible, key=lambda chunk: (
+                -profile[chunk], _rank("u10-tie", row["rollout_id"], chunk)))
+        else:
+            root = eligible[int(_rank("uniform-root", row["rollout_id"]), 16) % len(eligible)]
+        items.append({
+            "source_rollout_id": str(row["rollout_id"]),
+            "suite": str(row["suite"]), "task_idx": int(row["task_idx"]),
+            "episode_idx": int(row["episode_idx"]),
+            "init_state_hash": str(row["init_state_hash"]),
+            "source_success": bool(row["success"]), "source_n_steps": int(row["n_steps"]),
+            "source_n_chunks": int(row["n_chunks"]), "source_episode_seed": int(row["episode_seed"]),
+            "source_max_steps": int(row["max_steps"]),
+            "selection_strategy": strategy, "chunk_idx": int(root),
+            "source_root_u10": float(profile[root]),
+            "source_u10_profile": list(profile),
+            "short_episode_root_fallback": bool(fallback),
+            "selection_tiebreak": _rank("tree-order", row["rollout_id"]),
+        })
+        if index % 25 == 0 or index == len(rows):
+            print(f"[smolvla-tree] uncertainty manifests: {index}/{len(rows)}", flush=True)
+    items.sort(key=lambda item: item["selection_tiebreak"])
+    for ordinal, item in enumerate(items):
+        item["ordinal"] = ordinal
+        item["shard_index"] = ordinal % SMOLVLA_TREE_SHARDS
+    payload = {
+        "version": SMOLVLA_TREE_COLLECTION_VERSION,
+        "source_experiment": SMOLVLA_TREE_SOURCE_EXPERIMENT,
+        "experiment": SMOLVLA_TREE_EXPERIMENT,
+        "trees": SMOLVLA_TREE_COUNT, "shards": SMOLVLA_TREE_SHARDS,
+        "candidate_count": SMOLVLA_TREE_CANDIDATES,
+        "candidate_families": {"stored_source": 1, "fresh_initial_noise": 4,
+                               "fixed_initial_noise_new_pnp_perturbation": 4},
+        "priority_fraction": SMOLVLA_TREE_PRIORITY_FRACTION,
+        "uniform_fraction": 1.0 - SMOLVLA_TREE_PRIORITY_FRACTION,
+        "root_uncertainty": "(3,1,1)-pair-weighted U10",
+        "minimum_preferred_boundaries_remaining": SMOLVLA_TREE_MIN_BOUNDARIES,
+        "integration_steps": SMOLVLA_TREE_INTEGRATION_STEPS,
+        "executed_actions": SMOLVLA_TREE_ACTIONS,
+        "pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
+        "pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
+        "items": items,
+    }
+    if len(items) != SMOLVLA_TREE_COUNT:
+        raise AssertionError(f"manifest contains {len(items)} trees")
+    document = {"manifest_hash": _digest(payload), "payload": payload}
+    store._upload(SMOLVLA_TREE_MANIFEST_PATH, _canonical_json(document))
+    print({
+        "manifest_path": SMOLVLA_TREE_MANIFEST_PATH,
+        "manifest_hash": document["manifest_hash"],
+        "trees": len(items),
+        "u10_priority": sum(item["selection_strategy"] == "u10_priority" for item in items),
+        "uniform": sum(item["selection_strategy"] == "uniform" for item in items),
+        "short_episode_fallbacks": sum(item["short_episode_root_fallback"] for item in items),
+    }, flush=True)
+    return document
+
+
+def load_or_build_smolvla_tree_manifest(store=None) -> dict:
+    """Reuse the immutable manifest after the first worker creates it."""
+    store = store or SupabaseStore()
+    try:
+        document = json.loads(_download_with_retry(store, SMOLVLA_TREE_MANIFEST_PATH))
+    except Exception as error:
+        message = str(error).lower()
+        if "404" not in message and "not found" not in message and "does not exist" not in message:
+            raise
+        return build_smolvla_tree_manifest(store)
+    payload = document.get("payload")
+    if (not isinstance(payload, dict)
+            or int(payload.get("version", -1)) != SMOLVLA_TREE_COLLECTION_VERSION
+            or payload.get("source_experiment") != SMOLVLA_TREE_SOURCE_EXPERIMENT
+            or payload.get("experiment") != SMOLVLA_TREE_EXPERIMENT
+            or _digest(payload) != document.get("manifest_hash")):
+        raise ValueError("persisted SmolVLA tree manifest failed validation")
+    if len(payload.get("items", ())) != SMOLVLA_TREE_COUNT:
+        raise ValueError("persisted SmolVLA tree manifest has the wrong tree count")
+    print({
+        "manifest_path": SMOLVLA_TREE_MANIFEST_PATH,
+        "manifest_hash": document["manifest_hash"],
+        "trees": len(payload["items"]),
+        "status": "loaded existing immutable manifest",
+    }, flush=True)
+    return document
+
+
+def _load_source_bundle(store, row: dict) -> dict:
+    actions = _trajectory_actions_from_payload(
+        _download_with_retry(store, str(row["trajectory_path"])))
+    arrays = _load_selected_training_arrays(
+        store, str(row["training_data_path"]), names=_SMOLVLA_SOURCE_ARRAYS)
+    if not np.array_equal(actions, np.asarray(arrays["actions_env"], np.float32)):
+        raise AssertionError(f"source {row['rollout_id']} trajectory/training actions differ")
+    return {"row": row, "arrays": arrays, "actions": actions}
+
+
+def _candidate_u10(recorder: PnPRecorder) -> float:
+    weights = dict(zip(SMOLVLA_SCHEDULE_STEPS, SMOLVLA_SCHEDULE_K_BY_STEP))
+    values = {}
+    for chunk in recorder.current_chunks():
+        for record in chunk.get("steps", []):
+            values[int(record["step"])] = float(
+                np.asarray(record["u_time"], np.float32)[:10].mean())
+    if set(values) != set(weights):
+        raise RuntimeError(f"candidate P&P trace has steps {sorted(values)}")
+    return float(sum(weights[step] * values[step] for step in weights) / sum(weights.values()))
+
+
+def _pnp_config(*, save_features=False) -> RolloutConfig:
+    return RolloutConfig(
+        pnp_steps=SMOLVLA_SCHEDULE_STEPS,
+        pnp_k=max(SMOLVLA_SCHEDULE_K_BY_STEP),
+        pnp_k_by_step=SMOLVLA_SCHEDULE_K_BY_STEP,
+        refine=True, n_action_steps=SMOLVLA_TREE_ACTIONS,
+        save_pcp_features=bool(save_features),
+    )
+
+
+def _source_perturb_generator(policy, device, *, perturb_seed: int,
+                              completed_chunks: int) -> torch.Generator:
+    """Reconstruct notebook 87's lane-local P&P RNG at one source boundary."""
+    generator = torch.Generator(device=torch.device(device))
+    # training_data/perturb_seed is already the actual generator seed after the XOR mask.
+    generator.manual_seed(int(perturb_seed))
+    shape = (1, policy.config.chunk_size, policy.config.max_action_dim)
+    draws_per_chunk = sum(map(int, SMOLVLA_SCHEDULE_K_BY_STEP))
+    for _ in range(int(completed_chunks) * draws_per_chunk):
+        torch.empty(shape, device=device).normal_(generator=generator)
+    return generator
+
+
+def _clone_generator(generator: torch.Generator, device) -> torch.Generator:
+    clone = torch.Generator(device=torch.device(device))
+    clone.set_state(generator.get_state())
+    return clone
+
+
+def _generate_alternatives(policy, batch, device, *, item: dict, source: dict):
+    model = policy.model
+    kinds = ([f"fresh_seed_{index}" for index in range(1, 5)]
+             + [f"pnp_perturb_{index}" for index in range(1, 5)])
+    fresh_initial_seeds = [
+        _seed("fresh-initial", item["source_rollout_id"], item["chunk_idx"], index)
+        for index in range(1, 5)
+    ]
+    pnp_perturb_seeds = [
+        _seed("candidate-perturb", item["source_rollout_id"], item["chunk_idx"], kind)
+        for kind in kinds[4:]
+    ]
+    source_noise_seed = int(source["noise_seed"])
+    # Lane 0 reconstructs the stored source. Lanes 1:5 vary only initial flow noise; lanes 5:9
+    # hold the source initial noise fixed and vary only the P&P perturbation stream.
+    initial_seeds = [source_noise_seed, *fresh_initial_seeds, *([source_noise_seed] * 4)]
+    source_generator = _source_perturb_generator(
+        policy, device, perturb_seed=int(np.asarray(source["perturb_seed"])),
+        completed_chunks=int(item["chunk_idx"]))
+    generators = [_clone_generator(source_generator, device) for _ in range(5)]
+    for seed in pnp_perturb_seeds:
+        generator = torch.Generator(device=torch.device(device))
+        generator.manual_seed(int(seed))
+        generators.append(generator)
+
+    noises = torch.cat([
+        _draw_chunk_noise(policy, device, seed) for seed in initial_seeds], dim=0)
+    batches = _stack_policy_batches([batch for _ in initial_seeds])
+    recorders = [PnPRecorder() for _ in initial_seeds]
+    for recorder in recorders:
+        recorder.new_episode()
+    config = _pnp_config(save_features=True)
+    tap = BatchedRolloutTap(
+        config, recorders, generators, device, model._pnp.action_dim)
+    previous_steps, previous_position = model._pnp.num_steps, model._pnp.chunk_pos
+    model._pnp.num_steps = SMOLVLA_TREE_INTEGRATION_STEPS
+    # Notebook 87 executes ten actions per decision but conditions chunk position using the
+    # generated 50-action width, as run_episode_batch does.
+    estimated_chunks = max(1, round(
+        item["source_max_steps"] / int(policy.config.chunk_size)))
+    model._pnp.chunk_pos = [
+        min(item["chunk_idx"] / estimated_chunks, 1.0) for _ in initial_seeds]
+    try:
+        with _temp_strategy(model, tap), torch.no_grad():
+            chunks = policy.predict_action_chunk(batches, noise=noises)
+    finally:
+        model._pnp.num_steps = previous_steps
+        model._pnp.chunk_pos = previous_position
+    arrays = chunks.detach().cpu().numpy().astype(np.float32)
+    if not tap.pcp_chunks or not tap.pcp_chunks[0]:
+        raise RuntimeError("candidate generation captured no SmolVLA observation embedding")
+    obs_enc = np.asarray(tap.pcp_chunks[0][0]["obs_enc"], np.float32)
+    source_delta = arrays[0] - np.asarray(source["policy_chunk"], np.float32)
+    reconstruction = {
+        "source_chunk_reconstruction_rms": float(np.sqrt(np.mean(source_delta ** 2))),
+        "source_chunk_reconstruction_max_abs": float(np.max(np.abs(source_delta))),
+    }
+    # Batch-shape floating-point differences are allowed; a large mismatch indicates that the
+    # source P&P stream, initial noise, time conditioning, or policy input was not reconstructed.
+    if reconstruction["source_chunk_reconstruction_max_abs"] > 0.02:
+        raise RuntimeError(
+            "source P&P chunk reconstruction failed: "
+            f"{reconstruction['source_chunk_reconstruction_max_abs']:.5f} max abs")
+    metadata = {
+        kind: {
+            "candidate_family": ("fresh_initial_noise" if kind.startswith("fresh")
+                                 else "fixed_initial_noise_new_pnp_perturbation"),
+            "initial_noise_seed": int(initial_seeds[index + 1]),
+            "perturbation_seed": int(
+                np.asarray(source["perturb_seed"]) if index < 4
+                else pnp_perturb_seeds[index - 4]),
+            "pnp_u10": _candidate_u10(recorders[index + 1]),
+        }
+        for index, kind in enumerate(kinds)
+    }
+    return (kinds, arrays[1:], metadata, obs_enc,
+            tap.generators[0].get_state().clone(), reconstruction)
+
+
+def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device, *,
+                                item: dict, bundle: dict, manifest_hash: str) -> tuple[dict, list]:
+    source = _source_boundary(bundle, item)
+    source["perturb_seed"] = np.asarray(bundle["arrays"]["perturb_seed"])
+    root_step = int(source["root_step"])
+    parent_actions = np.asarray(bundle["actions"][:root_step], np.float32)
+    obs, terminal_events = _reset_and_replay_actions(
+        env, ep, policy, parent_actions, skip_unused_renders=True, render_lead=2)
+    _, sim = _unwrap_sim(env)
+    replay_state = np.asarray(sim.get_state().flatten()).copy()
+    setter = getattr(sim, "set_state_from_flattened", None)
+    if not callable(setter):
+        raise RuntimeError("MuJoCo simulator has no flat-state restoration")
+    setter(np.asarray(source["sim_state"]).copy()); sim.forward()
+    canonical_sim_state = copy.deepcopy(sim.get_state())
+    canonical_state = np.asarray(canonical_sim_state.flatten()).copy()
+    state_error = float(np.max(np.abs(canonical_state - np.asarray(source["sim_state"]))))
+    if state_error > 1e-6:
+        raise RuntimeError(f"source root restoration failed (max_abs={state_error:.3g})")
+
+    estimated_chunks = max(1, round(
+        int(ep["max_steps"]) / int(policy.config.chunk_size)))
+    policy.model._pnp.chunk_pos = min(item["chunk_idx"] / estimated_chunks, 1.0)
+    policy_observation = _source_policy_observation(
+        bundle["arrays"], source["boundary_index"], ep["task_desc"])
+    batch = preprocess(policy_observation)
+    (kinds, alternatives, alternative_meta, obs_enc,
+     source_next_perturb_state, source_reconstruction) = _generate_alternatives(
+        policy, batch, device, item=item, source=source)
+
+    policy_chunks = {"stored_source": np.asarray(source["policy_chunk"], np.float32)}
+    policy_chunks.update({kind: alternatives[index] for index, kind in enumerate(kinds)})
+    env_chunks = {
+        kind: postprocess_chunk(chunk, postprocess, device)
+        for kind, chunk in policy_chunks.items()
+    }
+    # Candidate zero is the exact already-observed edge, not a decoded approximation.
+    source_width = min(SMOLVLA_TREE_ACTIONS, len(bundle["actions"]) - root_step)
+    env_chunks["stored_source"][:source_width] = np.asarray(
+        bundle["actions"][root_step:root_step + source_width], np.float32)
+
+    group_id = candidate_group_id(
+        "libero", item["suite"], item["task_idx"], item["episode_idx"],
+        item["chunk_idx"], namespace=SMOLVLA_TREE_EXPERIMENT,
+        trajectory_seed=item["source_episode_seed"])
+    candidates = []
+    for kind in policy_chunks:
+        if kind == "stored_source":
+            success, n_steps = bool(item["source_success"]), int(item["source_n_steps"])
+            branch_meta = {
+                "candidate_family": "stored_source",
+                "reused_historical_suffix": True,
+                "initial_noise_seed": int(source["noise_seed"]),
+            }
+        else:
+            branch_obs, branch_events = _reset_and_replay_actions(
+                env, ep, policy, parent_actions,
+                skip_unused_renders=True, render_lead=2)
+            _, branch_sim = _unwrap_sim(env)
+            branch_sim.set_state(copy.deepcopy(canonical_sim_state)); branch_sim.forward()
+            corrected = np.asarray(branch_sim.get_state().flatten())
+            correction_error = float(np.max(np.abs(corrected - canonical_state)))
+            if correction_error > 1e-6:
+                raise RuntimeError(
+                    f"branch root restoration failed (max_abs={correction_error:.3g})")
+            recorder = PnPRecorder(); recorder.new_episode()
+            continuation_tap = RolloutTap(
+                _pnp_config(), recorder, device, policy.model._pnp.action_dim,
+                action_postprocess=postprocess)
+            # Restore the source stream immediately after its root chunk. Every branch then gets
+            # the same source future initial-noise and P&P randomness; only intervention differs.
+            _pnp_gen(device).set_state(source_next_perturb_state)
+            previous_steps = policy.model._pnp.num_steps
+            policy.model._pnp.num_steps = SMOLVLA_TREE_INTEGRATION_STEPS
+            try:
+                with _temp_strategy(policy.model, continuation_tap):
+                    success, n_steps = _run_continuation(
+                        env, branch_obs, ep, policy, preprocess, postprocess, device,
+                        prefix=env_chunks[kind][:SMOLVLA_TREE_ACTIONS],
+                        branch_seed=int(item["source_episode_seed"]), steps_already=root_step,
+                        n_action_steps=SMOLVLA_TREE_ACTIONS,
+                        skip_unused_renders=True, render_lead=2,
+                        replan_start_index=int(item["chunk_idx"]) + 1,
+                        chunk_position_stride=int(policy.config.chunk_size))
+            finally:
+                policy.model._pnp.num_steps = previous_steps
+            branch_meta = {
+                **alternative_meta[kind],
+                "reused_historical_suffix": False,
+                "common_continuation_seed": int(item["source_episode_seed"]),
+                "parent_replay_terminal_events": branch_events,
+                "root_restore_max_abs": correction_error,
+            }
+        candidate_id = hashlib.sha256(f"{group_id}|{kind}".encode()).hexdigest()[:24]
+        candidates.append({
+            "candidate_id": candidate_id, "candidate_kind": kind,
+            "success": bool(success), "n_steps": int(n_steps),
+            "rollout_id": (item["source_rollout_id"] if kind == "stored_source" else None),
+            "metadata_json": {
+                **branch_meta, "source_rollout_id": item["source_rollout_id"],
+                "chunk_idx": int(item["chunk_idx"]),
+                "executed_prefix_length": SMOLVLA_TREE_ACTIONS,
+                "policy_chunk_sha256": _content_digest(policy_chunks[kind]),
+            },
+            "blobs": {
+                "policy_chunk": {"actions": policy_chunks[kind]},
+                "env_chunk": {"actions": env_chunks[kind],
+                              "mask": np.ones(len(env_chunks[kind]), dtype=np.bool_)},
+                "observation": {
+                    "obs_enc": obs_enc,
+                    "policy_proprio": np.asarray(source["policy_proprio"], np.float32),
+                },
+            },
+        })
+    group = {
+        "candidate_group_id": group_id, "experiment": SMOLVLA_TREE_EXPERIMENT,
+        "benchmark": "libero", "suite": item["suite"],
+        "task_idx": int(item["task_idx"]), "episode_idx": int(item["episode_idx"]),
+        "chunk_idx": int(item["chunk_idx"]),
+        "uncertainty_stratum": item["selection_strategy"],
+        "pairing_mode": "exact_source_root_hybrid_candidates",
+        "prefix_length": SMOLVLA_TREE_ACTIONS, "snapshot_validated": True,
+        "trajectory_seed": int(item["source_episode_seed"]),
+        "collection_split": "smolvla_tree_train",
+        "manifest_hash": manifest_hash, "model_revision": SMOLVLA_REPO_ID,
+        "metadata_json": {
+            "source_rollout_id": item["source_rollout_id"],
+            "source_training_data_path": bundle["row"]["training_data_path"],
+            "source_boundary_index": int(source["boundary_index"]),
+            "source_success": bool(item["source_success"]),
+            "source_root_u10": float(item["source_root_u10"]),
+            "source_u10_profile": item["source_u10_profile"],
+            "root_selection_strategy": item["selection_strategy"],
+            "short_episode_root_fallback": bool(item["short_episode_root_fallback"]),
+            "candidate_families": {"stored_source": 1, "fresh_initial_noise": 4,
+                                   "fixed_initial_noise_new_pnp_perturbation": 4},
+            "candidate_count": SMOLVLA_TREE_CANDIDATES,
+            "integration_steps": SMOLVLA_TREE_INTEGRATION_STEPS,
+            "n_action_steps": SMOLVLA_TREE_ACTIONS,
+            "pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
+            "pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
+            "parent_replay_terminal_events": terminal_events,
+            "replay_root_max_abs_vs_source": float(np.max(np.abs(
+                replay_state - np.asarray(source["sim_state"])))),
+            "source_state_set_max_abs": state_error,
+            "root_sim_state_sha256": _content_digest(canonical_state),
+            "root_policy_input_sha256": _content_digest(batch),
+            "common_continuation_seed": int(item["source_episode_seed"]),
+            "common_continuation_replan_start": int(item["chunk_idx"]) + 1,
+            "chunk_position_stride": int(policy.config.chunk_size),
+            **source_reconstruction,
+            "videos": False,
+        },
+    }
+    return group, candidates
+
+
+def _complete_groups(store, items: list[dict]) -> tuple[set[str], dict[str, list[dict]]]:
+    rows = store.fetch_all(
+        "verifier_candidate_groups", "candidate_group_id,metadata_json",
+        configure=lambda query: query.eq("experiment", SMOLVLA_TREE_EXPERIMENT),
+        order_by=("candidate_group_id",))
+    ids = [row["candidate_group_id"] for row in rows]
+    candidates = []
+    for start in range(0, len(ids), 100):
+        batch = ids[start:start + 100]
+        candidates.extend(store.fetch_all(
+            "verifier_candidates",
+            "candidate_id,candidate_group_id,candidate_kind,success,n_steps,metadata_json",
+            configure=lambda query, batch=batch: query.in_("candidate_group_id", batch),
+            order_by=("candidate_group_id", "candidate_id")))
+    by_group: dict[str, list[dict]] = defaultdict(list)
+    for candidate in candidates:
+        by_group[str(candidate["candidate_group_id"])].append(candidate)
+    complete = {group_id for group_id, values in by_group.items()
+                if len(values) == SMOLVLA_TREE_CANDIDATES}
+    return complete, by_group
+
+
+def _print_progress(store, items: list[dict]) -> tuple[set[str], str]:
+    complete, by_group = _complete_groups(store, items)
+    allowed = {
+        candidate_group_id(
+            "libero", item["suite"], item["task_idx"], item["episode_idx"],
+            item["chunk_idx"], namespace=SMOLVLA_TREE_EXPERIMENT,
+            trajectory_seed=item["source_episode_seed"])
+        for item in items
+    }
+    complete &= allowed
+    trees = [by_group[group_id] for group_id in sorted(complete)]
+    if not trees:
+        table = "No complete trees in this shard yet."
+        return complete, table
+
+    def candidate(tree, kind):
+        return next(row for row in tree if row["candidate_kind"] == kind)
+
+    stock = [bool(candidate(tree, "stored_source")["success"]) for tree in trees]
+    fresh_any = [any(bool(row["success"]) for row in tree
+                     if str(row["candidate_kind"]).startswith("fresh_seed_")) for tree in trees]
+    perturb_any = [any(bool(row["success"]) for row in tree
+                       if str(row["candidate_kind"]).startswith("pnp_perturb_")) for tree in trees]
+    outcomes = [[bool(row["success"]) for row in tree] for tree in trees]
+    branch_successes = sum(sum(values) for values in outcomes)
+    mixed = sum(len(set(values)) > 1 for values in outcomes)
+    any_success = [any(values) for values in outcomes]
+    failures = max(1, sum(not value for value in stock))
+    pct = lambda value, denominator=len(trees): 100 * value / max(denominator, 1)
+    table = (
+        "Exact depth-1 SmolVLA trees in THIS shard; partial trees excluded.\n"
+        f"trees={len(trees)}/{len(items)} | branches={len(trees) * SMOLVLA_TREE_CANDIDATES} | "
+        f"branch SR={pct(branch_successes, len(trees) * SMOLVLA_TREE_CANDIDATES):.1f}% | "
+        f"mixed={pct(mixed):.1f}%\n"
+        f"stock SR={pct(sum(stock)):.1f}% | any-success={pct(sum(any_success)):.1f}% | "
+        f"oracle gain={pct(sum(any_success)) - pct(sum(stock)):+.1f} pp\n"
+        f"among stock failures: fresh-seed any-success={pct(sum(
+            fresh and not base for fresh, base in zip(fresh_any, stock)), failures):.1f}% | "
+        f"P&P-perturb any-success={pct(sum(
+            perturb and not base for perturb, base in zip(perturb_any, stock)), failures):.1f}%"
+    )
+    return complete, table
+
+
+def run_smolvla_tree_worker(*, shard_count: int = SMOLVLA_TREE_SHARDS,
+                            shard_index: int = 0,
+                            tree_limit: int | None = None,
+                            store=None) -> dict:
+    from . import libero_env, models
+
+    if shard_count != SMOLVLA_TREE_SHARDS or shard_index not in range(shard_count):
+        raise ValueError("the fixed tree manifest requires shard_count=2 and shard_index 0 or 1")
+    store = store or SupabaseStore()
+    document = load_or_build_smolvla_tree_manifest(store)
+    payload = document["payload"]
+    items = [dict(item) for item in payload["items"]
+             if int(item["shard_index"]) == int(shard_index)]
+    if tree_limit is not None:
+        if int(tree_limit) < 1:
+            raise ValueError("tree_limit must be positive or None")
+        items = items[:int(tree_limit)]
+    if tree_limit is None and len(items) != SMOLVLA_TREE_COUNT // SMOLVLA_TREE_SHARDS:
+        raise AssertionError(f"worker has {len(items)} trees, expected 400")
+
+    complete, table = _print_progress(store, items)
+    print(table, flush=True)
+    pending = []
+    for item in items:
+        group_id = candidate_group_id(
+            "libero", item["suite"], item["task_idx"], item["episode_idx"],
+            item["chunk_idx"], namespace=SMOLVLA_TREE_EXPERIMENT,
+            trajectory_seed=item["source_episode_seed"])
+        if group_id not in complete:
+            pending.append(item)
+    if not pending:
+        return {"new_trees": 0, "complete_trees": len(complete), "requested_trees": len(items)}
+
+    source_rows = {str(row["rollout_id"]): row for row in _source_rows(store)}
+    episodes = prepare_smolvla_tree_source_episodes()
+    lookup = {(ep["suite"], int(ep["task_idx"]), int(ep["ep_idx"])): ep for ep in episodes}
+    policy, preprocess, postprocess = models.load_smolvla()
+    device = models.default_device()
+    store.start_run(
+        "smolvla_depth1_tree_collection", "libero", SMOLVLA_TREE_EXPERIMENT,
+        config={
+            "manifest_path": SMOLVLA_TREE_MANIFEST_PATH,
+            "manifest_hash": document["manifest_hash"],
+            "shard_count": shard_count, "shard_index": shard_index,
+            "trees": len(items), "candidate_count": SMOLVLA_TREE_CANDIDATES,
+            "candidate_families": payload["candidate_families"],
+            "priority_fraction": SMOLVLA_TREE_PRIORITY_FRACTION,
+            "integration_steps": SMOLVLA_TREE_INTEGRATION_STEPS,
+            "n_action_steps": SMOLVLA_TREE_ACTIONS, "videos": False,
+        })
+    new_trees = 0
+    started = time.monotonic()
+    try:
+        for item in pending:
+            tree_started = time.monotonic()
+            print(
+                f"[smolvla-tree] starting {new_trees + 1}/{len(pending)} | "
+                f"{item['selection_strategy']} | {item['suite']} task {item['task_idx']} "
+                f"ep {item['episode_idx']} chunk {item['chunk_idx']} | "
+                f"U10={item['source_root_u10']:.5f}", flush=True)
+            row = source_rows[item["source_rollout_id"]]
+            bundle = _load_source_bundle(store, row)
+            ep = lookup[(item["suite"], int(item["task_idx"]), int(item["episode_idx"]))]
+            env = libero_env.make_env(ep["bddl_path"])
+            try:
+                group, candidates = collect_smolvla_depth1_tree(
+                    env, ep, policy, preprocess, postprocess, device,
+                    item=item, bundle=bundle, manifest_hash=document["manifest_hash"])
+            finally:
+                env.close()
+            store.register_candidate_group(group, candidates)
+            new_trees += 1
+            outcomes = [bool(candidate["success"]) for candidate in candidates]
+            families = defaultdict(list)
+            for candidate in candidates:
+                families[candidate["metadata_json"]["candidate_family"]].append(
+                    bool(candidate["success"]))
+            elapsed = time.monotonic() - started
+            eta = elapsed / new_trees * (len(pending) - new_trees)
+            print(
+                f"[smolvla-tree] completed {new_trees}/{len(pending)} | "
+                f"branches={sum(outcomes)}/{len(outcomes)} success | "
+                f"stock={'S' if outcomes[0] else 'F'} | mixed={len(set(outcomes)) > 1} | "
+                f"fresh={sum(families['fresh_initial_noise'])}/4 | "
+                f"perturb={sum(families['fixed_initial_noise_new_pnp_perturbation'])}/4 | "
+                f"tree={time.monotonic() - tree_started:.1f}s | ETA={eta / 60:.1f}m",
+                flush=True)
+            if new_trees % SMOLVLA_TREE_PRINT_EVERY == 0:
+                _, table = _print_progress(store, items)
+                print(table, flush=True)
+    finally:
+        store.finish_run(n_rollouts=new_trees * SMOLVLA_TREE_CANDIDATES)
+    complete, table = _print_progress(store, items)
+    print(table, flush=True)
+    return {
+        "manifest_hash": document["manifest_hash"], "shard_index": shard_index,
+        "requested_trees": len(items), "new_trees": new_trees,
+        "complete_trees": len(complete),
+        "new_candidate_rows": new_trees * SMOLVLA_TREE_CANDIDATES,
+    }
