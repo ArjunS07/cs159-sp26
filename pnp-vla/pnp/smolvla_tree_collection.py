@@ -2,7 +2,9 @@
 
 Each tree contains the exact stored source continuation plus eight counterfactual branches:
 four rerun the same P&P policy with fresh initial flow noise, and four hold the source initial
-noise fixed while changing only the P&P perturbation stream. Roots are fixed before collection:
+noise fixed while changing only the P&P perturbation stream. The stored source is never decoded
+again: SmolVLA's P&P path is measurably GPU-batch-shape-sensitive, so all eight counterfactuals
+are generated in one fixed eight-lane batch. Roots are fixed before collection:
 65% choose the largest pair-weighted U10 boundary and 35% choose a deterministic uniform
 boundary, balanced across suite and source outcome.
 """
@@ -13,6 +15,8 @@ import copy
 import hashlib
 import io
 import json
+import os
+import subprocess
 import time
 
 import numpy as np
@@ -52,9 +56,9 @@ from .verifier.collection import (
 )
 
 
-SMOLVLA_TREE_COLLECTION_VERSION = 1
-SMOLVLA_TREE_EXPERIMENT = "smolvla-libero-depth1-hybrid-trees-v1"
-SMOLVLA_TREE_MANIFEST_PATH = "smolvla_trees/manifests/idx10_29_depth1_hybrid_v1.json"
+SMOLVLA_TREE_COLLECTION_VERSION = 2
+SMOLVLA_TREE_EXPERIMENT = "smolvla-libero-depth1-hybrid-trees-v2-egl"
+SMOLVLA_TREE_MANIFEST_PATH = "smolvla_trees/manifests/idx10_29_depth1_hybrid_v2_egl.json"
 SMOLVLA_TREE_COUNT = 800
 SMOLVLA_TREE_SHARDS = 2
 SMOLVLA_TREE_CANDIDATES = 9
@@ -344,13 +348,15 @@ def _generate_alternatives(policy, batch, device, *, item: dict, source: dict):
         for kind in kinds[4:]
     ]
     source_noise_seed = int(source["noise_seed"])
-    # Lane 0 reconstructs the stored source. Lanes 1:5 vary only initial flow noise; lanes 5:9
-    # hold the source initial noise fixed and vary only the P&P perturbation stream.
-    initial_seeds = [source_noise_seed, *fresh_initial_seeds, *([source_noise_seed] * 4)]
+    # Four lanes vary only initial flow noise; four hold the source initial noise fixed and vary
+    # only the P&P perturbation stream. The exact source is read from its immutable artifact and
+    # deliberately does not enter this batch: calibration showed that decoding it again can be
+    # batch-shape-sensitive even with the exact stored input and RNG streams.
+    initial_seeds = [*fresh_initial_seeds, *([source_noise_seed] * 4)]
     source_generator = _source_perturb_generator(
         policy, device, perturb_seed=int(np.asarray(source["perturb_seed"])),
         completed_chunks=int(item["chunk_idx"]))
-    generators = [_clone_generator(source_generator, device) for _ in range(5)]
+    generators = [_clone_generator(source_generator, device) for _ in range(4)]
     for seed in pnp_perturb_seeds:
         generator = torch.Generator(device=torch.device(device))
         generator.manual_seed(int(seed))
@@ -383,42 +389,23 @@ def _generate_alternatives(policy, batch, device, *, item: dict, source: dict):
     if not tap.pcp_chunks or not tap.pcp_chunks[0]:
         raise RuntimeError("candidate generation captured no SmolVLA observation embedding")
     obs_enc = np.asarray(tap.pcp_chunks[0][0]["obs_enc"], np.float32)
-    source_delta = arrays[0] - np.asarray(source["policy_chunk"], np.float32)
-    executed_delta = source_delta[:SMOLVLA_TREE_ACTIONS]
-    reconstruction = {
-        "source_chunk_reconstruction_rms": float(np.sqrt(np.mean(source_delta ** 2))),
-        "source_chunk_reconstruction_max_abs": float(np.max(np.abs(source_delta))),
-        "source_executed_reconstruction_rms": float(
-            np.sqrt(np.mean(executed_delta ** 2))),
-        "source_executed_reconstruction_max_abs": float(
-            np.max(np.abs(executed_delta))),
-    }
-    # Notebook 87 generated each source inside a changing eight-lane GPU batch; this diagnostic
-    # reruns it in a fixed nine-lane batch. Small elementwise drift (especially in the discarded
-    # 40-action tail) is expected from batch-shape-dependent floating-point kernels. The stock
-    # branch itself always uses the exact stored source chunk and outcome. Fail only when the
-    # executed prefix has a material aggregate mismatch, which indicates a wrong source input,
-    # noise/P&P stream, or time-conditioning value.
-    if reconstruction["source_executed_reconstruction_rms"] > 0.02:
-        raise RuntimeError(
-            "source P&P chunk reconstruction failed: "
-            f"executed RMS={reconstruction['source_executed_reconstruction_rms']:.5f}, "
-            f"executed max={reconstruction['source_executed_reconstruction_max_abs']:.5f}, "
-            f"full max={reconstruction['source_chunk_reconstruction_max_abs']:.5f}")
     metadata = {
         kind: {
             "candidate_family": ("fresh_initial_noise" if kind.startswith("fresh")
                                  else "fixed_initial_noise_new_pnp_perturbation"),
-            "initial_noise_seed": int(initial_seeds[index + 1]),
+            "initial_noise_seed": int(initial_seeds[index]),
             "perturbation_seed": int(
                 np.asarray(source["perturb_seed"]) if index < 4
                 else pnp_perturb_seeds[index - 4]),
-            "pnp_u10": _candidate_u10(recorders[index + 1]),
+            "pnp_u10": _candidate_u10(recorders[index]),
         }
         for index, kind in enumerate(kinds)
     }
-    return (kinds, arrays[1:], metadata, obs_enc,
-            tap.generators[0].get_state().clone(), reconstruction)
+    # Every root P&P path consumes the same fixed five perturbation tensors, independent of its
+    # initial latent. Therefore the first fresh-noise lane ends at the exact source-stream RNG
+    # position immediately after this root and can initialize all common-future continuations.
+    return (kinds, arrays, metadata, obs_enc,
+            tap.generators[0].get_state().clone())
 
 
 def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device, *,
@@ -448,7 +435,7 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
         bundle["arrays"], source["boundary_index"], ep["task_desc"])
     batch = preprocess(policy_observation)
     (kinds, alternatives, alternative_meta, obs_enc,
-     source_next_perturb_state, source_reconstruction) = _generate_alternatives(
+     source_next_perturb_state) = _generate_alternatives(
         policy, batch, device, item=item, source=source)
 
     policy_chunks = {"stored_source": np.asarray(source["policy_chunk"], np.float32)}
@@ -571,7 +558,8 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
             "common_continuation_seed": int(item["source_episode_seed"]),
             "common_continuation_replan_start": int(item["chunk_idx"]) + 1,
             "chunk_position_stride": int(policy.config.chunk_size),
-            **source_reconstruction,
+            "source_candidate_mode": "exact_stored_artifact_no_redecode",
+            "counterfactual_generation_batch_size": 8,
             "videos": False,
         },
     }
@@ -676,6 +664,15 @@ def run_smolvla_tree_worker(*, shard_count: int = SMOLVLA_TREE_SHARDS,
             pending.append(item)
     if not pending:
         return {"new_trees": 0, "complete_trees": len(complete), "requested_trees": len(items)}
+
+    if os.name == "posix" and torch.cuda.is_available():
+        egl = subprocess.run(
+            "ldconfig -p | grep -q libEGL_nvidia", shell=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if egl.returncode != 0:
+            raise RuntimeError(
+                "NVIDIA EGL is unavailable. Run the notebook's GPU-renderer package cell, "
+                "restart the runtime if MuJoCo was already imported, and rerun from the top.")
 
     source_rows = {str(row["rollout_id"]): row for row in _source_rows(store)}
     episodes = prepare_smolvla_tree_source_episodes()

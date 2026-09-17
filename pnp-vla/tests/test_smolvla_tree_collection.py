@@ -6,7 +6,9 @@ import numpy as np
 
 from pnp.smolvla_tree_collection import (
     SMOLVLA_TREE_CANDIDATES,
+    SMOLVLA_TREE_COLLECTION_VERSION,
     SMOLVLA_TREE_COUNT,
+    SMOLVLA_TREE_EXPERIMENT,
     SMOLVLA_TREE_FRESH_CANDIDATES,
     SMOLVLA_TREE_PERTURB_CANDIDATES,
     SMOLVLA_TREE_SHARDS,
@@ -55,6 +57,8 @@ def test_priority_assignment_has_exact_requested_count_and_stratifies():
 
 
 def test_tree_contract_and_worker_notebooks():
+    assert SMOLVLA_TREE_COLLECTION_VERSION == 2
+    assert SMOLVLA_TREE_EXPERIMENT.endswith("v2-egl")
     assert SMOLVLA_TREE_COUNT == 800
     assert SMOLVLA_TREE_SHARDS == 2
     assert SMOLVLA_TREE_CANDIDATES == 9
@@ -76,3 +80,4 @@ def test_tree_contract_and_worker_notebooks():
         assert "TREE_LIMIT = None" in source
         assert "run_smolvla_tree_worker" in source
         assert "1 stored source + 4 fresh seed + 4 P&P perturbation" in source
+        assert "libEGL_nvidia" in source
