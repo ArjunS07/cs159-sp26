@@ -339,6 +339,30 @@ def _sample_actions_smolvla_hooked(
         fill_kv_cache=True,
     )
 
+    training_prefix = None
+    if bool(getattr(strat, "capture_training_prefix", False)):
+        def cpu(value):
+            if torch.is_tensor(value):
+                return value.detach().cpu().numpy()
+            if isinstance(value, dict):
+                return {key: cpu(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [cpu(item) for item in value]
+            return np.asarray(value)
+
+        training_prefix = {
+            "processed_images": cpu(images),
+            "processed_image_masks": cpu(img_masks),
+            "token_ids": cpu(lang_tokens),
+            "token_masks": cpu(lang_masks),
+            "prefix_embeddings": prefix_embs.detach().to(
+                device="cpu", dtype=torch.float16).numpy(),
+            "prefix_pad_masks": cpu(prefix_pad_masks),
+            "prefix_attention_masks": cpu(prefix_att_masks),
+            "prefix_attention_2d_masks": cpu(prefix_att_2d_masks),
+            "prefix_position_ids": cpu(prefix_position_ids),
+        }
+
     positions = self._pnp.chunk_pos
     ctx = ChunkContext(
         num_steps=num_steps,
@@ -346,6 +370,7 @@ def _sample_actions_smolvla_hooked(
         obs_enc=prefix_embs.mean(dim=1).detach(),
         chunk_pos=float(positions) if not isinstance(positions, (list, tuple)) else 0.0,
         chunk_positions=positions,
+        training_prefix=training_prefix,
         prefix_embeddings=prefix_embs,
         prefix_pad_masks=prefix_pad_masks,
     )
