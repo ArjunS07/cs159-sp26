@@ -110,6 +110,54 @@ def set_camera_observables(env, enabled: bool) -> bool:
     return True
 
 
+def refresh_camera_observation(env, obs_dict):
+    """Fill missing camera fields at the *current* simulator state without stepping it.
+
+    Sparse rendering normally re-enables cameras shortly before the next policy boundary. An
+    episode can, however, terminate in the middle of an action queue. In that case the terminal
+    observation has current proprioception but no images, while the training-data sink still
+    needs an exact terminal VLA prefix. Robosuite's ``force_update`` path exists specifically for
+    observations after directly setting / inspecting simulator state and does not execute an
+    action.
+    """
+    if all(name in obs_dict for name in CAMERA_OBSERVABLES):
+        return obs_dict
+    if not set_camera_observables(env, True):
+        missing = [name for name in CAMERA_OBSERVABLES if name not in obs_dict]
+        raise RuntimeError(f"cannot refresh missing camera observations: {missing}")
+
+    target = getattr(env, "env", env)
+    getter = getattr(target, "_get_observations", None)
+    if not callable(getter):
+        raise RuntimeError("LIBERO environment exposes no non-stepping observation refresh")
+
+    sim = getattr(target, "sim", None)
+    before = None
+    if sim is not None:
+        before = np.asarray(sim.get_state().flatten()).copy()
+    try:
+        fresh = getter(force_update=True)
+    except TypeError:
+        # Compatibility with wrappers whose getter has no force_update argument.
+        updater = getattr(target, "_update_observables", None)
+        if not callable(updater):
+            raise RuntimeError("environment cannot force-refresh camera observations")
+        updater(force=True)
+        fresh = getter()
+    if before is not None:
+        after = np.asarray(sim.get_state().flatten())
+        if not np.array_equal(before, after):
+            raise RuntimeError("camera-only observation refresh changed simulator state")
+
+    missing = [name for name in CAMERA_OBSERVABLES if name not in fresh]
+    if missing:
+        raise RuntimeError(f"forced observation refresh still lacks cameras: {missing}")
+    merged = dict(obs_dict)
+    for name in CAMERA_OBSERVABLES:
+        merged[name] = fresh[name]
+    return merged
+
+
 def build_final_episodes(benchmark_dict=None, episode_idxs=None, tasks=None):
     """Build the controlled slice episode list (8 stock tasks x 10 episodes by default)."""
     from libero.libero import get_libero_path

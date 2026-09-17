@@ -3,6 +3,7 @@ from pathlib import Path
 
 from pnp.config import Method
 from pnp.smolvla_tree_source_experiment import (
+    SMOLVLA_TREE_SOURCE_EXPERIMENT,
     SMOLVLA_TREE_SOURCE_EPISODE_INDICES,
     SMOLVLA_TREE_SOURCE_IDENTITIES,
     SMOLVLA_TREE_SOURCE_SHARDS,
@@ -23,6 +24,7 @@ def test_tree_source_config_is_restoration_and_training_ready():
     assert SMOLVLA_TREE_SOURCE_EPISODE_INDICES == tuple(range(10, 30))
     assert SMOLVLA_TREE_SOURCE_IDENTITIES == 800
     assert SMOLVLA_TREE_SOURCE_SHARDS == 2
+    assert SMOLVLA_TREE_SOURCE_EXPERIMENT.endswith("-v2")
 
 
 def test_two_tree_source_worker_notebooks_are_fixed():

@@ -24,7 +24,9 @@ from .smolvla_followup_experiments import (
 from .store import SupabaseStore, gather_provenance
 
 
-SMOLVLA_TREE_SOURCE_EXPERIMENT = "smolvla-libero-tree-source-idx10-29-v1"
+# v2 intentionally starts a clean persistence namespace. The original v1 ran before terminal
+# camera refresh was fixed and must never be resumed into this training dataset.
+SMOLVLA_TREE_SOURCE_EXPERIMENT = "smolvla-libero-tree-source-idx10-29-v2"
 SMOLVLA_TREE_SOURCE_EPISODE_INDICES = tuple(range(10, 30))
 SMOLVLA_TREE_SOURCE_SHARDS = 2
 SMOLVLA_TREE_SOURCE_IDENTITIES = 800
@@ -137,7 +139,7 @@ def run_smolvla_tree_source_worker(
         experiment=experiment,
         episodes=episodes,
         methods=[(method, config)],
-        cohort="smolvla_tree_source_idx10_29",
+        cohort="smolvla_tree_source_idx10_29_v2",
         shard_count=shard_count,
         shard_index=shard_index,
         benchmark="libero",
@@ -157,6 +159,7 @@ def run_smolvla_tree_source_worker(
             "future_priority_fraction": SMOLVLA_TREE_PRIORITY_FRACTION,
             "future_uniform_fraction": SMOLVLA_TREE_UNIFORM_FRACTION,
             "source_artifact_schema": "pcp-search-v1 rich boundary artifact",
+            "collection_revision": "v2-terminal-camera-refresh",
             "video": "off",
         },
         report_every=0,

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from pnp.config import NUM_STEPS_WAIT, RolloutConfig
+from pnp.libero_env import refresh_camera_observation, set_camera_observables
 from pnp.rollout import run_episode
 
 CHUNK = 5
@@ -73,6 +74,11 @@ class _Env:
             obs["agentview_image"] = self._cached
             obs["robot0_eye_in_hand_image"] = self._cached
         return obs
+
+    def _get_observations(self, force_update=False):
+        if force_update:
+            self._enabled_for = self.warmup
+        return self._observation()
 
     def reset(self):
         return self._observation()
@@ -197,3 +203,20 @@ def test_cameras_are_restored_for_the_next_rollout_on_the_same_env():
     env = _Env()
     _run(env, _Policy(), skip_unused_renders=True)
     assert env.cameras_on is True
+
+
+def test_terminal_camera_refresh_does_not_take_an_environment_step():
+    """An early terminal state can arrive while sparse cameras are disabled."""
+    env = _Env(warmup=3)
+    env.reset()
+    set_camera_observables(env, False)
+    obs, _, _, _ = env.step(np.zeros(7))
+    assert "agentview_image" not in obs
+    actions_before, step_before = len(env.actions), env._step
+
+    refreshed = refresh_camera_observation(env, obs)
+
+    assert len(env.actions) == actions_before
+    assert env._step == step_before
+    assert int(refreshed["agentview_image"][0, 0, 0]) == step_before
+    assert int(refreshed["robot0_eye_in_hand_image"][0, 0, 0]) == step_before

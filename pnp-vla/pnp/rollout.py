@@ -20,7 +20,8 @@ import torch
 
 from .config import (ADIM, LIBERO_DUMMY_ACTION, NUM_STEPS_WAIT, PERTURB_SEED_MASK,
                      VIDEO_FPS, RolloutConfig)
-from .libero_env import make_env, obs_to_policy, set_camera_observables
+from .libero_env import (make_env, obs_to_policy, refresh_camera_observation,
+                         set_camera_observables)
 from .pnp import (PnPRecorder, _pnp_seed_perturb, multi_policy_select, multi_sample_select,
                   summarize_probe_diagnostics)
 from .tap import RolloutTap, BatchedRolloutTap
@@ -600,6 +601,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
             if generated_chunks is None:
                 raise ValueError("save_training_data requires save_generated_chunks=True")
             terminal_step = len(executed_actions)
+            obs = refresh_camera_observation(env, obs)
             terminal_observation = obs_to_policy(obs, task_desc)
             training_decisions.append(_training_decision(
                 obs, env, task_desc, terminal_step, terminal_observation))
@@ -1001,6 +1003,18 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
     # Capture all final decision boundaries together. This does not execute another action; it
     # supplies the terminal/truncated RL-token prefix and A_next required by the masked Bellman
     # transition while retaining a batched GPU call.
+    # Success / env termination can occur in the middle of an execution queue, before sparse
+    # rendering was armed for the next policy boundary. Recover the exact terminal cameras at
+    # the unchanged simulator state before constructing the final RL-token prefix.
+    if config.save_training_data:
+        for i, (env, state) in enumerate(zip(envs, states)):
+            if state["status"] != "completed":
+                continue
+            try:
+                state["obs"] = refresh_camera_observation(env, state["obs"])
+            except Exception as exc:
+                state.update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
+                             terminated_reason="error")
     terminal_ids = [i for i, state in enumerate(states)
                     if config.save_training_data and state["status"] == "completed"]
     if terminal_ids:
