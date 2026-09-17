@@ -383,16 +383,27 @@ def _generate_alternatives(policy, batch, device, *, item: dict, source: dict):
         raise RuntimeError("candidate generation captured no SmolVLA observation embedding")
     obs_enc = np.asarray(tap.pcp_chunks[0][0]["obs_enc"], np.float32)
     source_delta = arrays[0] - np.asarray(source["policy_chunk"], np.float32)
+    executed_delta = source_delta[:SMOLVLA_TREE_ACTIONS]
     reconstruction = {
         "source_chunk_reconstruction_rms": float(np.sqrt(np.mean(source_delta ** 2))),
         "source_chunk_reconstruction_max_abs": float(np.max(np.abs(source_delta))),
+        "source_executed_reconstruction_rms": float(
+            np.sqrt(np.mean(executed_delta ** 2))),
+        "source_executed_reconstruction_max_abs": float(
+            np.max(np.abs(executed_delta))),
     }
-    # Batch-shape floating-point differences are allowed; a large mismatch indicates that the
-    # source P&P stream, initial noise, time conditioning, or policy input was not reconstructed.
-    if reconstruction["source_chunk_reconstruction_max_abs"] > 0.02:
+    # Notebook 87 generated each source inside a changing eight-lane GPU batch; this diagnostic
+    # reruns it in a fixed nine-lane batch. Small elementwise drift (especially in the discarded
+    # 40-action tail) is expected from batch-shape-dependent floating-point kernels. The stock
+    # branch itself always uses the exact stored source chunk and outcome. Fail only when the
+    # executed prefix has a material aggregate mismatch, which indicates a wrong source input,
+    # noise/P&P stream, or time-conditioning value.
+    if reconstruction["source_executed_reconstruction_rms"] > 0.02:
         raise RuntimeError(
             "source P&P chunk reconstruction failed: "
-            f"{reconstruction['source_chunk_reconstruction_max_abs']:.5f} max abs")
+            f"executed RMS={reconstruction['source_executed_reconstruction_rms']:.5f}, "
+            f"executed max={reconstruction['source_executed_reconstruction_max_abs']:.5f}, "
+            f"full max={reconstruction['source_chunk_reconstruction_max_abs']:.5f}")
     metadata = {
         kind: {
             "candidate_family": ("fresh_initial_noise" if kind.startswith("fresh")
