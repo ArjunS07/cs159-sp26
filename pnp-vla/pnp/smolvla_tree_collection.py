@@ -65,7 +65,8 @@ SMOLVLA_TREE_INTEGRATION_STEPS = 10
 SMOLVLA_TREE_MIN_BOUNDARIES = 3
 SMOLVLA_TREE_PRINT_EVERY = 5
 _U_TIME_KEY = __import__("re").compile(r"^c(?P<chunk>\d+)_s(?P<step>\d+)_u_time$")
-_SMOLVLA_SOURCE_ARRAYS = tuple(_SOURCE_FIDELITY_ARRAYS) + ("perturb_seed",)
+_SMOLVLA_SOURCE_ARRAYS = tuple(_SOURCE_FIDELITY_ARRAYS) + (
+    "perturb_seed", "boundary/instruction")
 
 
 def _canonical_json(value) -> bytes:
