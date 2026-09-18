@@ -18,6 +18,12 @@ class QPlanningModelConfig:
     value_min: float = 0.0
     value_max: float = 1.0
     hl_gauss_sigma: float = 0.01
+    # Optional deterministic compression of the frozen VLA prefix before the
+    # critic projects it.  ``None`` preserves every historical checkpoint's
+    # architecture and behaviour.  New demonstration-pretrained SmolVLA
+    # critics use a bounded token count so thousands of cached visual prefixes
+    # are practical to store and train on.
+    prefix_pool_tokens: int | None = None
 
     def __post_init__(self):
         if self.action_horizon not in (10, 50):
@@ -26,9 +32,16 @@ class QPlanningModelConfig:
             raise ValueError("width must be divisible by n_heads")
         if self.n_bins < 2 or not self.value_min < self.value_max:
             raise ValueError("invalid categorical value support")
+        if self.prefix_pool_tokens is not None and self.prefix_pool_tokens < 1:
+            raise ValueError("prefix_pool_tokens must be positive or None")
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        result = asdict(self)
+        # Keep the serialized architecture of old checkpoints byte-for-byte
+        # compatible.  A missing field reconstructs the default ``None``.
+        if result["prefix_pool_tokens"] is None:
+            result.pop("prefix_pool_tokens")
+        return result
 
 
 @dataclass(frozen=True)

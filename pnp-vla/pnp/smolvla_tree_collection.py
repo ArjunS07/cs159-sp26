@@ -6,7 +6,9 @@ noise fixed while changing only the P&P perturbation stream. The stored source i
 again: SmolVLA's P&P path is measurably GPU-batch-shape-sensitive, so all eight counterfactuals
 are generated in one fixed eight-lane batch. Roots are fixed before collection:
 65% choose the largest pair-weighted U10 boundary and 35% choose a deterministic uniform
-boundary, balanced across suite and source outcome.
+boundary, balanced across suite and source outcome. Version 3 additionally stores every
+counterfactual's sequential Q10 current/next-boundary tensors, so training can use the same
+EMA-bootstrapped Bellman objective as Q-Planning rather than a root-level Monte Carlo label.
 """
 from __future__ import annotations
 
@@ -32,7 +34,16 @@ from .qplanning_fork_pilot import (
     _source_policy_observation,
     _trajectory_actions_from_payload,
 )
-from .rollout import _draw_chunk_noise, _stack_policy_batches
+from .libero_env import obs_to_policy, refresh_camera_observation, set_camera_observables
+from .pcp_search.data import ACTION_HORIZON
+from .rollout import (
+    _draw_chunk_noise,
+    _raw_robot_state,
+    _sim_state,
+    _stack_policy_batches,
+    _training_decision,
+    chunk_noise_seed,
+)
 from .sampler import _temp_strategy
 from .smolvla_followup_experiments import (
     SMOLVLA_SCHEDULE_K_BY_STEP,
@@ -45,20 +56,24 @@ from .smolvla_tree_source_experiment import (
     prepare_smolvla_tree_source_episodes,
 )
 from .store import SupabaseStore
-from .tap import BatchedRolloutTap, RolloutTap
+from .tap import BatchedRolloutTap, PrefixCaptureTap, RolloutTap
 from .verifier.collection import (
     _content_digest,
     _reset_and_replay_actions,
-    _run_continuation,
     _unwrap_sim,
     candidate_group_id,
     postprocess_chunk,
 )
 
 
-SMOLVLA_TREE_COLLECTION_VERSION = 2
-SMOLVLA_TREE_EXPERIMENT = "smolvla-libero-depth1-hybrid-trees-v2-egl"
-SMOLVLA_TREE_MANIFEST_PATH = "smolvla_trees/manifests/idx10_29_depth1_hybrid_v2_egl.json"
+SMOLVLA_TREE_COLLECTION_VERSION = 3
+# v3 is deliberately disjoint from the old root-only v2 trees.  Every
+# counterfactual now persists an executed branch artifact with the current and
+# next decision-boundary inputs required by an EMA Bellman target.
+SMOLVLA_TREE_LEGACY_EXPERIMENT = "smolvla-libero-depth1-hybrid-trees-v2-egl"
+SMOLVLA_TREE_EXPERIMENT = "smolvla-libero-depth1-hybrid-trees-v3-bellman"
+SMOLVLA_TREE_MANIFEST_PATH = (
+    "smolvla_trees/manifests/idx10_29_depth1_hybrid_v3_bellman.json")
 SMOLVLA_TREE_COUNT = 800
 SMOLVLA_TREE_SHARDS = 2
 SMOLVLA_TREE_CANDIDATES = 9
@@ -68,9 +83,11 @@ SMOLVLA_TREE_ACTIONS = 10
 SMOLVLA_TREE_INTEGRATION_STEPS = 10
 SMOLVLA_TREE_MIN_BOUNDARIES = 3
 SMOLVLA_TREE_PRINT_EVERY = 5
+SMOLVLA_BRANCH_PREFIX_TOKENS = 128
 _U_TIME_KEY = __import__("re").compile(r"^c(?P<chunk>\d+)_s(?P<step>\d+)_u_time$")
 _SMOLVLA_SOURCE_ARRAYS = tuple(_SOURCE_FIDELITY_ARRAYS) + (
-    "perturb_seed", "boundary/instruction")
+    "perturb_seed", "boundary/instruction",
+    "prefix/prefix_embeddings", "prefix/prefix_pad_masks")
 
 
 def _canonical_json(value) -> bytes:
@@ -239,6 +256,9 @@ def build_smolvla_tree_manifest(store=None) -> dict:
         "executed_actions": SMOLVLA_TREE_ACTIONS,
         "pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
         "pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
+        "branch_artifact": "sequential_q10_bellman_v1",
+        "branch_prefix_pool_tokens": SMOLVLA_BRANCH_PREFIX_TOKENS,
+        "critic_target": "EMA Bellman r_0:9 + gamma^10 Qbar(next)",
         "items": items,
     }
     if len(items) != SMOLVLA_TREE_COUNT:
@@ -306,13 +326,15 @@ def _candidate_u10(recorder: PnPRecorder) -> float:
     return float(sum(weights[step] * values[step] for step in weights) / sum(weights.values()))
 
 
-def _pnp_config(*, save_features=False) -> RolloutConfig:
+def _pnp_config(*, save_features=False, save_training_data=False) -> RolloutConfig:
     return RolloutConfig(
         pnp_steps=SMOLVLA_SCHEDULE_STEPS,
         pnp_k=max(SMOLVLA_SCHEDULE_K_BY_STEP),
         pnp_k_by_step=SMOLVLA_SCHEDULE_K_BY_STEP,
         refine=True, n_action_steps=SMOLVLA_TREE_ACTIONS,
         save_pcp_features=bool(save_features),
+        save_generated_chunks=bool(save_training_data),
+        save_training_data=bool(save_training_data),
     )
 
 
@@ -408,6 +430,284 @@ def _generate_alternatives(policy, batch, device, *, item: dict, source: dict):
             tap.generators[0].get_state().clone())
 
 
+def _root_training_prefix(arrays: dict, boundary_index: int) -> dict:
+    """Return the exact frozen SmolVLA prefix at the persisted source root."""
+    return _compact_training_prefix({
+        "prefix_embeddings": np.asarray(
+            arrays["prefix/prefix_embeddings"][boundary_index]).copy(),
+        "prefix_pad_masks": np.asarray(
+            arrays["prefix/prefix_pad_masks"][boundary_index]).copy(),
+    })
+
+
+def _compact_training_prefix(value: dict) -> dict:
+    """Keep and deterministically pool only the frozen critic prefix tensors."""
+    required = ("prefix_embeddings", "prefix_pad_masks")
+    missing = [name for name in required if name not in value]
+    if missing:
+        raise RuntimeError(f"captured SmolVLA prefix is missing {missing}")
+    embeddings = np.asarray(value["prefix_embeddings"])
+    masks = np.asarray(value["prefix_pad_masks"], bool)
+    while embeddings.ndim > 2 and embeddings.shape[0] == 1:
+        embeddings = embeddings[0]
+    while masks.ndim > 1 and masks.shape[0] == 1:
+        masks = masks[0]
+    masks = masks.reshape(-1)
+    if embeddings.ndim != 2 or len(embeddings) != len(masks):
+        raise ValueError(
+            f"invalid prefix shapes {embeddings.shape}/{masks.shape}")
+    embeddings = embeddings[masks]
+    if not len(embeddings):
+        raise ValueError("captured prefix has no valid tokens")
+    target = SMOLVLA_BRANCH_PREFIX_TOKENS
+    tensor = torch.as_tensor(embeddings, dtype=torch.float32).T.unsqueeze(0)
+    if len(embeddings) > target:
+        tensor = torch.nn.functional.adaptive_avg_pool1d(tensor, target)
+    pooled = tensor.squeeze(0).T.numpy().astype(np.float16)
+    result = np.zeros((target, pooled.shape[-1]), np.float16)
+    width = min(target, len(pooled))
+    result[:width] = pooled[:width]
+    valid = np.zeros(target, bool); valid[:width] = True
+    # Preserve the historical singleton lane axis used by source artifacts.
+    return {"prefix_embeddings": result[None], "prefix_pad_masks": valid[None]}
+
+
+def _pack_branch_training_data(*, decisions: list[dict], prefixes: list[dict],
+                               generated_chunks: list[np.ndarray],
+                               normalized_actions: list[np.ndarray],
+                               env_actions: list[np.ndarray], rewards: list[float],
+                               terminated: list[bool], truncated: list[bool],
+                               step_success: list[bool], robot_states: list[np.ndarray],
+                               sim_states: list[np.ndarray], chunk_start_steps: list[int],
+                               chunk_noise_seeds: list[int], episode_seed: int,
+                               initial_state: np.ndarray) -> dict[str, np.ndarray]:
+    """Build the compact, lossless Q10 artifact used by EMA Bellman training.
+
+    Unlike the old v2 tree rows, this contains each executed branch transition
+    and both sides of every nonterminal bootstrap.  Raw camera pixels and the
+    duplicate tokenization tensors are intentionally omitted; the exact frozen
+    prefix embeddings needed by the critic are retained at every boundary.
+    """
+    transitions = len(chunk_start_steps)
+    if not transitions or len(decisions) != transitions + 1 or len(prefixes) != transitions + 1:
+        raise ValueError(
+            "branch Bellman artifact needs C chunks and C+1 boundaries: "
+            f"chunks={transitions}, decisions={len(decisions)}, prefixes={len(prefixes)}")
+    n_steps = len(env_actions)
+    if not (len(normalized_actions) == len(rewards) == len(terminated)
+            == len(truncated) == len(step_success) == n_steps):
+        raise ValueError("branch step arrays do not align")
+    if len(robot_states) != n_steps + 1 or len(sim_states) != n_steps + 1:
+        raise ValueError("branch physical-state arrays need T+1 rows")
+
+    normalized = np.asarray(normalized_actions, np.float32)
+    environment = np.asarray(env_actions, np.float32)
+    action_dim = int(normalized.shape[-1])
+    executed = np.zeros((transitions, ACTION_HORIZON, action_dim), np.float32)
+    valid = np.zeros((transitions, ACTION_HORIZON), bool)
+    for index, start in enumerate(chunk_start_steps):
+        stop = (chunk_start_steps[index + 1]
+                if index + 1 < transitions else n_steps)
+        width = int(stop - start)
+        if not 0 < width <= ACTION_HORIZON:
+            raise ValueError(f"branch chunk {index} has invalid interval [{start},{stop})")
+        executed[index, :width] = normalized[start:stop]
+        valid[index, :width] = True
+
+    prefixes = [_compact_training_prefix(value) for value in prefixes]
+    embeddings = np.stack([
+        np.asarray(value["prefix_embeddings"]) for value in prefixes]).astype(np.float16)
+    masks = np.stack([
+        np.asarray(value["prefix_pad_masks"]) for value in prefixes]).astype(bool)
+    generated = np.asarray(generated_chunks, np.float32)
+    if len(generated) != transitions or generated.shape[1] < ACTION_HORIZON:
+        raise ValueError("one generated action chunk is required per branch transition")
+    generated = generated[:, :, :action_dim]
+    boundary_steps = np.asarray([row["step"] for row in decisions], np.int32)
+    if boundary_steps[0] != 0 or boundary_steps[-1] != n_steps:
+        raise ValueError(
+            f"branch-local boundaries must span [0,{n_steps}], got "
+            f"[{boundary_steps[0]},{boundary_steps[-1]}]")
+
+    artifact = {
+        "branch_training_schema_version": np.asarray(1, np.int16),
+        "action_horizon": np.asarray(ACTION_HORIZON, np.int16),
+        "episode_seed": np.asarray(episode_seed, np.int64),
+        "initial_state": np.asarray(initial_state).copy(),
+        "chunk_start_steps": np.asarray(chunk_start_steps, np.int32),
+        "chunk_noise_seeds": np.asarray(chunk_noise_seeds, np.int64),
+        "actions_normalized": normalized,
+        "actions_env": environment,
+        "rewards": np.asarray(rewards, np.float32),
+        "terminated": np.asarray(terminated, bool),
+        "truncated": np.asarray(truncated, bool),
+        "step_success": np.asarray(step_success, bool),
+        "robot_state_t_plus_1": np.asarray(robot_states, np.float32),
+        "sim_state_t_plus_1": np.asarray(sim_states),
+        "bellman/action": generated,
+        "bellman/executed_normalized": executed,
+        "bellman/validity_mask": valid,
+        "boundary/step": boundary_steps,
+        "boundary/raw_robot_state": np.stack([
+            np.asarray(row["raw_robot_state"], np.float32) for row in decisions]),
+        "boundary/policy_proprio": np.stack([
+            np.asarray(row["policy_proprio"], np.float32) for row in decisions]),
+        "boundary/sim_state": np.stack([
+            np.asarray(row["sim_state"]) for row in decisions]),
+        "boundary/instruction": np.asarray([
+            str(row["instruction"]) for row in decisions], dtype=np.str_),
+        "prefix/prefix_embeddings": embeddings,
+        "prefix/prefix_pad_masks": masks,
+    }
+    # Validate with the exact downstream EMA-TD window builder before anything
+    # is uploaded.  This catches a missing next boundary or an off-by-one mask
+    # during collection rather than hours later in the training notebook.
+    from .qplanning_critic.data import (
+        _validate_qplanning_fields, qplanning_windows_from_artifact)
+    _validate_qplanning_fields(artifact)
+    windows = qplanning_windows_from_artifact(
+        {"rollout_id": "branch-preflight"}, artifact,
+        horizon=ACTION_HORIZON, gamma=.99)
+    if len(windows["reward"]) != transitions:
+        raise AssertionError("branch artifact/window transition counts differ")
+    return artifact
+
+
+def _run_training_continuation(
+        env, obs, ep, policy, preprocess, postprocess, device, *,
+        source: dict, source_arrays: dict, policy_chunk: np.ndarray,
+        env_chunk: np.ndarray, branch_seed: int, source_next_perturb_state,
+        root_noise_seed: int, root_step: int,
+        root_sim_state: np.ndarray) -> tuple[bool, int, dict]:
+    """Execute one branch and persist genuine Q10 current/next transitions."""
+    config = _pnp_config(save_training_data=True)
+    recorder = PnPRecorder(); recorder.new_episode()
+    tap = RolloutTap(
+        config, recorder, device, policy.model._pnp.action_dim,
+        action_postprocess=postprocess)
+    local_steps = 0
+    absolute_steps = int(root_step)
+    replan = int(source["boundary_index"]) + 1
+    position_stride = int(policy.config.chunk_size)
+    estimated_chunks = max(1, round(int(ep["max_steps"]) / position_stride))
+    lead = 2
+    skipping = bool(set_camera_observables(env, True))
+
+    root_decision = {
+        "step": 0,
+        "raw_robot_state": np.asarray(source["raw_robot"], np.float32).copy(),
+        "policy_proprio": np.asarray(source["policy_proprio"], np.float32).copy(),
+        "sim_state": np.asarray(root_sim_state).copy(),
+        "instruction": str(ep["task_desc"]),
+    }
+    decisions = [root_decision]
+    prefixes = [_root_training_prefix(source_arrays, source["boundary_index"])]
+    generated_chunks = [np.asarray(policy_chunk, np.float32).copy()]
+    chunk_start_steps = [0]
+    noise_seeds = [int(root_noise_seed)]
+    normalized_actions: list[np.ndarray] = []
+    environment_actions: list[np.ndarray] = []
+    rewards: list[float] = []
+    terminated_flags: list[bool] = []
+    truncated_flags: list[bool] = []
+    success_flags: list[bool] = []
+    robot_states = [np.asarray(source["raw_robot"], np.float32).copy()]
+    sim_states = [np.asarray(root_sim_state).copy()]
+    queue_policy = list(np.asarray(policy_chunk, np.float32)[:SMOLVLA_TREE_ACTIONS])
+    queue_env = list(np.asarray(env_chunk, np.float32)[:SMOLVLA_TREE_ACTIONS])
+    success = False
+
+    def render_next(needed: bool) -> None:
+        if skipping:
+            set_camera_observables(env, needed)
+
+    def execute_queue() -> bool:
+        nonlocal obs, local_steps, absolute_steps, success
+        while queue_policy:
+            render_next(len(queue_policy) <= lead)
+            normalized = np.asarray(queue_policy.pop(0), np.float32).reshape(-1)[:7]
+            action = np.asarray(queue_env.pop(0), np.float32).reshape(-1)[:7]
+            obs, reward, done, _ = env.step(action)
+            local_steps += 1; absolute_steps += 1
+            step_success = bool(env.check_success())
+            terminal = bool(done or step_success)
+            truncation = bool(absolute_steps >= int(ep["max_steps"]) and not terminal)
+            normalized_actions.append(normalized.copy())
+            environment_actions.append(action.copy())
+            rewards.append(float(reward))
+            terminated_flags.append(terminal)
+            truncated_flags.append(truncation)
+            success_flags.append(step_success)
+            robot_states.append(_raw_robot_state(obs))
+            state = _sim_state(env)
+            if state is None:
+                raise RuntimeError("branch Bellman collection requires simulator state")
+            sim_states.append(state)
+            if step_success:
+                success = True
+            if terminal or truncation:
+                return True
+        return False
+
+    _pnp_gen(device).set_state(source_next_perturb_state)
+    previous_steps = policy.model._pnp.num_steps
+    policy.model._pnp.num_steps = SMOLVLA_TREE_INTEGRATION_STEPS
+    try:
+        with _temp_strategy(policy.model, tap):
+            finished = execute_queue()
+            while not finished and absolute_steps < int(ep["max_steps"]):
+                policy.model._pnp.chunk_pos = min(
+                    (absolute_steps // SMOLVLA_TREE_ACTIONS) / estimated_chunks, 1.0)
+                policy_observation = obs_to_policy(obs, ep["task_desc"])
+                decisions.append(_training_decision(
+                    obs, env, ep["task_desc"], local_steps, policy_observation))
+                seed = chunk_noise_seed(branch_seed, replan)
+                noise = _draw_chunk_noise(policy, device, seed)
+                with torch.no_grad():
+                    chunk = policy.predict_action_chunk(preprocess(policy_observation), noise=noise)
+                generated = chunk.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                if len(tap.training_prefixes) != len(decisions) - 1:
+                    raise RuntimeError("branch continuation prefix capture fell out of alignment")
+                prefixes.append(_compact_training_prefix(tap.training_prefixes[-1]))
+                generated_chunks.append(generated.copy())
+                chunk_start_steps.append(local_steps)
+                noise_seeds.append(int(seed))
+                queue_policy[:] = list(generated[:SMOLVLA_TREE_ACTIONS])
+                queue_env[:] = list(postprocess_chunk(
+                    generated[:SMOLVLA_TREE_ACTIONS], postprocess, device))
+                replan += 1
+                finished = execute_queue()
+
+        # Every transition needs an actual next decision-boundary prefix.  A
+        # terminal/truncated observation may have skipped cameras, so refresh it
+        # at the same simulator state before the capture-only model call.
+        obs = refresh_camera_observation(env, obs)
+        terminal_observation = obs_to_policy(obs, ep["task_desc"])
+        decisions.append(_training_decision(
+            obs, env, ep["task_desc"], local_steps, terminal_observation))
+        terminal_tap = PrefixCaptureTap()
+        terminal_seed = chunk_noise_seed(branch_seed, replan)
+        terminal_noise = _draw_chunk_noise(policy, device, terminal_seed)
+        policy.model._pnp.chunk_pos = min(
+            (absolute_steps // SMOLVLA_TREE_ACTIONS) / estimated_chunks, 1.0)
+        with _temp_strategy(policy.model, terminal_tap), torch.no_grad():
+            policy.predict_action_chunk(preprocess(terminal_observation), noise=terminal_noise)
+        prefixes.append(_compact_training_prefix(terminal_tap.training_prefixes[0]))
+    finally:
+        policy.model._pnp.num_steps = previous_steps
+        if skipping:
+            set_camera_observables(env, True)
+
+    training_data = _pack_branch_training_data(
+        decisions=decisions, prefixes=prefixes, generated_chunks=generated_chunks,
+        normalized_actions=normalized_actions, env_actions=environment_actions,
+        rewards=rewards, terminated=terminated_flags, truncated=truncated_flags,
+        step_success=success_flags, robot_states=robot_states, sim_states=sim_states,
+        chunk_start_steps=chunk_start_steps, chunk_noise_seeds=noise_seeds,
+        episode_seed=branch_seed, initial_state=np.asarray(root_sim_state))
+    return success, absolute_steps, training_data
+
+
 def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device, *,
                                 item: dict, bundle: dict, manifest_hash: str) -> tuple[dict, list]:
     source = _source_boundary(bundle, item)
@@ -455,12 +755,16 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
         trajectory_seed=item["source_episode_seed"])
     candidates = []
     for kind in policy_chunks:
+        branch_training_data = None
         if kind == "stored_source":
             success, n_steps = bool(item["source_success"]), int(item["source_n_steps"])
             branch_meta = {
                 "candidate_family": "stored_source",
                 "reused_historical_suffix": True,
                 "initial_noise_seed": int(source["noise_seed"]),
+                "bellman_data_mode": "source_artifact_suffix",
+                "training_data_path": str(bundle["row"]["training_data_path"]),
+                "training_data_start_boundary": int(source["boundary_index"]),
             }
         else:
             branch_obs, branch_events = _reset_and_replay_actions(
@@ -473,33 +777,25 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
             if correction_error > 1e-6:
                 raise RuntimeError(
                     f"branch root restoration failed (max_abs={correction_error:.3g})")
-            recorder = PnPRecorder(); recorder.new_episode()
-            continuation_tap = RolloutTap(
-                _pnp_config(), recorder, device, policy.model._pnp.action_dim,
-                action_postprocess=postprocess)
             # Restore the source stream immediately after its root chunk. Every branch then gets
             # the same source future initial-noise and P&P randomness; only intervention differs.
-            _pnp_gen(device).set_state(source_next_perturb_state)
-            previous_steps = policy.model._pnp.num_steps
-            policy.model._pnp.num_steps = SMOLVLA_TREE_INTEGRATION_STEPS
-            try:
-                with _temp_strategy(policy.model, continuation_tap):
-                    success, n_steps = _run_continuation(
-                        env, branch_obs, ep, policy, preprocess, postprocess, device,
-                        prefix=env_chunks[kind][:SMOLVLA_TREE_ACTIONS],
-                        branch_seed=int(item["source_episode_seed"]), steps_already=root_step,
-                        n_action_steps=SMOLVLA_TREE_ACTIONS,
-                        skip_unused_renders=True, render_lead=2,
-                        replan_start_index=int(item["chunk_idx"]) + 1,
-                        chunk_position_stride=int(policy.config.chunk_size))
-            finally:
-                policy.model._pnp.num_steps = previous_steps
+            success, n_steps, branch_training_data = _run_training_continuation(
+                env, branch_obs, ep, policy, preprocess, postprocess, device,
+                source=source, source_arrays=bundle["arrays"],
+                policy_chunk=policy_chunks[kind], env_chunk=env_chunks[kind],
+                branch_seed=int(item["source_episode_seed"]),
+                source_next_perturb_state=source_next_perturb_state,
+                root_noise_seed=int(alternative_meta[kind]["initial_noise_seed"]),
+                root_step=root_step, root_sim_state=canonical_state)
             branch_meta = {
                 **alternative_meta[kind],
                 "reused_historical_suffix": False,
                 "common_continuation_seed": int(item["source_episode_seed"]),
                 "parent_replay_terminal_events": branch_events,
                 "root_restore_max_abs": correction_error,
+                "bellman_data_mode": "persisted_counterfactual_branch",
+                "bellman_transitions": int(len(
+                    branch_training_data["bellman/action"])),
             }
         candidate_id = hashlib.sha256(f"{group_id}|{kind}".encode()).hexdigest()[:24]
         candidates.append({
@@ -520,6 +816,8 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
                     "obs_enc": obs_enc,
                     "policy_proprio": np.asarray(source["policy_proprio"], np.float32),
                 },
+                **({"training_data": branch_training_data}
+                   if branch_training_data is not None else {}),
             },
         })
     group = {
@@ -560,6 +858,11 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
             "chunk_position_stride": int(policy.config.chunk_size),
             "source_candidate_mode": "exact_stored_artifact_no_redecode",
             "counterfactual_generation_batch_size": 8,
+            "counterfactual_artifact": (
+                "Q10 current/next frozen prefixes, physical states, generated/executed "
+                "actions, rewards, and terminal masks"),
+            "branch_training_schema_version": 1,
+            "critic_target": "EMA Bellman r_0:9 + gamma^10 Qbar(next)",
             "videos": False,
         },
     }
@@ -583,8 +886,20 @@ def _complete_groups(store, items: list[dict]) -> tuple[set[str], dict[str, list
     by_group: dict[str, list[dict]] = defaultdict(list)
     for candidate in candidates:
         by_group[str(candidate["candidate_group_id"])].append(candidate)
+    group_metadata = {
+        str(row["candidate_group_id"]): dict(row.get("metadata_json") or {})
+        for row in rows}
+
+    def bellman_complete(group_id: str, values: list[dict]) -> bool:
+        if len(values) != SMOLVLA_TREE_CANDIDATES:
+            return False
+        if group_metadata.get(group_id, {}).get("branch_training_schema_version") != 1:
+            return False
+        return all(bool((row.get("metadata_json") or {}).get("training_data_path"))
+                   for row in values)
+
     complete = {group_id for group_id, values in by_group.items()
-                if len(values) == SMOLVLA_TREE_CANDIDATES}
+                if bellman_complete(group_id, values)}
     return complete, by_group
 
 
@@ -662,6 +977,10 @@ def run_smolvla_tree_worker(*, shard_count: int = SMOLVLA_TREE_SHARDS,
             trajectory_seed=item["source_episode_seed"])
         if group_id not in complete:
             pending.append(item)
+    print(
+        f"[smolvla-tree] namespace={SMOLVLA_TREE_EXPERIMENT} | "
+        f"schema-complete={len(complete)}/{len(items)} | pending={len(pending)}",
+        flush=True)
     if not pending:
         return {"new_trees": 0, "complete_trees": len(complete), "requested_trees": len(items)}
 
@@ -690,6 +1009,9 @@ def run_smolvla_tree_worker(*, shard_count: int = SMOLVLA_TREE_SHARDS,
             "priority_fraction": SMOLVLA_TREE_PRIORITY_FRACTION,
             "integration_steps": SMOLVLA_TREE_INTEGRATION_STEPS,
             "n_action_steps": SMOLVLA_TREE_ACTIONS, "videos": False,
+            "branch_artifact": "sequential_q10_bellman_v1",
+            "branch_prefix_pool_tokens": SMOLVLA_BRANCH_PREFIX_TOKENS,
+            "critic_target": "EMA Bellman r_0:9 + gamma^10 Qbar(next)",
         })
     new_trees = 0
     started = time.monotonic()

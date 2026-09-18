@@ -29,7 +29,8 @@ from .pcp_critic.resumable_snapshot import (
     _download_with_retry, load_training_fields_with_retry)
 from .qplanning_critic.config import QPlanningModelConfig
 from .qplanning_critic.model import QPlanningCritic
-from .smolvla_tree_collection import SMOLVLA_TREE_CANDIDATES, SMOLVLA_TREE_EXPERIMENT
+from .smolvla_tree_collection import (
+    SMOLVLA_TREE_CANDIDATES, SMOLVLA_TREE_LEGACY_EXPERIMENT)
 from .store import SupabaseStore
 
 
@@ -43,6 +44,10 @@ TREE_Q10_KINDS = (
     "fresh_seed_1", "fresh_seed_2", "fresh_seed_3", "fresh_seed_4",
     "pnp_perturb_1", "pnp_perturb_2", "pnp_perturb_3", "pnp_perturb_4",
 )
+# These historical MC/ranking trainers intentionally remain pinned to the 521
+# root-only v2 trees.  The v3 sequential branch dataset has a separate EMA-TD
+# trainer and must never silently flow into these objectives.
+SMOLVLA_TREE_EXPERIMENT = SMOLVLA_TREE_LEGACY_EXPERIMENT
 _SOURCE_FIELDS = (
     "prefix/prefix_embeddings", "prefix/prefix_pad_masks",
     "boundary/raw_robot_state", "boundary/policy_proprio", "boundary/step",

@@ -728,6 +728,20 @@ class SupabaseStore:
                 path = f"verifier_candidates/{group_id}/{candidate['candidate_id']}.{name}.npz"
                 self._upload(path, _npz_bytes(blobs[name]))
                 candidate[f"{name}_path"] = path
+            # Counterfactual tree branches can opt into a full sequential critic
+            # artifact.  Keep its path in metadata_json because the historical
+            # verifier_candidates table deliberately has no training_data_path
+            # column.  Multipart transport prevents long branches from crossing
+            # the Storage object-size cap.
+            if blobs.get("training_data") is not None:
+                artifact_id = f"candidate-{candidate['candidate_id']}"
+                training_path, uploads = _training_data_payloads(
+                    artifact_id, blobs["training_data"])
+                for key, payload in uploads:
+                    self._upload(key, payload)
+                metadata = dict(candidate.get("metadata_json") or {})
+                metadata["training_data_path"] = training_path
+                candidate["metadata_json"] = metadata
             candidate["candidate_group_id"] = group_id
             self.client.table("verifier_candidates").upsert(
                 self._json(candidate), on_conflict="candidate_id").execute()

@@ -227,6 +227,9 @@ def train_qplanning_critic(model: QPlanningCritic,
     rolling = defaultdict(float)
     rolling_count = 0
     for update in range(start_update + 1, config.updates + 1):
+        # Validation switches the critic to eval mode.  Explicitly restore
+        # training mode so dropout remains active after every eval interval.
+        model.train()
         learning_rate = config.learning_rate_at(update)
         for group in optimizer.param_groups:
             group["lr"] = learning_rate

@@ -8,6 +8,39 @@ import torch.nn.functional as F
 from .config import QPlanningModelConfig
 
 
+def pool_prefix_tokens(prefix: torch.Tensor, prefix_valid: torch.Tensor,
+                       target_tokens: int | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministically reduce each valid frozen-VLA prefix to a bounded length.
+
+    Adaptive average pooling retains the ordered coarse visual/language layout.
+    Inputs at or below the requested length are copied and padded, making this
+    idempotent for prefixes that were already compressed in a persistent cache.
+    """
+    if target_tokens is None:
+        return prefix, prefix_valid.bool()
+    if prefix.ndim != 3 or prefix_valid.shape != prefix.shape[:2]:
+        raise ValueError("prefix/prefix_valid must be [batch,tokens,width]/[batch,tokens]")
+    target_tokens = int(target_tokens)
+    rows = []
+    masks = []
+    for values, valid in zip(prefix, prefix_valid.bool()):
+        values = values[valid]
+        if not len(values):
+            raise ValueError("each critic prefix needs at least one valid token")
+        if len(values) > target_tokens:
+            values = F.adaptive_avg_pool1d(
+                values.transpose(0, 1).unsqueeze(0).float(), target_tokens
+            ).squeeze(0).transpose(0, 1).to(prefix.dtype)
+        width = len(values)
+        if width < target_tokens:
+            values = F.pad(values, (0, 0, 0, target_tokens - width))
+        rows.append(values)
+        mask = torch.zeros(target_tokens, dtype=torch.bool, device=prefix.device)
+        mask[:width] = True
+        masks.append(mask)
+    return torch.stack(rows), torch.stack(masks)
+
+
 class QPlanningCritic(nn.Module):
     """Score an action sequence using frozen PI context plus physical state."""
 
@@ -53,6 +86,8 @@ class QPlanningCritic(nn.Module):
                 f"expected action [batch,{c.action_horizon},{c.action_dim}], got {tuple(action.shape)}")
         if action_valid.shape != action.shape[:2]:
             raise ValueError("action_valid must be [batch,horizon]")
+        prefix, prefix_valid = pool_prefix_tokens(
+            prefix, prefix_valid, c.prefix_pool_tokens)
         memory = torch.cat([
             self.prefix_projection(prefix.float()),
             self.robot_projection(robot.float())[:, None, :],

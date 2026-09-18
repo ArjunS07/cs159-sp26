@@ -14,6 +14,7 @@ from pnp.smolvla_tree_collection import (
     SMOLVLA_TREE_SHARDS,
     _balanced_priority_ids,
     _eligible_roots,
+    _pack_branch_training_data,
     _pnp_config,
     weighted_u10_profile,
 )
@@ -57,8 +58,8 @@ def test_priority_assignment_has_exact_requested_count_and_stratifies():
 
 
 def test_tree_contract_and_worker_notebooks():
-    assert SMOLVLA_TREE_COLLECTION_VERSION == 2
-    assert SMOLVLA_TREE_EXPERIMENT.endswith("v2-egl")
+    assert SMOLVLA_TREE_COLLECTION_VERSION == 3
+    assert SMOLVLA_TREE_EXPERIMENT.endswith("v3-bellman")
     assert SMOLVLA_TREE_COUNT == 800
     assert SMOLVLA_TREE_SHARDS == 2
     assert SMOLVLA_TREE_CANDIDATES == 9
@@ -80,4 +81,35 @@ def test_tree_contract_and_worker_notebooks():
         assert "TREE_LIMIT = None" in source
         assert "run_smolvla_tree_worker" in source
         assert "1 stored source + 4 fresh seed + 4 P&P perturbation" in source
+        assert "EMA Bellman" in source
         assert "libEGL_nvidia" in source
+
+
+def test_branch_artifact_contains_current_and_next_q10_boundaries():
+    prefix = lambda value: {
+        "prefix_embeddings": np.full((1, 4, 6), value, np.float16),
+        "prefix_pad_masks": np.ones((1, 4), bool),
+    }
+    decisions = [
+        {"step": step, "raw_robot_state": np.full(9, step, np.float32),
+         "policy_proprio": np.full(8, step, np.float32),
+         "sim_state": np.full(5, step, np.float64), "instruction": "task"}
+        for step in (0, 10, 15)
+    ]
+    artifact = _pack_branch_training_data(
+        decisions=decisions, prefixes=[prefix(0), prefix(1), prefix(2)],
+        generated_chunks=[np.zeros((50, 7), np.float32),
+                          np.ones((50, 7), np.float32)],
+        normalized_actions=[np.full(7, i, np.float32) for i in range(15)],
+        env_actions=[np.full(7, i, np.float32) for i in range(15)],
+        rewards=[0.0] * 14 + [1.0],
+        terminated=[False] * 14 + [True], truncated=[False] * 15,
+        step_success=[False] * 14 + [True],
+        robot_states=[np.full(9, i, np.float32) for i in range(16)],
+        sim_states=[np.full(5, i, np.float64) for i in range(16)],
+        chunk_start_steps=[0, 10], chunk_noise_seeds=[11, 12],
+        episode_seed=7, initial_state=np.zeros(5))
+    assert artifact["boundary/step"].tolist() == [0, 10, 15]
+    assert artifact["bellman/action"].shape == (2, 50, 7)
+    assert artifact["bellman/validity_mask"].sum(axis=1).tolist() == [10, 5]
+    assert artifact["prefix/prefix_embeddings"].shape == (3, 1, 128, 6)
