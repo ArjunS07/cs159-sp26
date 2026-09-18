@@ -25,6 +25,9 @@ dependencies = [
 # imports (config, store, analysis helpers) work locally without a GPU stack.
 sim = [
     "transformers==5.5.4",
+    # LeRobot's demonstration-video reader imports PyAV.  Rollout-only
+    # notebooks did not need it, but demo critic pretraining does.
+    "av>=15.0.0,<16.0.0",
     "mujoco>=3.1.6,<3.10",
     "libero==0.1.1",
     "lerobot[pi0,smolvla] @ git+https://github.com/huggingface/lerobot.git@01dcb4c29222bc9f2388cebf87f0e79965a9508b",
