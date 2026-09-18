@@ -12,12 +12,14 @@ are persisted.  The policy is never updated.
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import time
 from typing import Iterable
 
 import numpy as np
@@ -52,6 +54,98 @@ def _atomic_json(path: Path, payload: dict) -> None:
 def _manifest_digest(value: dict) -> str:
     return hashlib.sha256(json.dumps(
         value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
+
+
+def _paths_for_episodes(layout: list[dict], episodes: Iterable[int]) -> list[str]:
+    """Return actual parquet paths whose footer ranges contain selected episodes."""
+    wanted = set(map(int, episodes))
+    paths = sorted({
+        str(row["path"]) for row in layout
+        if any(int(row["episode_min"]) <= episode <= int(row["episode_max"])
+               for episode in wanted)
+    })
+    covered = {
+        episode for episode in wanted
+        if any(int(row["episode_min"]) <= episode <= int(row["episode_max"])
+               for row in layout)
+    }
+    if covered != wanted:
+        raise ValueError(f"parquet footer map is missing episodes {sorted(wanted - covered)}")
+    return paths
+
+
+def _load_or_scan_source_layout(path: Path, *, workers: int = 16) -> list[dict]:
+    """Map episode ranges to real parquet files without downloading their image payloads.
+
+    The published HuggingFaceVLA/libero ``data/file_index`` episode metadata does
+    not match the repository's actual parquet filenames.  LeRobot trusts that
+    metadata for selective downloads and consequently downloads files containing
+    no requested rows.  Parquet footers contain authoritative episode_index
+    statistics, and HTTP range reads make scanning them inexpensive.
+    """
+    if path.is_file():
+        payload = json.loads(path.read_text())
+        if (payload.get("schema_version") == 1
+                and payload.get("dataset_revision") == SMOLVLA_DEMO_DATASET_REVISION):
+            return list(payload["files"])
+    import fsspec
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_url
+
+    repo_paths = sorted(
+        name for name in HfApi().list_repo_files(
+            DIVERSITY_DATASET_REPO, repo_type="dataset",
+            revision=SMOLVLA_DEMO_DATASET_REVISION)
+        if name.startswith("data/") and name.endswith(".parquet"))
+    print(
+        f"[smolvla-demo-q10] scanning {len(repo_paths)} parquet footers once "
+        "to repair the published episode/file mapping", flush=True)
+
+    def inspect(name: str) -> dict:
+        url = hf_hub_url(
+            DIVERSITY_DATASET_REPO, name, repo_type="dataset",
+            revision=SMOLVLA_DEMO_DATASET_REVISION)
+        for attempt in range(5):
+            try:
+                with fsspec.open(
+                        url, "rb", block_size=64 * 1024, cache_type="bytes") as handle:
+                    parquet = pq.ParquetFile(handle)
+                    column_index = None
+                    first = parquet.metadata.row_group(0)
+                    for index in range(first.num_columns):
+                        if first.column(index).path_in_schema == "episode_index":
+                            column_index = index; break
+                    if column_index is None:
+                        raise ValueError(f"{name} has no episode_index parquet column")
+                    ranges = []
+                    for group_index in range(parquet.num_row_groups):
+                        stats = parquet.metadata.row_group(group_index).column(
+                            column_index).statistics
+                        if stats is None or not stats.has_min_max:
+                            raise ValueError(
+                                f"{name} has no episode_index footer statistics")
+                        ranges.append((int(stats.min), int(stats.max)))
+                break
+            except (OSError, TimeoutError):
+                if attempt == 4:
+                    raise
+                time.sleep(2 ** attempt)
+        return {"path": name, "episode_min": min(x[0] for x in ranges),
+                "episode_max": max(x[1] for x in ranges)}
+
+    layout = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for index, row in enumerate(executor.map(inspect, repo_paths), 1):
+            layout.append(row)
+            if index % 25 == 0 or index == len(repo_paths):
+                print(
+                    f"[smolvla-demo-q10] parquet footer map {index}/{len(repo_paths)}",
+                    flush=True)
+    layout.sort(key=lambda row: row["path"])
+    _atomic_json(path, {
+        "schema_version": 1, "dataset_repo_id": DIVERSITY_DATASET_REPO,
+        "dataset_revision": SMOLVLA_DEMO_DATASET_REVISION, "files": layout})
+    return layout
 
 
 def _episode_rows(metadata) -> list[dict]:
@@ -288,27 +382,39 @@ def prepare_smolvla_demo_q10_cache(*, cache_root: str | Path,
     done = len(entries)
     total = len(manifest["episodes"])
     print(f"[smolvla-demo-q10] compact cache {done}/{total} episodes ready", flush=True)
-    for task, task_rows in sorted(grouped.items()):
-        episode_ids = [int(row["episode_index"]) for row in task_rows]
-        task_root = None
-        if source_root is not None:
-            task_root = Path(source_root).expanduser() / manifest["manifest_digest"]
+    dataset = columns = episode_values = action_values = None
+    local_by_episode = {}
+    if grouped:
+        from huggingface_hub import snapshot_download
+        missing_ids = [
+            int(row["episode_index"]) for rows in grouped.values() for row in rows]
+        layout = _load_or_scan_source_layout(root / "source_parquet_layout.json")
+        parquet_paths = _paths_for_episodes(layout, missing_ids)
+        source_base = (Path(source_root).expanduser() if source_root is not None
+                       else Path("/content/smolvla_demo_source"))
+        source_dir = source_base / manifest["manifest_digest"]
+        print(
+            f"[smolvla-demo-q10] downloading {len(parquet_paths)} real parquet files "
+            f"for {len(missing_ids)} uncached demonstrations to {source_dir}", flush=True)
+        snapshot_download(
+            DIVERSITY_DATASET_REPO, repo_type="dataset",
+            revision=SMOLVLA_DEMO_DATASET_REVISION, local_dir=source_dir,
+            allow_patterns=["meta/**", *parquet_paths])
+        # All requested files now exist locally.  Do not invoke LeRobot's broken
+        # selective downloader; its reader can correctly scan and filter them.
         dataset = LeRobotDataset(
-            DIVERSITY_DATASET_REPO, root=task_root, episodes=episode_ids,
-            revision=SMOLVLA_DEMO_DATASET_REVISION,
-            # The revision cache is shared across these task-sized loads.  Once
-            # one task has populated a few parquet files, DatasetReader.try_load
-            # can otherwise filter those files for the next task *before* its
-            # own files are downloaded and raise "train corresponds to no data".
-            # Syncing first remains incremental in snapshot_download and makes
-            # the selected files present before the episode predicate is used.
-            force_cache_sync=True)
+            DIVERSITY_DATASET_REPO, root=source_dir, episodes=missing_ids,
+            revision=SMOLVLA_DEMO_DATASET_REVISION)
         columns = dataset.hf_dataset.select_columns(["episode_index", "action"])
         episode_values = np.asarray(columns["episode_index"], np.int64)
         action_values = np.asarray(columns["action"], np.float32)
         local_by_episode = {
             episode: np.flatnonzero(episode_values == episode).astype(int).tolist()
-            for episode in episode_ids}
+            for episode in missing_ids}
+        empty = [episode for episode, indices in local_by_episode.items() if not indices]
+        if empty:
+            raise ValueError(f"downloaded parquet set has no rows for episodes {empty}")
+    for task, task_rows in sorted(grouped.items()):
         for row in task_rows:
             episode = int(row["episode_index"])
             local = local_by_episode[episode]
@@ -326,10 +432,11 @@ def prepare_smolvla_demo_q10_cache(*, cache_root: str | Path,
             print(
                 f"[smolvla-demo-q10] {done}/{total} episodes | {task} ep={episode} | "
                 f"{len(arrays['reward'])} Q10 windows", flush=True)
-        del dataset, columns, episode_values, action_values
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
+    if dataset is not None:
+        del dataset, columns, episode_values, action_values
 
     ordered = [entries[int(row["episode_index"])] for row in manifest["episodes"]]
     first_path = root / ordered[0]["path"]

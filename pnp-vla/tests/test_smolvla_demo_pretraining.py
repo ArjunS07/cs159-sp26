@@ -1,7 +1,8 @@
 import numpy as np
 
 from pnp.smolvla_demo_pretraining import (
-    _axis_angle_to_quaternion, _demo_windows, select_demo_episodes)
+    _axis_angle_to_quaternion, _demo_windows, _paths_for_episodes,
+    select_demo_episodes)
 
 
 def _rows():
@@ -52,3 +53,13 @@ def test_demo_windows_have_terminal_reward_and_ema_bootstrap():
     np.testing.assert_allclose(arrays["reward"][2], 1.0)
     np.testing.assert_allclose(arrays["mc_return"], [.99 ** 20, .99 ** 10, 1.0])
     assert arrays["next_action_valid"][2].sum() == 1
+
+
+def test_actual_parquet_paths_are_selected_from_footer_ranges():
+    layout = [
+        {"path": "file-000.parquet", "episode_min": 0, "episode_max": 2},
+        {"path": "file-001.parquet", "episode_min": 3, "episode_max": 4},
+        {"path": "file-002.parquet", "episode_min": 5, "episode_max": 9},
+    ]
+    assert _paths_for_episodes(layout, [1, 4, 8]) == [
+        "file-000.parquet", "file-001.parquet", "file-002.parquet"]
