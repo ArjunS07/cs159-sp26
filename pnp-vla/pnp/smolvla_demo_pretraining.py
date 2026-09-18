@@ -338,6 +338,33 @@ def _write_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
     os.replace(temporary, path)
 
 
+def _download_source_files(*, local_dir: Path, allow_patterns: list[str],
+                           attempts: int = 6) -> None:
+    """Download large embedded-image parquets without Xet/CAS rate-limit bursts."""
+    # Set both the environment variable (for fresh imports) and the already
+    # imported runtime constant (load_smolvla imports huggingface_hub earlier).
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    import huggingface_hub.constants as hub_constants
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import HfHubHTTPError
+    hub_constants.HF_HUB_DISABLE_XET = True
+    for attempt in range(attempts):
+        try:
+            snapshot_download(
+                DIVERSITY_DATASET_REPO, repo_type="dataset",
+                revision=SMOLVLA_DEMO_DATASET_REVISION, local_dir=local_dir,
+                allow_patterns=allow_patterns, max_workers=2)
+            return
+        except (HfHubHTTPError, RuntimeError, OSError) as error:
+            if attempt + 1 == attempts:
+                raise
+            delay = min(60, 5 * (2 ** attempt))
+            print(
+                f"[smolvla-demo-q10] source download interrupted ({type(error).__name__}); "
+                f"resuming in {delay}s [{attempt + 1}/{attempts}]", flush=True)
+            time.sleep(delay)
+
+
 def prepare_smolvla_demo_q10_cache(*, cache_root: str | Path,
                                    source_root: str | Path | None = None,
                                    seed: int = 42,
@@ -385,7 +412,6 @@ def prepare_smolvla_demo_q10_cache(*, cache_root: str | Path,
     dataset = columns = episode_values = action_values = None
     local_by_episode = {}
     if grouped:
-        from huggingface_hub import snapshot_download
         missing_ids = [
             int(row["episode_index"]) for rows in grouped.values() for row in rows]
         layout = _load_or_scan_source_layout(root / "source_parquet_layout.json")
@@ -396,10 +422,8 @@ def prepare_smolvla_demo_q10_cache(*, cache_root: str | Path,
         print(
             f"[smolvla-demo-q10] downloading {len(parquet_paths)} real parquet files "
             f"for {len(missing_ids)} uncached demonstrations to {source_dir}", flush=True)
-        snapshot_download(
-            DIVERSITY_DATASET_REPO, repo_type="dataset",
-            revision=SMOLVLA_DEMO_DATASET_REVISION, local_dir=source_dir,
-            allow_patterns=["meta/**", *parquet_paths])
+        _download_source_files(
+            local_dir=source_dir, allow_patterns=["meta/**", *parquet_paths])
         # All requested files now exist locally.  Do not invoke LeRobot's broken
         # selective downloader; its reader can correctly scan and filter them.
         dataset = LeRobotDataset(
