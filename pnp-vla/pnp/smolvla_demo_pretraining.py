@@ -295,7 +295,14 @@ def prepare_smolvla_demo_q10_cache(*, cache_root: str | Path,
             task_root = Path(source_root).expanduser() / manifest["manifest_digest"]
         dataset = LeRobotDataset(
             DIVERSITY_DATASET_REPO, root=task_root, episodes=episode_ids,
-            revision=SMOLVLA_DEMO_DATASET_REVISION)
+            revision=SMOLVLA_DEMO_DATASET_REVISION,
+            # The revision cache is shared across these task-sized loads.  Once
+            # one task has populated a few parquet files, DatasetReader.try_load
+            # can otherwise filter those files for the next task *before* its
+            # own files are downloaded and raise "train corresponds to no data".
+            # Syncing first remains incremental in snapshot_download and makes
+            # the selected files present before the episode predicate is used.
+            force_cache_sync=True)
         columns = dataset.hf_dataset.select_columns(["episode_index", "action"])
         episode_values = np.asarray(columns["episode_index"], np.int64)
         action_values = np.asarray(columns["action"], np.float32)
@@ -429,4 +436,3 @@ def run_smolvla_demo_q10_pretraining(*,
         "Demo validation is success-only; failure AUC is intentionally undefined. "
         "Use Bellman/return MAE here and evaluate failure discrimination after tree training.")
     return report
-
