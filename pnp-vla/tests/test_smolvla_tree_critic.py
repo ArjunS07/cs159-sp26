@@ -5,8 +5,11 @@ import torch
 from pnp.smolvla_tree_critic import (
     TREE_Q10_KINDS,
     _candidate_order,
+    _selection_batch_indices,
     _split_group_ids,
     discounted_fork_return,
+    listwise_success_selection_loss,
+    pairwise_success_ranking_loss,
     stock_relative_difference_loss,
 )
 
@@ -43,3 +46,27 @@ def test_group_split_is_deterministic_and_disjoint():
     assert validation_a == validation_b
     assert set(train_a).isdisjoint(validation_a)
     assert set(train_a) | set(validation_a) == {entry["candidate_group_id"] for entry in entries}
+
+
+def test_direct_selection_losses_reward_success_over_failure():
+    success = torch.tensor([[True, False, True, False]])
+    correct = torch.tensor([[2.0, -1.0, 1.0, -2.0]], requires_grad=True)
+    reversed_scores = -correct.detach()
+    assert pairwise_success_ranking_loss(correct, success) < pairwise_success_ranking_loss(
+        reversed_scores, success)
+    assert listwise_success_selection_loss(correct, success) < listwise_success_selection_loss(
+        reversed_scores, success)
+    (pairwise_success_ranking_loss(correct, success)
+     + listwise_success_selection_loss(correct, success)).backward()
+    assert correct.grad is not None
+
+
+def test_selection_sampler_has_exact_65_percent_mixed_slots_per_five_updates():
+    mixed = np.arange(20)
+    nonmixed = np.arange(20, 40)
+    batches = [
+        _selection_batch_indices(mixed=mixed, nonmixed=nonmixed, update=step, seed=42)
+        for step in range(1, 6)
+    ]
+    assert sum(np.isin(batch, mixed).sum() for batch in batches) == 26
+    assert all(len(set(batch.tolist())) == 8 for batch in batches)

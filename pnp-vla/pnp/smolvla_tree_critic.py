@@ -91,6 +91,52 @@ class SmolVLATreeQ10TrainConfig:
         return self.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
 
 
+@dataclass(frozen=True)
+class SmolVLATreeSelectionTrainConfig:
+    """Directly optimize same-root candidate ordering on the frozen tree snapshot."""
+
+    seed: int = 42
+    updates: int = 2_000
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-4
+    warmup_updates: int = 200
+    effective_tree_batch: int = 8
+    micro_tree_batch: int = 2
+    absolute_weight: float = 0.25
+    pairwise_weight: float = 1.0
+    listwise_weight: float = 0.0
+    ranking_temperature: float = 0.10
+    ranking_margin: float = 0.05
+    print_interval: int = 100
+    eval_interval: int = 250
+    checkpoint_interval: int = 500
+    grad_clip: float = 1.0
+    use_bf16: bool = True
+
+    def __post_init__(self):
+        if self.updates < 1 or self.warmup_updates < 0:
+            raise ValueError("invalid update schedule")
+        if self.effective_tree_batch != 8:
+            raise ValueError("the declared 65% schedule requires an eight-tree effective batch")
+        if self.micro_tree_batch < 1 or self.effective_tree_batch % self.micro_tree_batch:
+            raise ValueError("micro_tree_batch must divide effective_tree_batch")
+        if min(self.absolute_weight, self.pairwise_weight, self.listwise_weight) < 0:
+            raise ValueError("loss weights must be nonnegative")
+        if self.ranking_temperature <= 0 or self.ranking_margin < 0:
+            raise ValueError("invalid ranking temperature or margin")
+
+    @property
+    def accumulation_steps(self) -> int:
+        return self.effective_tree_batch // self.micro_tree_batch
+
+    def learning_rate_at(self, update: int) -> float:
+        if self.warmup_updates and update <= self.warmup_updates:
+            return self.learning_rate * update / self.warmup_updates
+        span = max(1, self.updates - self.warmup_updates)
+        progress = min(1.0, max(0.0, (update - self.warmup_updates) / span))
+        return self.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+
+
 def discounted_fork_return(success: bool, *, n_steps: int, root_step: int,
                            gamma: float = TREE_Q10_GAMMA) -> float:
     """Terminal reward discounted per executed action from the fork boundary."""
@@ -110,6 +156,53 @@ def stock_relative_difference_loss(prediction: torch.Tensor,
     predicted_gap = prediction[:, 1:] - prediction[:, :1]
     target_gap = target[:, 1:] - target[:, :1]
     return F.smooth_l1_loss(predicted_gap, target_gap)
+
+
+def mixed_tree_mask(success: torch.Tensor) -> torch.Tensor:
+    """Trees containing at least one successful and one failed candidate."""
+    if success.ndim != 2:
+        raise ValueError("success must be [trees,candidates]")
+    success = success.bool()
+    return success.any(1) & (~success).any(1)
+
+
+def pairwise_success_ranking_loss(score: torch.Tensor, success: torch.Tensor, *,
+                                  temperature: float = 0.10,
+                                  margin: float = 0.05) -> torch.Tensor:
+    """Tree-balanced logistic loss over every success-versus-failure pair.
+
+    Unlike the old stock-relative regression, this objective has a direct, order-one
+    gradient whenever a failed candidate outranks a successful candidate. Trees without
+    both outcomes provide no ranking label and therefore contribute a differentiable zero.
+    """
+    if score.shape != success.shape or score.ndim != 2:
+        raise ValueError("score and success must have matching [trees,candidates] shapes")
+    if temperature <= 0 or margin < 0:
+        raise ValueError("invalid ranking temperature or margin")
+    per_tree = []
+    success = success.bool()
+    for values, labels in zip(score, success):
+        good, bad = values[labels], values[~labels]
+        if len(good) and len(bad):
+            gap = good[:, None] - bad[None, :]
+            per_tree.append(F.softplus((margin - gap) / temperature).mean())
+    return torch.stack(per_tree).mean() if per_tree else score.sum() * 0.0
+
+
+def listwise_success_selection_loss(score: torch.Tensor, success: torch.Tensor, *,
+                                    temperature: float = 0.10) -> torch.Tensor:
+    """Negative log softmax mass assigned to successful candidates in each mixed tree."""
+    if score.shape != success.shape or score.ndim != 2:
+        raise ValueError("score and success must have matching [trees,candidates] shapes")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    per_tree = []
+    success = success.bool()
+    scaled = score / temperature
+    for values, labels in zip(scaled, success):
+        if bool(labels.any()) and bool((~labels).any()):
+            per_tree.append(torch.logsumexp(values, 0) - torch.logsumexp(values[labels], 0))
+    return torch.stack(per_tree).mean() if per_tree else score.sum() * 0.0
 
 
 def _json_digest(value) -> str:
@@ -651,6 +744,227 @@ def run_smolvla_tree_q10_training(*, run_name: str, difference_weight: float,
         model, validation, device, micro_tree_batch=micro_tree_batch)
     return {
         "run_name": run_name, "difference_weight": difference_weight,
+        "dataset_digest": cache["dataset_digest"], "initial_model_digest": initial_digest,
+        "updates": config.updates, "validation": final, "history": history,
+        "final_checkpoint": str(output_dir / f"checkpoint_step_{config.updates:06d}.pt"),
+    }
+
+
+def _selection_outcome_pools(dataset: SmolVLATreeDataset):
+    mixed, nonmixed = [], []
+    for index, entry in enumerate(dataset.entries):
+        with np.load(dataset.root / entry["path"], allow_pickle=False) as archive:
+            success = np.asarray(archive["successes"], bool)
+        (mixed if success.any() and (~success).any() else nonmixed).append(index)
+    if not mixed or not nonmixed:
+        raise ValueError("selection training requires both mixed and non-mixed trees")
+    return np.asarray(mixed, np.int64), np.asarray(nonmixed, np.int64)
+
+
+def _selection_batch_indices(*, mixed: np.ndarray, nonmixed: np.ndarray,
+                             update: int, seed: int) -> np.ndarray:
+    """Eight trees/update with exactly 65% mixed slots over each five-update block."""
+    # Four updates use 5/8 mixed and every fifth uses 6/8: (4*5+6)/(5*8) = 65%.
+    n_mixed = 6 if int(update) % 5 == 0 else 5
+    rng = np.random.default_rng(int(seed) * 1_000_003 + int(update))
+    selected = np.concatenate([
+        rng.choice(mixed, size=n_mixed, replace=False),
+        rng.choice(nonmixed, size=8 - n_mixed, replace=False),
+    ])
+    rng.shuffle(selected)
+    return selected
+
+
+def _save_selection_checkpoint(path: Path, *, model, optimizer, update: int,
+                               cache: dict, config: SmolVLATreeSelectionTrainConfig,
+                               history: list[dict], run_name: str):
+    payload = {
+        "format": "smolvla_tree_q10_selection_critic_v1", "update": update,
+        "run_name": run_name, "dataset_digest": cache["dataset_digest"],
+        "train_group_ids": cache["train_group_ids"],
+        "validation_group_ids": cache["validation_group_ids"],
+        "architecture": model.architecture_config(), "train_config": asdict(config),
+        "source_policy": {"model": "HuggingFaceVLA/smolvla_libero",
+                          "executed_actions": 10, "generated_actions": 50},
+        "selection_score": "expected_hl_gauss_return",
+        "model": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+        "optimizer": optimizer.state_dict(), "history": history,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+    for candidate in path.parent.glob("checkpoint_step_*.pt"):
+        if candidate != path:
+            candidate.unlink()
+
+
+def run_smolvla_tree_q10_selection_training(
+        *, run_name: str, listwise_weight: float,
+        expected_trees: int = TREE_Q10_EXPECTED_TREES, updates: int = 2_000,
+        cache_root: str | Path = "/content/smolvla_tree_q10_cache",
+        output_root: str | Path = "/content/drive/MyDrive/pnp_smolvla_tree_q10_selection",
+        micro_tree_batch: int = 2, download_workers: int = 8,
+        device: str | None = None, resume: bool = True, store=None):
+    """Train matched direct-ranking arms without changing the critic architecture."""
+    if float(listwise_weight) not in (0.0, 1.0):
+        raise ValueError("the declared ablation requires listwise_weight 0.0 or 1.0")
+    store = store or SupabaseStore()
+    config = SmolVLATreeSelectionTrainConfig(
+        updates=updates, micro_tree_batch=micro_tree_batch,
+        listwise_weight=float(listwise_weight))
+    cache = prepare_smolvla_tree_q10_cache(
+        store=store, cache_root=cache_root, expected_trees=expected_trees,
+        gamma=TREE_Q10_GAMMA, download_workers=download_workers)
+    train = SmolVLATreeDataset(cache, cache["train_group_ids"])
+    validation = SmolVLATreeDataset(cache, cache["validation_group_ids"])
+    mixed_pool, nonmixed_pool = _selection_outcome_pools(train)
+
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+    random.seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
+    model = QPlanningCritic(
+        prefix_dim=int(cache["prefix_dim"]), robot_dim=int(cache["robot_dim"]),
+        proprio_dim=int(cache["proprio_dim"]),
+        config=QPlanningModelConfig(
+            action_horizon=TREE_Q10_HORIZON, action_dim=int(cache["action_dim"])))
+    model.set_action_statistics(cache["action_mean"], cache["action_std"])
+    initial_digest = _state_digest(model)
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    output_dir = Path(output_root).expanduser() / cache["dataset_digest"] / run_name
+    start_update, history = 0, []
+    latest = _latest_checkpoint(output_dir) if resume else None
+    if latest is not None:
+        payload = torch.load(latest, map_location="cpu", weights_only=False)
+        if (payload.get("format") != "smolvla_tree_q10_selection_critic_v1"
+                or payload.get("dataset_digest") != cache["dataset_digest"]
+                or payload.get("train_config") != asdict(config)):
+            raise ValueError("existing checkpoint does not match this exact selection contract")
+        model.load_state_dict(payload["model"])
+        optimizer.load_state_dict(payload["optimizer"])
+        model.to(device)
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+        start_update = int(payload["update"])
+        history = list(payload.get("history", []))
+        torch.set_rng_state(payload["torch_rng_state"])
+        if torch.cuda.is_available() and payload.get("cuda_rng_state") is not None:
+            torch.cuda.set_rng_state_all(payload["cuda_rng_state"])
+        print(f"[smolvla-tree-selection] resumed {latest.name} at step {start_update}",
+              flush=True)
+
+    print("Training contract", flush=True)
+    print({
+        "run_name": run_name, "architecture": "unchanged QPlanningCritic",
+        "absolute_weight": config.absolute_weight,
+        "pairwise_weight": config.pairwise_weight,
+        "listwise_weight": config.listwise_weight,
+        "ranking_temperature": config.ranking_temperature,
+        "ranking_margin": config.ranking_margin,
+        "mixed_sampling": "65% exactly over each 5-update block",
+        "mixed_train_trees": len(mixed_pool), "nonmixed_train_trees": len(nonmixed_pool),
+        "updates": config.updates, "effective_tree_batch": config.effective_tree_batch,
+        "effective_candidate_rows": config.effective_tree_batch * SMOLVLA_TREE_CANDIDATES,
+        "dataset_digest": cache["dataset_digest"], "initial_model_digest": initial_digest,
+        "train_trees": len(train), "validation_trees": len(validation),
+        "device": str(device), "output_dir": str(output_dir),
+    }, flush=True)
+    if start_update == 0:
+        initial = evaluate_smolvla_tree_q10(
+            model, validation, device, micro_tree_batch=micro_tree_batch)
+        history.append({"update": 0, "validation": initial})
+        print(f"validation step 0 | {initial}", flush=True)
+
+    use_amp = bool(config.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
+    started = time.perf_counter()
+    rolling = defaultdict(float)
+    rolling_micro, rolling_mixed = 0, 0
+    for update in range(start_update + 1, config.updates + 1):
+        learning_rate = config.learning_rate_at(update)
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
+        indices = _selection_batch_indices(
+            mixed=mixed_pool, nonmixed=nonmixed_pool, update=update, seed=config.seed)
+        optimizer.zero_grad(set_to_none=True)
+        model.train()
+        total_mixed = 6 if update % 5 == 0 else 5
+        for offset in range(0, len(indices), config.micro_tree_batch):
+            raw = _collate_groups([
+                train[int(i)] for i in indices[offset:offset + config.micro_tree_batch]])
+            batch = _to(raw, device)
+            micro_mixed = int(mixed_tree_mask(batch["success"]).sum().item())
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                logits, expected = _forward_groups(model, batch)
+                absolute = model.categorical_loss(logits, batch["target"].reshape(-1))
+                pairwise = pairwise_success_ranking_loss(
+                    expected, batch["success"],
+                    temperature=config.ranking_temperature, margin=config.ranking_margin)
+                listwise = listwise_success_selection_loss(
+                    expected, batch["success"], temperature=config.ranking_temperature)
+                mixed_fraction = micro_mixed / total_mixed
+                loss = (config.absolute_weight * absolute / config.accumulation_steps
+                        + config.pairwise_weight * pairwise * mixed_fraction
+                        + config.listwise_weight * listwise * mixed_fraction)
+            loss.backward()
+            rolling["absolute"] += float(absolute.detach())
+            rolling["pairwise"] += float(pairwise.detach()) * micro_mixed
+            rolling["listwise"] += float(listwise.detach()) * micro_mixed
+            rolling["q"] += float(expected.detach().mean())
+            rolling["target"] += float(batch["target"].mean())
+            rolling_micro += 1
+            rolling_mixed += micro_mixed
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+        optimizer.step()
+
+        if update % config.print_interval == 0 or update == config.updates:
+            elapsed = time.perf_counter() - started
+            completed = update - start_update
+            eta = elapsed / max(completed, 1) * (config.updates - update)
+            gpu = torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0
+            print(
+                f"tree-selection step {update}/{config.updates} | "
+                f"abs_ce {rolling['absolute']/max(rolling_micro, 1):.4f} | "
+                f"pair_rank {rolling['pairwise']/max(rolling_mixed, 1):.4f} | "
+                f"listwise {rolling['listwise']/max(rolling_mixed, 1):.4f} | "
+                f"q {rolling['q']/max(rolling_micro, 1):.4f} | "
+                f"target {rolling['target']/max(rolling_micro, 1):.4f} | "
+                f"mixed slots {rolling_mixed}/{rolling_micro*config.micro_tree_batch} | "
+                f"grad {float(grad_norm):.3f} | lr {learning_rate:.2e} | GPU {gpu:.1f} GB | "
+                f"elapsed {elapsed/60:.1f}m | ETA {eta/60:.1f}m", flush=True)
+            rolling.clear()
+            rolling_micro, rolling_mixed = 0, 0
+        if update % config.eval_interval == 0 or update == config.updates:
+            metrics = evaluate_smolvla_tree_q10(
+                model, validation, device, micro_tree_batch=micro_tree_batch)
+            history.append({"update": update, "validation": metrics})
+            print(
+                "validation | CE {hl_gauss_ce:.4f} | return MAE {return_mae:.4f} | "
+                "gap MAE {difference_mae:.4f} | failure AUC {failure_auc:.3f} | "
+                "within-tree {within_tree_pairwise_accuracy:.3f} | "
+                "selected-stock {selected_minus_stock_pp:+.1f} pp | "
+                "F->S {failure_to_success} | S->F {success_to_failure} | "
+                "stock chosen {stock_selected_pct:.1f}% | n {trees}".format(**metrics),
+                flush=True)
+        if update % config.checkpoint_interval == 0 or update == config.updates:
+            path = output_dir / f"checkpoint_step_{update:06d}.pt"
+            _save_selection_checkpoint(
+                path, model=model, optimizer=optimizer, update=update, cache=cache,
+                config=config, history=history, run_name=run_name)
+            print(f"[smolvla-tree-selection] saved {path}", flush=True)
+
+    final = evaluate_smolvla_tree_q10(
+        model, validation, device, micro_tree_batch=micro_tree_batch)
+    return {
+        "run_name": run_name, "listwise_weight": config.listwise_weight,
         "dataset_digest": cache["dataset_digest"], "initial_model_digest": initial_digest,
         "updates": config.updates, "validation": final, "history": history,
         "final_checkpoint": str(output_dir / f"checkpoint_step_{config.updates:06d}.pt"),
