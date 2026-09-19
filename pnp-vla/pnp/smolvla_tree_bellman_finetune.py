@@ -1129,3 +1129,166 @@ def analyze_smolvla_tree_advantage_thresholds(*,
         "scores": scores, "success": success, "delta_q": delta,
         "suggested_exploratory_threshold": chosen_threshold,
     }
+
+
+def analyze_smolvla_tree_gradient_directions(*,
+                                             checkpoint_path: str | Path,
+                                             cache_root: str | Path =
+                                             "/content/smolvla_tree_threshold_cache",
+                                             tree_limit: int = 480,
+                                             snapshot_key: str = DEFAULT_SNAPSHOT_KEY,
+                                             download_workers: int = 8,
+                                             device=None,
+                                             store=None) -> dict:
+    """Test whether stock-action Q gradients align with successful tree branches.
+
+    This is a finite-direction diagnostic over observed candidate displacements. It
+    does not claim that a novel gradient-updated action would succeed in the simulator.
+    """
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from IPython.display import display
+
+    checkpoint_path = _resolve_single(checkpoint_path)
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if payload.get("format") != CHECKPOINT_FORMAT:
+        raise ValueError(f"unsupported tree checkpoint: {checkpoint_path}")
+    architecture = payload["architecture"]
+    horizon = int(architecture["action_horizon"])
+    action_dim = int(architecture["action_dim"])
+    store = store or SupabaseStore()
+    snapshot = load_or_create_tree_snapshot(
+        store=store, snapshot_key=snapshot_key, tree_limit=tree_limit)
+    if payload.get("snapshot_digest") != snapshot["snapshot_digest"]:
+        raise ValueError("checkpoint and shared tree snapshot differ")
+    root_cache = prepare_tree_validation_roots(
+        snapshot=snapshot, cache_root=cache_root, horizon=horizon,
+        action_dim=action_dim, download_workers=download_workers, store=store)
+    dataset = RootTreeDataset(root_cache, root_cache["validation_group_ids"])
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model, _ = _model_from_checkpoint(payload, device)
+    model.eval()
+
+    gradient_dot_parts, gradient_cosine_parts = [], []
+    finite_delta_parts, success_parts = [], []
+    for start in range(0, len(dataset), 16):
+        batch = _to(_root_batch([
+            dataset[index] for index in range(start, min(len(dataset), start + 16))]),
+            device)
+        stock_action = batch["action"][:, 0].detach().clone().requires_grad_(True)
+        stock_valid = batch["action_valid"][:, 0]
+        logits = model(
+            batch["prefix"], batch["pad"], batch["robot"], batch["proprio"],
+            stock_action, stock_valid)
+        stock_q = (logits.float().softmax(-1) * model.value_bins.float()).sum(-1)
+        gradient = torch.autograd.grad(stock_q.sum(), stock_action)[0]
+        displacement = batch["action"][:, 1:] - stock_action.detach()[:, None]
+        valid = (batch["action_valid"][:, 1:]
+                 & stock_valid[:, None]).to(displacement.dtype)[..., None]
+        displacement = displacement * valid
+        expanded_gradient = gradient[:, None] * valid
+        dot = (expanded_gradient * displacement).sum(dim=(-1, -2))
+        gradient_norm = expanded_gradient.square().sum(dim=(-1, -2)).sqrt()
+        displacement_norm = displacement.square().sum(dim=(-1, -2)).sqrt()
+        cosine = dot / (gradient_norm * displacement_norm).clamp_min(1e-12)
+        with torch.no_grad():
+            all_scores = _root_scores(model, batch)
+        gradient_dot_parts.append(dot.detach().cpu().numpy())
+        gradient_cosine_parts.append(cosine.detach().cpu().numpy())
+        finite_delta_parts.append((all_scores[:, 1:] - all_scores[:, :1]).cpu().numpy())
+        success_parts.append(batch["success"].cpu().numpy())
+
+    signals = {
+        "finite_delta_q": np.concatenate(finite_delta_parts),
+        "gradient_dot": np.concatenate(gradient_dot_parts),
+        "gradient_cosine": np.concatenate(gradient_cosine_parts),
+    }
+    success = np.concatenate(success_parts).astype(bool)
+    stock_success = success[:, 0]
+    candidate_success = success[:, 1:]
+
+    def pairwise_accuracy(values: np.ndarray) -> tuple[float, int]:
+        correct = total = 0.0
+        for scores, labels in zip(values, candidate_success):
+            good, bad = scores[labels], scores[~labels]
+            if len(good) and len(bad):
+                differences = good[:, None] - bad[None, :]
+                correct += float((differences > 0).sum()
+                                 + .5 * (differences == 0).sum())
+                total += differences.size
+        return (float(correct / total) if total else float("nan"), int(total))
+
+    rows = []
+    decisive_positive = (~stock_success[:, None]) & candidate_success
+    decisive_negative = stock_success[:, None] & (~candidate_success)
+    decisive = decisive_positive | decisive_negative
+    decisive_labels = decisive_positive[decisive]
+    for name, values in signals.items():
+        decisive_values = values[decisive]
+        auc = _auc(decisive_labels, decisive_values)
+        sign_correct = np.concatenate([
+            values[decisive_positive] > 0,
+            values[decisive_negative] < 0,
+        ])
+        within, pairs = pairwise_accuracy(values)
+        best = values.argmax(1)
+        best_value = values[np.arange(len(values)), best]
+        override = best_value > 0
+        selected_success = stock_success.copy()
+        selected_success[override] = candidate_success[
+            np.arange(len(values))[override], best[override]]
+        f_to_s = int((~stock_success & selected_success).sum())
+        s_to_f = int((stock_success & ~selected_success).sum())
+        rows.append({
+            "signal": name,
+            "decisive_auc_FtoS_over_StoF": auc,
+            "decisive_sign_accuracy": float(sign_correct.mean()) if len(sign_correct) else float("nan"),
+            "within_tree_success_failure_accuracy": within,
+            "within_tree_pairs": pairs,
+            "positive_signal_override_pct": float(100 * override.mean()),
+            "failure_to_success": f_to_s, "success_to_failure": s_to_f,
+            "selected_minus_stock_pp": float(
+                100 * (selected_success.mean() - stock_success.mean())),
+        })
+    metrics = pd.DataFrame(rows)
+
+    categories = np.full(candidate_success.shape, "same outcome", dtype=object)
+    categories[decisive_positive] = "F->S"
+    categories[decisive_negative] = "S->F"
+    detail_rows = []
+    for name, values in signals.items():
+        for category in ("F->S", "S->F", "same outcome"):
+            selected = values[categories == category]
+            if len(selected):
+                detail_rows.append({
+                    "signal": name, "transition": category, "n": len(selected),
+                    "mean": float(selected.mean()), "median": float(np.median(selected)),
+                    "p10": float(np.quantile(selected, .10)),
+                    "p90": float(np.quantile(selected, .90)),
+                })
+    detail = pd.DataFrame(detail_rows)
+    print({
+        "checkpoint": str(checkpoint_path), "checkpoint_update": int(payload["update"]),
+        "validation_trees": len(dataset),
+        "interpretation": (
+            "A useful ascent direction should put F->S above S->F: AUC, sign accuracy, "
+            "and within-tree accuracy should exceed 0.5."),
+    }, flush=True)
+    display(metrics)
+    print("\nSignal distributions by observed transition:")
+    display(detail)
+
+    figure, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for axis, (name, values) in zip(axes, signals.items()):
+        groups, labels = [], []
+        for category in ("F->S", "S->F", "same outcome"):
+            selected = values[categories == category]
+            if len(selected):
+                groups.append(selected); labels.append(category)
+        axis.boxplot(groups, labels=labels, showfliers=False)
+        axis.axhline(0, color="black", linestyle="--", linewidth=1)
+        axis.set_title(name); axis.tick_params(axis="x", rotation=20)
+    figure.suptitle("Do stock-Q gradients point toward helpful candidate displacements?")
+    plt.tight_layout(); plt.show()
+    return {"metrics": metrics, "detail": detail, "signals": signals,
+            "success": success}
