@@ -105,6 +105,8 @@ class Method:
     THREE_STEP_SINGLE_REFINE = "three_step_single_refine"
     THREE_STEP_SINGLE_QUERY = "three_step_single_query"
     SMOLVLA_PNP_S123_K311 = "smolvla_pnp_steps123_k311"
+    SMOLVLA_CONSENSUS_PROJECT_K3 = "smolvla_consensus_project_s05_k3"
+    SMOLVLA_CONSENSUS_PROJECT_K5 = "smolvla_consensus_project_s05_k5"
     QPLANNING_Q10 = "qplanning_q10"
     QPLANNING_Q50 = "qplanning_q50"
     QPLANNING_Q50_U025 = "qplanning_q50_u20_beta025"
@@ -138,6 +140,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.FIVE_STEP_LOWEST_U20, Method.FIVE_STEP_LOWEST_U20_REFINE,
                Method.FIVE_STEP_SINGLE_REFINE, Method.THREE_STEP_SINGLE_REFINE,
                Method.THREE_STEP_SINGLE_QUERY, Method.SMOLVLA_PNP_S123_K311,
+               Method.SMOLVLA_CONSENSUS_PROJECT_K3,
+               Method.SMOLVLA_CONSENSUS_PROJECT_K5,
                Method.QPLANNING_Q10,
                Method.QPLANNING_Q50, Method.QPLANNING_Q50_U025,
                Method.QPLANNING_Q50_U050, Method.QPLANNING_Q50_U100,
@@ -203,6 +207,12 @@ class RolloutConfig:
     # Scale every inner predict/perturb proposal toward its destination. Unlike
     # refine_horizon_m, this changes the intermediate states seen by all K velocity evaluations.
     refine_inner_strength: Optional[float] = None
+    # SmolVLA consensus projection: average the exact-stock and completed P&P-refined chunks,
+    # forward-noise that clean consensus to one Euler boundary, run K fixed-time P&P cycles,
+    # then integrate from that boundary to s=0. The ordinary refine settings above define the
+    # refined parent; these fields define only the subsequent projection.
+    consensus_projection_k: Optional[int] = None
+    consensus_projection_step: Optional[int] = None
     # Differentiate exact P&P uncertainty through the frozen VLA and update only the live latent.
     # The random mode still computes the gradient, then applies an equal-RMS random direction.
     uncertainty_gradient_mode: Optional[str] = None  # None | "descent" | "random"
@@ -503,6 +513,24 @@ class RolloutConfig:
             if (not math.isfinite(float(self.refine_inner_strength))
                     or not 0 < float(self.refine_inner_strength) <= 1):
                 raise ValueError("refine_inner_strength must lie in (0, 1]")
+        projection_fields = (self.consensus_projection_k, self.consensus_projection_step)
+        if any(value is not None for value in projection_fields):
+            if not all(value is not None for value in projection_fields):
+                raise ValueError(
+                    "consensus projection requires both projection_k and projection_step")
+            if not self.refine:
+                raise ValueError("consensus projection requires a P&P-refined parent")
+            if self.num_inference_steps is None:
+                raise ValueError("consensus projection requires explicit num_inference_steps")
+            if (isinstance(self.consensus_projection_k, bool)
+                    or int(self.consensus_projection_k) != self.consensus_projection_k
+                    or int(self.consensus_projection_k) < 1):
+                raise ValueError("consensus_projection_k must be a positive integer")
+            if (isinstance(self.consensus_projection_step, bool)
+                    or int(self.consensus_projection_step) != self.consensus_projection_step
+                    or not 1 <= int(self.consensus_projection_step) < int(self.num_inference_steps)):
+                raise ValueError(
+                    "consensus_projection_step must lie in [1, num_inference_steps)")
         # Probe-derived sinks need a probe.
         for sink in ("save_pcp_features", "save_ahats", "save_time_uncertainty"):
             if getattr(self, sink) and not self.has_probe:
@@ -596,6 +624,9 @@ class RolloutConfig:
             logical.pop("q_guidance_gate_horizon")
             logical.pop("q_guidance_gate_pnp_k")
             logical.pop("q_guidance_gate_probe_steps")
+        if logical.get("consensus_projection_k") is None:
+            logical.pop("consensus_projection_k")
+            logical.pop("consensus_projection_step")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
@@ -628,6 +659,7 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_k_by_step", "pnp_time_min", "action
                   "refine", "refine_average", "refine_horizon_m", "refine_threshold",
                   "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
                   "refine_prefix_only", "refine_inner_strength",
+                  "consensus_projection_k", "consensus_projection_step",
                   "uncertainty_gradient_mode", "uncertainty_gradient_step_size",
                   "uncertainty_gradient_horizon",
                   "uncertainty_gradient_action_rms_max",

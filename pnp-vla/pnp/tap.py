@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from .config import RolloutConfig, PERTURB_SEED_MASK
-from .pnp import (run_probe, extend_probe_with_final_prediction, apply_refine,
+from .pnp import (run_probe, extend_probe_with_final_prediction, apply_refine, _pnp_gen,
                   apply_fractional_refine, PnPRecorder, temporal_decay_weights,
                   temporal_prefix_weights)
 from .pcp import apply_correct, CorrectTelemetry
@@ -125,9 +125,51 @@ class RolloutTap:
         return bool(
             (self.config.refine and (
                 self.config.refine_threshold is not None
-                or self.config.refine_start_chunk is not None))
+                or self.config.refine_start_chunk is not None
+                or self.config.consensus_projection_k is not None))
             or self.config.uncertainty_gradient_action_rms_max is not None
             or self.config.q_guidance_ckpt_id is not None)
+
+    def _projection_noise(self, like):
+        return torch.empty_like(like).normal_(generator=_pnp_gen(like.device))
+
+    def _projection_generators(self):
+        return None
+
+    def project_consensus_action(self, baseline_action, refined_action, vfield, ctx):
+        """Project the stock/refined clean-chunk average back onto the flow manifold."""
+        cfg = self.config
+        if cfg.consensus_projection_k is None:
+            return refined_action
+        num_steps = int(ctx.num_steps)
+        step = int(cfg.consensus_projection_step)
+        s = 1.0 - step / num_steps
+        if not 0.0 < s < 1.0:
+            raise ValueError("consensus projection requires an interior flow time")
+
+        consensus = 0.5 * (baseline_action + refined_action)
+        # Averaging opposite gripper commands can create an invalid near-zero command. Keep the
+        # stock command only on disagreement; continuous arm dimensions remain true averages.
+        if min(self.adim, consensus.shape[-1]) > 6:
+            disagree = baseline_action[..., 6] * refined_action[..., 6] < 0
+            consensus[..., 6] = torch.where(
+                disagree, baseline_action[..., 6], consensus[..., 6])
+
+        initial_noise = self._projection_noise(consensus)
+        x_t = (1.0 - s) * consensus + s * initial_noise
+        probe = run_probe(
+            x_t, s, lambda value: vfield(value, s),
+            k=int(cfg.consensus_projection_k), adim=cfg.action_dim,
+            generators=self._projection_generators())
+        ctx.step = step
+        self._record_probe(probe, ctx)
+        x_t = apply_refine(probe, average=False)
+
+        dt = -1.0 / num_steps
+        for remaining_step in range(step, num_steps):
+            remaining_s = 1.0 + remaining_step * dt
+            x_t = x_t + dt * vfield(x_t, remaining_s)
+        return x_t
 
     def begin_chunk(self) -> None:
         self._chunk_idx += 1
@@ -502,6 +544,25 @@ class BatchedRolloutTap:
             gen = torch.Generator(device=torch.device(device))
             gen.manual_seed(int(seed) ^ PERTURB_SEED_MASK)
             self.generators.append(gen)
+
+    @property
+    def needs_baseline_fallback(self):
+        return self.config.consensus_projection_k is not None
+
+    def _projection_noise(self, like):
+        noise = torch.empty_like(like)
+        for lane, generator in enumerate(self.generators):
+            noise[lane:lane + 1].normal_(generator=generator)
+        return noise
+
+    def _projection_generators(self):
+        return self.generators
+
+    project_consensus_action = RolloutTap.project_consensus_action
+
+    @staticmethod
+    def finalize_action(baseline_action, candidate_action):
+        return candidate_action
 
     def selected(self, step, s):
         return self.config.probe_selected(step, s)

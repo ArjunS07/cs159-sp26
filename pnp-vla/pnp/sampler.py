@@ -404,6 +404,21 @@ def _sample_actions_smolvla_hooked(
                 callback(x_t, s, velocity, ctx)
         x_t = x_t + dt * velocity
 
+    projector = getattr(strat, "project_consensus_action", None)
+    if projector is not None and getattr(strat.config, "consensus_projection_k", None) is not None:
+        def projection_vfield(inp, s):
+            self._pnp.vf_evals += 1
+            time_tensor = torch.tensor(
+                s, dtype=torch.float32, device=device).expand(bsize)
+            return self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=inp,
+                timestep=time_tensor,
+            )
+
+        x_t = projector(baseline_action, x_t, projection_vfield, ctx)
+
     strat.finish(ctx)
     if not strat.invasive:
         return baseline_action
