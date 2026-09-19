@@ -50,6 +50,11 @@ DEFAULT_SNAPSHOT_KEY = (
 # complete contract: the shared window builder validates its generated/executed
 # action diagnostics even though this fine-tuner does not optimize those arrays.
 TREE_FIELDS = QPLANNING_ARTIFACT_FIELDS
+ROOT_SOURCE_FIELDS = (
+    "prefix/prefix_embeddings", "prefix/prefix_pad_masks",
+    "boundary/raw_robot_state", "boundary/policy_proprio", "boundary/step",
+    "bellman/action",
+)
 
 
 @dataclass(frozen=True)
@@ -421,6 +426,154 @@ def _resolve_single(pattern: str | Path) -> Path:
     if len(matches) != 1:
         raise ValueError(f"expected exactly one match for {path}; found {matches}")
     return matches[0]
+
+
+def _root_prefix(value) -> np.ndarray:
+    value = np.asarray(value)
+    while value.ndim > 2 and value.shape[0] == 1:
+        value = value[0]
+    if value.ndim != 2:
+        raise ValueError(f"expected root prefix [tokens,width], got {value.shape}")
+    return value.astype(np.float16, copy=False)
+
+
+def _root_mask(value, length: int) -> np.ndarray:
+    value = np.asarray(value)
+    while value.ndim > 1 and value.shape[0] == 1:
+        value = value[0]
+    value = value.reshape(-1).astype(bool, copy=False)
+    if len(value) != length:
+        raise ValueError("root prefix/mask lengths differ")
+    return value
+
+
+def _read_policy_chunk(store, path: str, *, horizon: int, action_dim: int):
+    payload = _download_with_retry(store, str(path))
+    with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+        if "actions" not in archive.files:
+            raise ValueError(f"candidate policy chunk {path} has no actions")
+        value = np.asarray(archive["actions"], np.float32)
+    if value.ndim != 2 or value.shape[0] < horizon or value.shape[1] < action_dim:
+        raise ValueError(f"candidate policy chunk {path} has shape {value.shape}")
+    return value[:horizon, :action_dim].copy()
+
+
+def prepare_tree_validation_roots(*, snapshot: dict, cache_root: str | Path,
+                                  horizon: int, action_dim: int,
+                                  download_workers: int = 8, store=None) -> dict:
+    """Materialize only held-out fork roots for fast threshold diagnostics."""
+    store = store or SupabaseStore()
+    _, validation_ids = _split_groups(snapshot["groups"])
+    wanted = set(validation_ids)
+    root = Path(cache_root).expanduser() / snapshot["snapshot_digest"]
+    root.mkdir(parents=True, exist_ok=True)
+    index_path = root / "validation_root_index.json"
+    if index_path.is_file():
+        payload = json.loads(index_path.read_text())
+        if (payload.get("snapshot_digest") == snapshot["snapshot_digest"]
+                and payload.get("horizon") == horizon
+                and payload.get("action_dim") == action_dim
+                and set(payload.get("validation_group_ids", ())) == wanted
+                and all((root / row["path"]).is_file()
+                        for row in payload.get("group_entries", ()) )):
+            print(f"[tree-threshold] root cache ready: {len(wanted)} trees", flush=True)
+            return payload
+
+    groups = store.fetch_all(
+        "verifier_candidate_groups",
+        "candidate_group_id,suite,task_idx,episode_idx,metadata_json",
+        configure=lambda query: query.eq("experiment", SMOLVLA_TREE_EXPERIMENT),
+        order_by=("candidate_group_id",))
+    groups = {str(row["candidate_group_id"]): row for row in groups
+              if str(row["candidate_group_id"]) in wanted}
+    if set(groups) != wanted:
+        raise ValueError(f"validation root query found {len(groups)}/{len(wanted)} groups")
+    candidates = []
+    ids = sorted(wanted)
+    for start in range(0, len(ids), 100):
+        subset = ids[start:start + 100]
+        candidates.extend(store.fetch_all(
+            "verifier_candidates",
+            "candidate_id,candidate_group_id,candidate_kind,success,policy_chunk_path",
+            configure=lambda query, subset=subset: query.in_("candidate_group_id", subset),
+            order_by=("candidate_group_id", "candidate_kind")))
+    by_group = defaultdict(list)
+    for row in candidates:
+        by_group[str(row["candidate_group_id"])].append(row)
+    rank = {kind: index for index, kind in enumerate(TREE_Q10_KINDS)}
+    for gid in wanted:
+        rows = by_group[gid]
+        if (len(rows) != len(TREE_Q10_KINDS)
+                or {str(row["candidate_kind"]) for row in rows} != set(TREE_Q10_KINDS)):
+            raise ValueError(f"validation tree {gid} is incomplete")
+        rows.sort(key=lambda row: rank[str(row["candidate_kind"])])
+
+    local = threading.local()
+
+    def materialize(gid: str):
+        path = root / f"root_{gid}.npz"
+        group = groups[gid]
+        metadata = group.get("metadata_json") or {}
+        worker_store = getattr(local, "store", None)
+        if worker_store is None:
+            worker_store = store.fork_for_thread()
+            local.store = worker_store
+        source = load_training_fields_with_retry(
+            worker_store, str(metadata["source_training_data_path"]), ROOT_SOURCE_FIELDS)
+        boundary = int(metadata["source_boundary_index"])
+        prefix = _root_prefix(source["prefix/prefix_embeddings"][boundary])
+        pad = _root_mask(source["prefix/prefix_pad_masks"][boundary], len(prefix))
+        rows = by_group[gid]
+        actions = np.stack([
+            _read_policy_chunk(
+                worker_store, row["policy_chunk_path"],
+                horizon=horizon, action_dim=action_dim)
+            for row in rows])
+        exact_source = np.asarray(source["bellman/action"][boundary], np.float32)[
+            :horizon, :action_dim]
+        error = float(np.max(np.abs(exact_source - actions[0])))
+        if error > 1e-6:
+            raise ValueError(f"stored source mismatch at {gid}: {error:.3g}")
+        _atomic_npz(path, {
+            "prefix": prefix, "pad": pad,
+            "robot": np.asarray(
+                source["boundary/raw_robot_state"][boundary], np.float32).reshape(-1),
+            "proprio": np.asarray(
+                source["boundary/policy_proprio"][boundary], np.float32).reshape(-1),
+            "actions": actions,
+            "action_valid": np.ones((len(rows), horizon), bool),
+            "success": np.asarray([bool(row["success"]) for row in rows], bool),
+            "candidate_kinds": np.asarray(TREE_Q10_KINDS, dtype="U32"),
+        })
+        return {
+            "candidate_group_id": gid, "suite": str(group["suite"]),
+            "task_idx": int(group["task_idx"]),
+            "stock_success": bool(rows[0]["success"]),
+            "mixed": len({bool(row["success"]) for row in rows}) > 1,
+            "path": path.name,
+        }
+
+    entries = []
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=download_workers) as executor:
+        futures = [executor.submit(materialize, gid) for gid in sorted(wanted)]
+        for future in as_completed(futures):
+            entries.append(future.result())
+            done = len(entries)
+            if done % 10 == 0 or done == len(wanted):
+                elapsed = time.perf_counter() - started
+                eta = elapsed / done * (len(wanted) - done)
+                print(
+                    f"[tree-threshold] roots {done}/{len(wanted)} | "
+                    f"ETA {eta / 60:.1f}m", flush=True)
+    entries.sort(key=lambda row: row["candidate_group_id"])
+    payload = {
+        "snapshot_digest": snapshot["snapshot_digest"],
+        "cache_dir": str(root), "horizon": horizon, "action_dim": action_dim,
+        "validation_group_ids": sorted(wanted), "group_entries": entries,
+    }
+    _atomic_json(index_path, payload)
+    return payload
 
 
 def _load_demo_contract(cache_root: str | Path, checkpoint_path: str | Path):
@@ -825,4 +978,154 @@ def run_smolvla_tree_bellman_finetune(*,
         "snapshot_digest": snapshot["snapshot_digest"], "updates": config.updates,
         "validation": final, "history": history,
         "final_checkpoint": str(output_dir / f"checkpoint_step_{config.updates:06d}.pt"),
+    }
+
+
+def analyze_smolvla_tree_advantage_thresholds(*,
+                                              checkpoint_path: str | Path,
+                                              cache_root: str | Path =
+                                              "/content/smolvla_tree_threshold_cache",
+                                              tree_limit: int = 480,
+                                              snapshot_key: str = DEFAULT_SNAPSHOT_KEY,
+                                              download_workers: int = 8,
+                                              device=None,
+                                              store=None) -> dict:
+    """Rescore held-out roots and sweep a stock-relative Q override margin."""
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from IPython.display import display
+
+    checkpoint_path = _resolve_single(checkpoint_path)
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if payload.get("format") != CHECKPOINT_FORMAT:
+        raise ValueError(f"unsupported tree checkpoint: {checkpoint_path}")
+    architecture = payload["architecture"]
+    horizon = int(architecture["action_horizon"])
+    action_dim = int(architecture["action_dim"])
+    store = store or SupabaseStore()
+    snapshot = load_or_create_tree_snapshot(
+        store=store, snapshot_key=snapshot_key, tree_limit=tree_limit)
+    if payload.get("snapshot_digest") != snapshot["snapshot_digest"]:
+        raise ValueError("checkpoint and shared tree snapshot differ")
+    root_cache = prepare_tree_validation_roots(
+        snapshot=snapshot, cache_root=cache_root, horizon=horizon,
+        action_dim=action_dim, download_workers=download_workers, store=store)
+    dataset = RootTreeDataset(root_cache, root_cache["validation_group_ids"])
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model, _ = _model_from_checkpoint(payload, device)
+    model.eval()
+    score_parts, success_parts = [], []
+    with torch.no_grad():
+        for start in range(0, len(dataset), 16):
+            batch = _to(_root_batch([
+                dataset[index] for index in range(start, min(len(dataset), start + 16))]),
+                device)
+            score_parts.append(_root_scores(model, batch).cpu().numpy())
+            success_parts.append(batch["success"].cpu().numpy())
+    scores = np.concatenate(score_parts)
+    success = np.concatenate(success_parts).astype(bool)
+    suites = np.asarray([entry["suite"] for entry in dataset.entries])
+    rows = np.arange(len(scores))
+    best_alternative = scores[:, 1:].argmax(1) + 1
+    delta = scores[rows, best_alternative] - scores[:, 0]
+    alternative_success = success[rows, best_alternative]
+    stock_success = success[:, 0]
+
+    def metrics(threshold: float) -> dict:
+        override = delta > threshold
+        selected = np.where(override, alternative_success, stock_success)
+        f_to_s = int((~stock_success & selected).sum())
+        s_to_f = int((stock_success & ~selected).sum())
+        return {
+            "threshold": float(threshold), "overrides": int(override.sum()),
+            "override_pct": float(100 * override.mean()),
+            "failure_to_success": f_to_s, "success_to_failure": s_to_f,
+            "net_flips": f_to_s - s_to_f,
+            "selected_minus_stock_pp": float(100 * (selected.mean() - stock_success.mean())),
+            "selected_sr_pct": float(100 * selected.mean()),
+        }
+
+    sweep = pd.DataFrame([metrics(float("-inf"))] + [
+        metrics(value) for value in np.unique(delta)])
+    ranked = sweep.sort_values(
+        ["net_flips", "success_to_failure", "overrides"],
+        ascending=[False, True, True])
+    best = ranked.iloc[0]
+    conservative_pool = sweep[
+        (sweep["overrides"] > 0)
+        & (sweep["failure_to_success"] >= sweep["success_to_failure"])]
+    conservative = (conservative_pool.sort_values(
+        ["net_flips", "success_to_failure", "overrides"],
+        ascending=[False, True, True]).iloc[0]
+        if len(conservative_pool) else None)
+    requested = [
+        ("ungated argmax", float("-inf")),
+        ("positive advantage", 0.0),
+        ("median delta", float(np.quantile(delta, .50))),
+        ("top quartile delta", float(np.quantile(delta, .75))),
+        ("top decile delta", float(np.quantile(delta, .90))),
+        ("best validation net", float(best["threshold"])),
+    ]
+    if conservative is not None:
+        requested.append(("best F->S >= S->F", float(conservative["threshold"])))
+    operating = pd.DataFrame([
+        {"rule": label, **metrics(threshold)} for label, threshold in requested])
+    operating = operating.drop_duplicates(subset=["threshold"], keep="first")
+
+    transition = np.full(len(delta), "same outcome", dtype=object)
+    transition[~stock_success & alternative_success] = "F->S"
+    transition[stock_success & ~alternative_success] = "S->F"
+    delta_summary = pd.DataFrame({"transition": transition, "delta_q": delta}).groupby(
+        "transition")["delta_q"].agg(["count", "mean", "median", "min", "max"])
+    chosen_threshold = float(
+        conservative["threshold"] if conservative is not None else best["threshold"])
+    per_suite = []
+    for suite in sorted(set(suites)):
+        keep = suites == suite
+        override = (delta > chosen_threshold) & keep
+        selected = stock_success.copy()
+        selected[override] = alternative_success[override]
+        per_suite.append({
+            "suite": suite, "n": int(keep.sum()),
+            "overrides": int(override.sum()),
+            "failure_to_success": int((keep & ~stock_success & selected).sum()),
+            "success_to_failure": int((keep & stock_success & ~selected).sum()),
+            "stock_sr_pct": float(100 * stock_success[keep].mean()),
+            "selected_sr_pct": float(100 * selected[keep].mean()),
+        })
+    per_suite = pd.DataFrame(per_suite)
+
+    print({
+        "checkpoint": str(checkpoint_path), "checkpoint_update": int(payload["update"]),
+        "validation_trees": len(dataset), "mixed_validation_trees": int(sum(
+            len(set(row)) > 1 for row in success)),
+        "note": "best/safe thresholds are exploratory choices on this validation set",
+    }, flush=True)
+    print("\nOperating points:")
+    display(operating)
+    print("\nDelta-Q by outcome of the ungated best alternative:")
+    display(delta_summary)
+    print(f"\nPer-suite result at exploratory threshold {chosen_threshold:.6f}:")
+    display(per_suite)
+
+    finite = sweep[np.isfinite(sweep["threshold"])]
+    figure, axes = plt.subplots(1, 2, figsize=(13, 4))
+    axes[0].plot(finite["threshold"], finite["selected_minus_stock_pp"])
+    axes[0].axhline(0, color="black", linestyle="--", linewidth=1)
+    axes[0].set(xlabel="Require best alternative Q - stock Q > threshold",
+                ylabel="Selected SR minus stock (pp)", title="Validation threshold sweep")
+    groups = [delta[transition == name] for name in ("F->S", "S->F", "same outcome")
+              if np.any(transition == name)]
+    labels = [name for name in ("F->S", "S->F", "same outcome")
+              if np.any(transition == name)]
+    axes[1].boxplot(groups, labels=labels, showfliers=True)
+    axes[1].axhline(0, color="black", linestyle="--", linewidth=1)
+    axes[1].set(ylabel="Best-alternative Q minus stock Q",
+                title="Does the margin separate helpful and harmful overrides?")
+    plt.tight_layout(); plt.show()
+    return {
+        "operating_points": operating, "full_sweep": sweep,
+        "delta_summary": delta_summary, "per_suite": per_suite,
+        "scores": scores, "success": success, "delta_q": delta,
+        "suggested_exploratory_threshold": chosen_threshold,
     }
