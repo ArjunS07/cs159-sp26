@@ -32,7 +32,7 @@ from .pcp_critic.resumable_snapshot import (
     _download_with_retry, load_training_fields_with_retry)
 from .qplanning_critic.config import QPlanningModelConfig
 from .qplanning_critic.data import (
-    QPlanningCacheIndex, QPlanningWindowDataset, collate_windows,
+    QPLANNING_ARTIFACT_FIELDS, QPlanningCacheIndex, QPlanningWindowDataset, collate_windows,
     qplanning_windows_from_artifact)
 from .qplanning_critic.model import QPlanningCritic, pool_prefix_tokens
 from .smolvla_tree_collection import (
@@ -46,11 +46,10 @@ CACHE_SCHEMA_VERSION = 1
 CHECKPOINT_FORMAT = "smolvla_tree_bellman_finetune_v1"
 DEFAULT_SNAPSHOT_KEY = (
     "smolvla_trees/manifests/v3_bellman_finetune_480_20260919.json")
-TREE_FIELDS = (
-    "actions_normalized", "rewards", "terminated", "truncated", "step_success",
-    "boundary/step", "boundary/raw_robot_state", "boundary/policy_proprio",
-    "prefix/prefix_embeddings", "prefix/prefix_pad_masks",
-)
+# Tree collection writes the same Bellman contract as Q-planning. Request the
+# complete contract: the shared window builder validates its generated/executed
+# action diagnostics even though this fine-tuner does not optimize those arrays.
+TREE_FIELDS = QPLANNING_ARTIFACT_FIELDS
 
 
 @dataclass(frozen=True)
