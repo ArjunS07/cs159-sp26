@@ -12,6 +12,7 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 import copy
+import glob
 import hashlib
 import io
 import json
@@ -413,7 +414,11 @@ def _resolve_single(pattern: str | Path) -> Path:
     path = Path(pattern).expanduser()
     if path.is_file():
         return path
-    matches = list(path.parent.glob(path.name))
+    # The snapshot digest is an intermediate wildcard component, e.g.
+    # checkpoints/*/demo_q10_pretrain/checkpoint_step_004000.pt. Path.glob on
+    # path.parent cannot expand that parent wildcard, so expand the complete
+    # pattern instead.
+    matches = [Path(value) for value in sorted(glob.glob(str(path)))]
     if len(matches) != 1:
         raise ValueError(f"expected exactly one match for {path}; found {matches}")
     return matches[0]
