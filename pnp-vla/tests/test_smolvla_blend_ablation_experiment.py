@@ -3,6 +3,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -12,7 +13,9 @@ from pnp.pnp import PnPRecorder
 from pnp.sampler import install_smolvla_patch, set_strategy
 from pnp.smolvla_blend_ablation_experiment import (
     build_smolvla_blend_ablation_methods,
+    build_smolvla_consensus_a20_method,
     build_smolvla_consensus_a1_method,
+    build_smolvla_mixed_parent_method,
 )
 from pnp.tap import RolloutTap
 
@@ -46,6 +49,36 @@ def test_consensus_a1_is_same_k3_projection_with_one_executed_action():
     assert config.consensus_projection_k == 3
     assert config.consensus_projection_step == 5
     assert config.n_action_steps == 1
+
+
+def test_a20_and_two_stock_two_refine_contracts():
+    method, a20 = build_smolvla_consensus_a20_method()
+    assert method == Method.SMOLVLA_CONSENSUS_PROJECT_K3_A20
+    assert a20.n_action_steps == 20
+    assert a20.consensus_projection_k == 3
+    method, mixed = build_smolvla_mixed_parent_method()
+    assert method == Method.SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3
+    assert mixed.consensus_candidate_count == 4
+    assert mixed.consensus_candidate_refine_count == 2
+    assert mixed.consensus_candidate_inference_steps == 10
+    assert tuple(mixed.pnp_steps) == (1, 2, 3)
+    assert tuple(mixed.pnp_k_by_step) == (3, 1, 1)
+    assert mixed.n_action_steps == 10
+
+
+def test_candidate_refinement_only_updates_final_two_candidate_groups():
+    config = build_smolvla_mixed_parent_method()[1]
+    tap = RolloutTap(config, SimpleNamespace(), device="cpu", adim=2)
+    actions = torch.zeros((4, 3, 2))
+
+    def fake_probe(x_t, *args, **kwargs):
+        return SimpleNamespace(x_acc=x_t + 10.0)
+
+    with patch("pnp.tap.run_probe", side_effect=fake_probe):
+        updated = tap.refine_candidate_actions(
+            actions, 0.9, lambda value: value, step=1, count=4, batch_size=1)
+    assert torch.equal(updated[:2], actions[:2])
+    assert torch.equal(updated[2:], torch.full_like(updated[2:], 10.0))
 
 
 def test_candidate_consensus_validation_and_hash_material():
@@ -82,6 +115,10 @@ def test_worker_notebooks_call_the_expected_entrypoints():
             "run_smolvla_blend_ablation_eval_worker",
         "101_smolvla_a1_consensus_projection_k3_eval.ipynb":
             "run_smolvla_consensus_a1_eval_worker",
+        "102_smolvla_a20_consensus_projection_k3_eval.ipynb":
+            "run_smolvla_consensus_a20_eval_worker",
+        "103_smolvla_a10_two_stock_two_refine_projection_eval.ipynb":
+            "run_smolvla_mixed_parent_eval_worker",
     }
     for filename, entrypoint in expected.items():
         notebook = json.loads((root / filename).read_text())

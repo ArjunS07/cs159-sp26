@@ -159,6 +159,25 @@ class RolloutTap:
         return self.average_candidate_actions(torch.stack(
             [baseline_action, refined_action], dim=0))
 
+    def _candidate_generators(self, count):
+        return None
+
+    def refine_candidate_actions(self, actions, s, vfield, step, count, batch_size):
+        """Apply the configured P&P update only to the final candidate-major groups."""
+        refine_count = int(self.config.consensus_candidate_refine_count)
+        if not refine_count or not self.config.probe_selected(step, s):
+            return actions
+        probe = run_probe(
+            actions, s, vfield, k=self.config.probe_k(step),
+            adim=self.config.action_dim,
+            generators=self._candidate_generators(count))
+        refined = apply_refine(probe, average=False)
+        mask = torch.zeros(
+            (int(count), int(batch_size)), dtype=torch.bool, device=actions.device)
+        mask[-refine_count:] = True
+        mask = mask.reshape(int(count) * int(batch_size), 1, 1)
+        return torch.where(mask, refined, actions)
+
     def project_clean_consensus(self, consensus, vfield, ctx):
         """Forward-noise a clean consensus and project it back through the frozen flow."""
         cfg = self.config
@@ -589,10 +608,14 @@ class BatchedRolloutTap:
             noises.append(candidate)
         return torch.cat(noises, dim=0)
 
+    def _candidate_generators(self, count):
+        return [generator for _ in range(int(count)) for generator in self.generators]
+
     project_consensus_action = RolloutTap.project_consensus_action
     project_clean_consensus = RolloutTap.project_clean_consensus
     average_candidate_actions = RolloutTap.average_candidate_actions
     average_stock_refined = RolloutTap.average_stock_refined
+    refine_candidate_actions = RolloutTap.refine_candidate_actions
 
     @staticmethod
     def finalize_action(baseline_action, candidate_action):

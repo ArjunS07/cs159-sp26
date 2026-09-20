@@ -355,16 +355,23 @@ def _sample_actions_smolvla_hooked(
         candidate_actions = candidate_noises
         for candidate_step in range(candidate_steps):
             candidate_s = 1.0 + candidate_step * candidate_dt
-            candidate_time = torch.full(
-                (bsize * candidate_count,), candidate_s,
-                dtype=torch.float32, device=device)
-            candidate_velocity = self.denoise_step(
-                prefix_pad_masks=candidate_pad,
-                past_key_values=candidate_cache,
-                x_t=candidate_actions,
-                timestep=candidate_time,
-            )
-            self._pnp.vf_evals += 1
+
+            def candidate_vfield(inp, _s=candidate_s):
+                candidate_time = torch.full(
+                    (bsize * candidate_count,), _s,
+                    dtype=torch.float32, device=device)
+                self._pnp.vf_evals += 1
+                return self.denoise_step(
+                    prefix_pad_masks=candidate_pad,
+                    past_key_values=candidate_cache,
+                    x_t=inp,
+                    timestep=candidate_time,
+                )
+
+            candidate_actions = strat.refine_candidate_actions(
+                candidate_actions, candidate_s, candidate_vfield, candidate_step,
+                candidate_count, bsize)
+            candidate_velocity = candidate_vfield(candidate_actions)
             candidate_actions = candidate_actions + candidate_dt * candidate_velocity
         candidate_actions = candidate_actions.reshape(
             candidate_count, bsize, *candidate_actions.shape[1:])

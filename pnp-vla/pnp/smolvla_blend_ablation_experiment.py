@@ -29,6 +29,9 @@ from .store import SupabaseStore, gather_provenance
 
 SMOLVLA_BLEND_ABLATION_EXPERIMENT = "smolvla-libero-a10-blend-ablation-v1"
 SMOLVLA_CONSENSUS_A1_EXPERIMENT = "smolvla-libero-a1-consensus-project-s05-k3-v1"
+SMOLVLA_CONSENSUS_A20_EXPERIMENT = "smolvla-libero-a20-consensus-project-s05-k3-v1"
+SMOLVLA_MIXED_PARENT_EXPERIMENT = (
+    "smolvla-libero-a10-two-stock-two-refine-project-s05-k3-v1")
 
 
 def build_smolvla_blend_ablation_methods():
@@ -76,6 +79,44 @@ def build_smolvla_consensus_a1_method():
         render_lead=LIBERO_RENDER_LEAD,
     )
     return Method.SMOLVLA_CONSENSUS_PROJECT_K3_A1, config
+
+
+def build_smolvla_consensus_a20_method():
+    config = RolloutConfig(
+        pnp_steps=SMOLVLA_SCHEDULE_STEPS,
+        pnp_k=max(SMOLVLA_SCHEDULE_K_BY_STEP),
+        pnp_k_by_step=SMOLVLA_SCHEDULE_K_BY_STEP,
+        refine=True,
+        num_inference_steps=10,
+        n_action_steps=20,
+        consensus_projection_k=3,
+        consensus_projection_step=PROJECTION_STEP,
+        save_time_uncertainty=True,
+        save_trajectory=True,
+        skip_unused_renders=LIBERO_SKIP_RENDERS,
+        render_lead=LIBERO_RENDER_LEAD,
+    )
+    return Method.SMOLVLA_CONSENSUS_PROJECT_K3_A20, config
+
+
+def build_smolvla_mixed_parent_method():
+    config = RolloutConfig(
+        pnp_steps=SMOLVLA_SCHEDULE_STEPS,
+        pnp_k=max(SMOLVLA_SCHEDULE_K_BY_STEP),
+        pnp_k_by_step=SMOLVLA_SCHEDULE_K_BY_STEP,
+        num_inference_steps=10,
+        n_action_steps=10,
+        consensus_candidate_count=4,
+        consensus_candidate_inference_steps=10,
+        consensus_candidate_refine_count=2,
+        consensus_projection_k=3,
+        consensus_projection_step=PROJECTION_STEP,
+        save_time_uncertainty=True,
+        save_trajectory=True,
+        skip_unused_renders=LIBERO_SKIP_RENDERS,
+        render_lead=LIBERO_RENDER_LEAD,
+    )
+    return Method.SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3, config
 
 
 def _matched_historical_projection_k3(store, episodes):
@@ -214,6 +255,133 @@ def run_smolvla_consensus_a1_eval_worker(
             "projection_step": PROJECTION_STEP,
             "projection_k": 3,
             "n_action_steps": 1,
+            "video": "off",
+        },
+        report_every=0, report_every_identities=10,
+        matched_reference_outcomes={
+            "historic stock A10": historical_stock,
+            "historic K3 projection A10": historical_projected_a10,
+        },
+        initial_identity_outcomes=existing,
+        rollout_batch_size=rollout_batch_size,
+        provenance=provenance,
+        resume_completed_only=True,
+    )
+
+
+def run_smolvla_consensus_a20_eval_worker(
+        *, rollout_batch_size: int = 8,
+        experiment: str = SMOLVLA_CONSENSUS_A20_EXPERIMENT):
+    """Run notebook-96 K3 projection while executing 20 actions per decision."""
+    from . import models
+
+    episodes = _prepare_libero_episodes()
+    method, config = build_smolvla_consensus_a20_method()
+    store = SupabaseStore()
+    historical_stock = _matched_historical_stock(store, episodes)
+    historical_projected_a10 = _matched_historical_projection_k3(store, episodes)
+    existing = _existing_outcomes(
+        store, experiment=experiment, method=method, config=config, episodes=episodes)
+    print({
+        "experiment": experiment,
+        "model": SMOLVLA_REPO_ID,
+        "cohort": "worker-85/96 standard LIBERO identities: indices 0-9",
+        "identities": len(episodes),
+        "arm": "stock + refined average, K3 s=0.5 projection; execute 20 actions",
+        "parent_refine": "P&P steps=(1,2,3), K=(3,1,1)",
+        "projection": {"step": 5, "s": 0.5, "k": 3},
+        "integration_steps": 10,
+        "n_action_steps": 20,
+        "rollout_batch_size": rollout_batch_size,
+        "video": "off",
+    })
+    print("Periodic output: A20 projection plus exact-matched stock A10 and projected A10 every 10 identities.")
+
+    policy, preprocess, postprocess = models.load_smolvla()
+    provenance = gather_provenance(model_repo_id=SMOLVLA_REPO_ID)
+    provenance["policy_model"] = "smolvla"
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=[(method, config)], cohort="smolvla_consensus_project_k3_a20",
+        shard_count=1, shard_index=0, benchmark="libero",
+        driver="smolvla_consensus_project_k3_a20_eval",
+        run_metadata={
+            "model_repo_id": SMOLVLA_REPO_ID,
+            "target_identities": len(episodes),
+            "episode_idxs": list(range(10)),
+            "parent_pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
+            "parent_pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
+            "projection_step": PROJECTION_STEP,
+            "projection_k": 3,
+            "n_action_steps": 20,
+            "video": "off",
+        },
+        report_every=0, report_every_identities=10,
+        matched_reference_outcomes={
+            "historic stock A10": historical_stock,
+            "historic K3 projection A10": historical_projected_a10,
+        },
+        initial_identity_outcomes=existing,
+        rollout_batch_size=rollout_batch_size,
+        provenance=provenance,
+        resume_completed_only=True,
+    )
+
+
+def run_smolvla_mixed_parent_eval_worker(
+        *, rollout_batch_size: int = 8,
+        experiment: str = SMOLVLA_MIXED_PARENT_EXPERIMENT):
+    """Average two stock and two refined 10-step parents, then project at s=0.5."""
+    from . import models
+
+    episodes = _prepare_libero_episodes()
+    method, config = build_smolvla_mixed_parent_method()
+    store = SupabaseStore()
+    historical_stock = _matched_historical_stock(store, episodes)
+    historical_projected_a10 = _matched_historical_projection_k3(store, episodes)
+    existing = _existing_outcomes(
+        store, experiment=experiment, method=method, config=config, episodes=episodes)
+    print({
+        "experiment": experiment,
+        "model": SMOLVLA_REPO_ID,
+        "cohort": "worker-85/96 standard LIBERO identities: indices 0-9",
+        "identities": len(episodes),
+        "arm": "average two stock + two P&P-refined parents, then K3 projection",
+        "parent_count": 4,
+        "stock_parents": 2,
+        "refined_parents": 2,
+        "parent_integration_steps": 10,
+        "parent_refine": "P&P steps=(1,2,3), K=(3,1,1)",
+        "projection": {"step": 5, "s": 0.5, "k": 3},
+        "n_action_steps": 10,
+        "rollout_batch_size": rollout_batch_size,
+        "video": "off",
+    })
+    print("Periodic output: mixed-parent projection plus exact-matched stock and K3 projection every 10 identities.")
+
+    policy, preprocess, postprocess = models.load_smolvla()
+    provenance = gather_provenance(model_repo_id=SMOLVLA_REPO_ID)
+    provenance["policy_model"] = "smolvla"
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=[(method, config)], cohort="smolvla_mixed_parent_project_k3_a10",
+        shard_count=1, shard_index=0, benchmark="libero",
+        driver="smolvla_mixed_parent_project_k3_eval",
+        run_metadata={
+            "model_repo_id": SMOLVLA_REPO_ID,
+            "target_identities": len(episodes),
+            "episode_idxs": list(range(10)),
+            "candidate_count": 4,
+            "stock_candidate_count": 2,
+            "refined_candidate_count": 2,
+            "candidate_integration_steps": 10,
+            "candidate_pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
+            "candidate_pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
+            "projection_step": PROJECTION_STEP,
+            "projection_k": 3,
+            "n_action_steps": 10,
             "video": "off",
         },
         report_every=0, report_every_identities=10,

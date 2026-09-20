@@ -110,6 +110,9 @@ class Method:
     SMOLVLA_STOCK_REFINE_RAW_AVERAGE = "smolvla_stock_refine_raw_average"
     SMOLVLA_FOUR_CANDIDATE_PROJECT_K3 = "smolvla_four_candidate_average_project_s05_k3"
     SMOLVLA_CONSENSUS_PROJECT_K3_A1 = "smolvla_consensus_project_s05_k3_a1"
+    SMOLVLA_CONSENSUS_PROJECT_K3_A20 = "smolvla_consensus_project_s05_k3_a20"
+    SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3 = (
+        "smolvla_two_stock_two_refine_average_project_s05_k3")
     SMOLVLA_STOCK_A1 = "smolvla_stock_a1"
     SMOLVLA_PNP_S123_K311_A1 = "smolvla_pnp_steps123_k311_a1"
     QPLANNING_Q10 = "qplanning_q10"
@@ -150,6 +153,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.SMOLVLA_STOCK_REFINE_RAW_AVERAGE,
                Method.SMOLVLA_FOUR_CANDIDATE_PROJECT_K3,
                Method.SMOLVLA_CONSENSUS_PROJECT_K3_A1,
+               Method.SMOLVLA_CONSENSUS_PROJECT_K3_A20,
+               Method.SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3,
                Method.SMOLVLA_STOCK_A1,
                Method.SMOLVLA_PNP_S123_K311_A1,
                Method.QPLANNING_Q10,
@@ -229,6 +234,7 @@ class RolloutConfig:
     consensus_average_only: bool = False
     consensus_candidate_count: Optional[int] = None
     consensus_candidate_inference_steps: Optional[int] = None
+    consensus_candidate_refine_count: int = 0
     # Differentiate exact P&P uncertainty through the frozen VLA and update only the live latent.
     # The random mode still computes the gradient, then applies an equal-RMS random direction.
     uncertainty_gradient_mode: Optional[str] = None  # None | "descent" | "random"
@@ -552,6 +558,18 @@ class RolloutConfig:
                 raise ValueError("candidate consensus is separate from stock/refine consensus")
             if not all(value is not None for value in projection_fields):
                 raise ValueError("candidate consensus requires projection settings")
+        if (isinstance(self.consensus_candidate_refine_count, bool)
+                or int(self.consensus_candidate_refine_count)
+                != self.consensus_candidate_refine_count
+                or int(self.consensus_candidate_refine_count) < 0):
+            raise ValueError("consensus_candidate_refine_count must be a non-negative integer")
+        if self.consensus_candidate_refine_count:
+            if self.consensus_candidate_count is None:
+                raise ValueError("candidate refinement requires candidate consensus")
+            if self.consensus_candidate_refine_count > self.consensus_candidate_count:
+                raise ValueError("candidate refine count cannot exceed candidate count")
+            if not self.has_probe:
+                raise ValueError("candidate refinement requires a P&P schedule")
         if self.consensus_average_only:
             if not self.refine:
                 raise ValueError("consensus_average_only requires a P&P-refined parent")
@@ -676,6 +694,8 @@ class RolloutConfig:
         if logical.get("consensus_candidate_count") is None:
             logical.pop("consensus_candidate_count")
             logical.pop("consensus_candidate_inference_steps")
+        if not logical.get("consensus_candidate_refine_count"):
+            logical.pop("consensus_candidate_refine_count")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
@@ -710,7 +730,7 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_k_by_step", "pnp_time_min", "action
                   "refine_prefix_only", "refine_inner_strength",
                   "consensus_projection_k", "consensus_projection_step",
                   "consensus_average_only", "consensus_candidate_count",
-                  "consensus_candidate_inference_steps",
+                  "consensus_candidate_inference_steps", "consensus_candidate_refine_count",
                   "uncertainty_gradient_mode", "uncertainty_gradient_step_size",
                   "uncertainty_gradient_horizon",
                   "uncertainty_gradient_action_rms_max",
