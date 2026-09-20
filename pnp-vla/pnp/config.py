@@ -113,6 +113,9 @@ class Method:
     SMOLVLA_CONSENSUS_PROJECT_K3_A20 = "smolvla_consensus_project_s05_k3_a20"
     SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3 = (
         "smolvla_two_stock_two_refine_average_project_s05_k3")
+    SMOLVLA_TEMPORAL_STOCK_PROJECT_K3 = "smolvla_temporal_overlap_stock_project_s05_k3"
+    SMOLVLA_TEMPORAL_REFINED_PROJECT_K3 = (
+        "smolvla_temporal_overlap_refined_project_s05_k3")
     SMOLVLA_STOCK_A1 = "smolvla_stock_a1"
     SMOLVLA_PNP_S123_K311_A1 = "smolvla_pnp_steps123_k311_a1"
     QPLANNING_Q10 = "qplanning_q10"
@@ -155,6 +158,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.SMOLVLA_CONSENSUS_PROJECT_K3_A1,
                Method.SMOLVLA_CONSENSUS_PROJECT_K3_A20,
                Method.SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3,
+               Method.SMOLVLA_TEMPORAL_STOCK_PROJECT_K3,
+               Method.SMOLVLA_TEMPORAL_REFINED_PROJECT_K3,
                Method.SMOLVLA_STOCK_A1,
                Method.SMOLVLA_PNP_S123_K311_A1,
                Method.QPLANNING_Q10,
@@ -235,6 +240,9 @@ class RolloutConfig:
     consensus_candidate_count: Optional[int] = None
     consensus_candidate_inference_steps: Optional[int] = None
     consensus_candidate_refine_count: int = 0
+    # Align the unexecuted suffix of the preceding projected/executed chunk with the matching
+    # prefix of the current independently generated parent, average, then project and store it.
+    temporal_overlap_consensus: bool = False
     # Differentiate exact P&P uncertainty through the frozen VLA and update only the live latent.
     # The random mode still computes the gradient, then applies an equal-RMS random direction.
     uncertainty_gradient_mode: Optional[str] = None  # None | "descent" | "random"
@@ -329,7 +337,8 @@ class RolloutConfig:
         n_actions = int(self.refine) + int(self.correction_lambda is not None) \
             + int(self.num_samples is not None) + int(self.uncertainty_gradient_mode is not None) \
             + int(self.q_guidance_ckpt_id is not None) \
-            + int(self.consensus_candidate_count is not None)
+            + int(self.consensus_candidate_count is not None) \
+            + int(self.temporal_overlap_consensus and not self.refine)
         if n_actions > 1:
             raise ValueError(
                 "at most one action: refine / correction / samples / U-gradient / Q-guidance "
@@ -575,11 +584,20 @@ class RolloutConfig:
                 raise ValueError("consensus_average_only requires a P&P-refined parent")
             if any(value is not None for value in projection_fields):
                 raise ValueError("raw consensus averaging and projection are separate arms")
+        if self.temporal_overlap_consensus:
+            if self.n_action_steps is None:
+                raise ValueError("temporal overlap consensus requires explicit n_action_steps")
+            if self.consensus_candidate_count is not None or self.consensus_average_only:
+                raise ValueError(
+                    "temporal overlap consensus is separate from same-state consensus arms")
+            if not all(value is not None for value in projection_fields):
+                raise ValueError("temporal overlap consensus requires projection settings")
         if any(value is not None for value in projection_fields):
             if not all(value is not None for value in projection_fields):
                 raise ValueError(
                     "consensus projection requires both projection_k and projection_step")
-            if not self.refine and self.consensus_candidate_count is None:
+            if (not self.refine and self.consensus_candidate_count is None
+                    and not self.temporal_overlap_consensus):
                 raise ValueError(
                     "consensus projection requires a P&P-refined parent or candidate consensus")
             if self.num_inference_steps is None:
@@ -696,6 +714,8 @@ class RolloutConfig:
             logical.pop("consensus_candidate_inference_steps")
         if not logical.get("consensus_candidate_refine_count"):
             logical.pop("consensus_candidate_refine_count")
+        if not logical.get("temporal_overlap_consensus"):
+            logical.pop("temporal_overlap_consensus")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
@@ -731,6 +751,7 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_k_by_step", "pnp_time_min", "action
                   "consensus_projection_k", "consensus_projection_step",
                   "consensus_average_only", "consensus_candidate_count",
                   "consensus_candidate_inference_steps", "consensus_candidate_refine_count",
+                  "temporal_overlap_consensus",
                   "uncertainty_gradient_mode", "uncertainty_gradient_step_size",
                   "uncertainty_gradient_horizon",
                   "uncertainty_gradient_action_rms_max",

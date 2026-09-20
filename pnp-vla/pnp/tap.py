@@ -110,6 +110,7 @@ class RolloutTap:
         self._pcp_buf: list = []
         self._training_prefixes: list[dict] = []
         self._pending_variable_probe = None
+        self._temporal_previous_projected = None
 
     # ── sampler-facing interface ────────────────────────────────────────────
     @property
@@ -117,6 +118,7 @@ class RolloutTap:
         """Whether the action changes inference (drives the sampler's measure-only path)."""
         return (self.config.refine or self._correcting
                 or self.config.consensus_candidate_count is not None
+                or self.config.temporal_overlap_consensus
                 or self.config.uncertainty_gradient_mode is not None
                 or self.config.q_guidance_ckpt_id is not None)
 
@@ -127,8 +129,10 @@ class RolloutTap:
             (self.config.refine and (
                 self.config.refine_threshold is not None
                 or self.config.refine_start_chunk is not None
-                or self.config.consensus_projection_k is not None
+                or (self.config.consensus_projection_k is not None
+                    and not self.config.temporal_overlap_consensus)
                 or self.config.consensus_average_only))
+            or (self.config.temporal_overlap_consensus and not self.config.refine)
             or self.config.uncertainty_gradient_action_rms_max is not None
             or self.config.q_guidance_ckpt_id is not None)
 
@@ -158,6 +162,32 @@ class RolloutTap:
     def average_stock_refined(self, baseline_action, refined_action):
         return self.average_candidate_actions(torch.stack(
             [baseline_action, refined_action], dim=0))
+
+    @staticmethod
+    def _merge_temporal_parent(previous, current, shift, adim):
+        if previous is None:
+            return current.clone()
+        shift = int(shift)
+        available = min(previous.shape[-2] - shift, current.shape[-2])
+        if available <= 0:
+            raise ValueError("temporal parent has no unexecuted overlap")
+        consensus = current.clone()
+        old = previous[..., shift:shift + available, :]
+        new = current[..., :available, :]
+        consensus[..., :available, :] = 0.5 * (old + new)
+        if min(int(adim), consensus.shape[-1]) > 6:
+            disagree = old[..., 6] * new[..., 6] < 0
+            consensus[..., :available, 6] = torch.where(
+                disagree, new[..., 6], consensus[..., :available, 6])
+        return consensus
+
+    def temporal_consensus_action(self, current_parent):
+        return self._merge_temporal_parent(
+            self._temporal_previous_projected, current_parent,
+            self.config.n_action_steps, self.adim)
+
+    def store_temporal_projected_action(self, projected_action):
+        self._temporal_previous_projected = projected_action.detach().clone()
 
     def _candidate_generators(self, count):
         return None
@@ -565,9 +595,11 @@ class RolloutTap:
 
 class BatchedRolloutTap:
     """Probe/refinement strategy with independent sinks and perturbation RNG per lane."""
-    def __init__(self, config, recorders, seeds, device, adim):
+    def __init__(self, config, recorders, seeds, device, adim, previous_projected=None):
         self.config, self.recorders, self.adim = config, recorders, adim
-        self.invasive = bool(config.refine or config.consensus_candidate_count is not None)
+        self.invasive = bool(
+            config.refine or config.consensus_candidate_count is not None
+            or config.temporal_overlap_consensus)
         self.save_pcp = config.save_pcp_features
         self.capture_training_prefix = config.save_training_data
         self.records_uncertainty = config.records_uncertainty or config.compute_multimodal
@@ -576,6 +608,12 @@ class BatchedRolloutTap:
         self.training_prefixes = [[] for _ in recorders]
         self.generators = []
         self._pending_variable_probe = None
+        self.temporal_previous_projected = list(
+            previous_projected
+            if previous_projected is not None else [None] * len(recorders))
+        if len(self.temporal_previous_projected) != len(recorders):
+            raise ValueError("previous_projected must align with batched rollout lanes")
+        self.temporal_projected_actions = [None] * len(recorders)
         for seed in seeds:
             if isinstance(seed, torch.Generator):
                 self.generators.append(seed)
@@ -586,9 +624,12 @@ class BatchedRolloutTap:
 
     @property
     def needs_baseline_fallback(self):
-        return bool(self.config.refine and (
-            self.config.consensus_projection_k is not None
-            or self.config.consensus_average_only))
+        return bool(
+            (self.config.refine and (
+                (self.config.consensus_projection_k is not None
+                 and not self.config.temporal_overlap_consensus)
+                or self.config.consensus_average_only))
+            or (self.config.temporal_overlap_consensus and not self.config.refine))
 
     def _projection_noise(self, like):
         noise = torch.empty_like(like)
@@ -616,6 +657,19 @@ class BatchedRolloutTap:
     average_candidate_actions = RolloutTap.average_candidate_actions
     average_stock_refined = RolloutTap.average_stock_refined
     refine_candidate_actions = RolloutTap.refine_candidate_actions
+
+    def temporal_consensus_action(self, current_parent):
+        merged = []
+        for lane, previous in enumerate(self.temporal_previous_projected):
+            current = current_parent[lane:lane + 1]
+            merged.append(RolloutTap._merge_temporal_parent(
+                previous, current, self.config.n_action_steps, self.adim))
+        return torch.cat(merged, dim=0)
+
+    def store_temporal_projected_action(self, projected_action):
+        for lane in range(len(self.temporal_projected_actions)):
+            self.temporal_projected_actions[lane] = (
+                projected_action[lane:lane + 1].detach().clone())
 
     @staticmethod
     def finalize_action(baseline_action, candidate_action):

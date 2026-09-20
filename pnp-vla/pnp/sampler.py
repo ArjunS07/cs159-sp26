@@ -458,6 +458,29 @@ def _sample_actions_smolvla_hooked(
         strat.finish(ctx)
         return x_t
 
+    # Stock temporal consensus needs the exact original sampler output as its current parent,
+    # but no instrumented duplicate Euler pass. Build the live prefix once for projection and
+    # return immediately after merging/projecting the exact stock chunk.
+    if (bool(getattr(strategy_config, "temporal_overlap_consensus", False))
+            and not strategy_config.refine):
+        def stock_temporal_projection_vfield(inp, s):
+            self._pnp.vf_evals += 1
+            time_tensor = torch.tensor(
+                s, dtype=torch.float32, device=device).expand(bsize)
+            return self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=inp,
+                timestep=time_tensor,
+            )
+
+        temporal_consensus = strat.temporal_consensus_action(baseline_action)
+        x_t = strat.project_clean_consensus(
+            temporal_consensus, stock_temporal_projection_vfield, ctx)
+        strat.store_temporal_projected_action(x_t)
+        strat.finish(ctx)
+        return x_t
+
     dt = -1.0 / num_steps
     x_t = noise
     for step in range(num_steps):
@@ -486,8 +509,27 @@ def _sample_actions_smolvla_hooked(
         x_t = x_t + dt * velocity
 
     average_only = bool(getattr(strategy_config, "consensus_average_only", False))
+    temporal_overlap = bool(getattr(
+        strategy_config, "temporal_overlap_consensus", False))
     projector = getattr(strat, "project_consensus_action", None)
-    if average_only:
+    if temporal_overlap:
+        def temporal_projection_vfield(inp, s):
+            self._pnp.vf_evals += 1
+            time_tensor = torch.tensor(
+                s, dtype=torch.float32, device=device).expand(bsize)
+            return self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=inp,
+                timestep=time_tensor,
+            )
+
+        current_parent = x_t if strategy_config.refine else baseline_action
+        temporal_consensus = strat.temporal_consensus_action(current_parent)
+        x_t = strat.project_clean_consensus(
+            temporal_consensus, temporal_projection_vfield, ctx)
+        strat.store_temporal_projected_action(x_t)
+    elif average_only:
         x_t = strat.average_stock_refined(baseline_action, x_t)
     elif projector is not None and getattr(strat.config, "consensus_projection_k", None) is not None:
         def projection_vfield(inp, s):

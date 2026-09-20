@@ -180,7 +180,8 @@ def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int,
     """A tap exists iff the rollout has a probe. Vanilla / extra_steps / multi-sample (which
     probes at the chunk level) run with no tap installed."""
     if (not config.has_probe and config.q_guidance_ckpt_id is None
-            and config.consensus_candidate_count is None):
+            and config.consensus_candidate_count is None
+            and not config.temporal_overlap_consensus):
         return None
     return RolloutTap(config, recorder, device, adim, action_postprocess=action_postprocess)
 
@@ -845,6 +846,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                      generated=[] if config.save_generated_chunks else None,
                      frames=[] if (config.save_observations or config.video != "off") else None,
                      nan_count=0, inference_ms=0.0, vf_evals=0, perturb_gen=perturb_gen,
+                     temporal_previous_projected=None,
                      started_at=now(), t0=time.time(), done=False,
                      skip_rendering=False)
         try:
@@ -891,8 +893,12 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 batches.append(preprocess(policy_observation))
                 positions.append(min(state["ci"] / max(1, round(ep["max_steps"] / chunk_size)), 1.0))
             tap = (BatchedRolloutTap(config, [recorders[i] for i in infer_ids],
-                                     [states[i]["perturb_gen"] for i in infer_ids], device, adim)
-                   if (config.has_probe or config.consensus_candidate_count is not None)
+                                     [states[i]["perturb_gen"] for i in infer_ids], device, adim,
+                                     previous_projected=[
+                                         states[i]["temporal_previous_projected"]
+                                         for i in infer_ids])
+                   if (config.has_probe or config.consensus_candidate_count is not None
+                       or config.temporal_overlap_consensus)
                    else None)
             _sampler.set_strategy(model, tap)
             model._pnp.chunk_pos = positions
@@ -902,6 +908,10 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 with torch.no_grad():
                     chunks = policy.predict_action_chunk(
                         _stack_policy_batches(batches), noise=torch.cat(noises, dim=0))
+                if tap is not None and config.temporal_overlap_consensus:
+                    for lane, i in enumerate(infer_ids):
+                        states[i]["temporal_previous_projected"] = (
+                            tap.temporal_projected_actions[lane])
                 infer_ms = (time.perf_counter() - started) * 1000.0
                 vf_delta = model._pnp.vf_evals - before_vf
                 arrays = chunks.detach().cpu().numpy()
