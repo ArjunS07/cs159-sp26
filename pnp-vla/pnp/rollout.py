@@ -179,7 +179,8 @@ def build_tap(config: RolloutConfig, recorder: PnPRecorder, device, adim: int,
               action_postprocess=None):
     """A tap exists iff the rollout has a probe. Vanilla / extra_steps / multi-sample (which
     probes at the chunk level) run with no tap installed."""
-    if not config.has_probe and config.q_guidance_ckpt_id is None:
+    if (not config.has_probe and config.q_guidance_ckpt_id is None
+            and config.consensus_candidate_count is None):
         return None
     return RolloutTap(config, recorder, device, adim, action_postprocess=action_postprocess)
 
@@ -891,7 +892,8 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 positions.append(min(state["ci"] / max(1, round(ep["max_steps"] / chunk_size)), 1.0))
             tap = (BatchedRolloutTap(config, [recorders[i] for i in infer_ids],
                                      [states[i]["perturb_gen"] for i in infer_ids], device, adim)
-                   if config.has_probe else None)
+                   if (config.has_probe or config.consensus_candidate_count is not None)
+                   else None)
             _sampler.set_strategy(model, tap)
             model._pnp.chunk_pos = positions
             before_vf = model._pnp.vf_evals

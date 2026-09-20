@@ -313,6 +313,63 @@ def _sample_actions_smolvla_hooked(
         noise = self.sample_noise(
             (bsize, self.config.chunk_size, self.config.max_action_dim), device)
 
+    candidate_consensus = None
+    strategy_config = getattr(strat, "config", None)
+    candidate_count = getattr(strategy_config, "consensus_candidate_count", None)
+    if candidate_count is not None:
+        candidate_count = int(candidate_count)
+
+        def repeat_batch(value):
+            if torch.is_tensor(value):
+                return torch.cat([value] * candidate_count, dim=0)
+            if isinstance(value, list):
+                return [repeat_batch(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(repeat_batch(item) for item in value)
+            if isinstance(value, dict):
+                return {key: repeat_batch(item) for key, item in value.items()}
+            raise TypeError(
+                f"candidate batching does not support {type(value).__name__}")
+
+        candidate_images = repeat_batch(images)
+        candidate_img_masks = repeat_batch(img_masks)
+        candidate_lang_tokens = repeat_batch(lang_tokens)
+        candidate_lang_masks = repeat_batch(lang_masks)
+        candidate_state = repeat_batch(state)
+        candidate_noises = strat.candidate_initial_noises(noise, candidate_count)
+        candidate_prefix, candidate_pad, candidate_att = self.embed_prefix(
+            candidate_images, candidate_img_masks, candidate_lang_tokens,
+            candidate_lang_masks, state=candidate_state)
+        candidate_att_2d = make_att_2d_masks(candidate_pad, candidate_att)
+        candidate_positions = torch.cumsum(candidate_pad, dim=1) - 1
+        _, candidate_cache = self.vlm_with_expert.forward(
+            attention_mask=candidate_att_2d,
+            position_ids=candidate_positions,
+            past_key_values=None,
+            inputs_embeds=[candidate_prefix, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+        candidate_steps = int(strat.config.consensus_candidate_inference_steps)
+        candidate_dt = -1.0 / candidate_steps
+        candidate_actions = candidate_noises
+        for candidate_step in range(candidate_steps):
+            candidate_s = 1.0 + candidate_step * candidate_dt
+            candidate_time = torch.full(
+                (bsize * candidate_count,), candidate_s,
+                dtype=torch.float32, device=device)
+            candidate_velocity = self.denoise_step(
+                prefix_pad_masks=candidate_pad,
+                past_key_values=candidate_cache,
+                x_t=candidate_actions,
+                timestep=candidate_time,
+            )
+            self._pnp.vf_evals += 1
+            candidate_actions = candidate_actions + candidate_dt * candidate_velocity
+        candidate_actions = candidate_actions.reshape(
+            candidate_count, bsize, *candidate_actions.shape[1:])
+        candidate_consensus = strat.average_candidate_actions(candidate_actions)
+
     baseline_action = None
     needs_baseline_fallback = bool(
         getattr(strat, "needs_baseline_fallback", False))
@@ -377,6 +434,23 @@ def _sample_actions_smolvla_hooked(
     if hasattr(strat, "recorders"):
         ctx.records = [[] for _ in range(bsize)]
 
+    if candidate_consensus is not None:
+        def candidate_projection_vfield(inp, s):
+            self._pnp.vf_evals += 1
+            time_tensor = torch.tensor(
+                s, dtype=torch.float32, device=device).expand(bsize)
+            return self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=inp,
+                timestep=time_tensor,
+            )
+
+        x_t = strat.project_clean_consensus(
+            candidate_consensus, candidate_projection_vfield, ctx)
+        strat.finish(ctx)
+        return x_t
+
     dt = -1.0 / num_steps
     x_t = noise
     for step in range(num_steps):
@@ -404,8 +478,11 @@ def _sample_actions_smolvla_hooked(
                 callback(x_t, s, velocity, ctx)
         x_t = x_t + dt * velocity
 
+    average_only = bool(getattr(strategy_config, "consensus_average_only", False))
     projector = getattr(strat, "project_consensus_action", None)
-    if projector is not None and getattr(strat.config, "consensus_projection_k", None) is not None:
+    if average_only:
+        x_t = strat.average_stock_refined(baseline_action, x_t)
+    elif projector is not None and getattr(strat.config, "consensus_projection_k", None) is not None:
         def projection_vfield(inp, s):
             self._pnp.vf_evals += 1
             time_tensor = torch.tensor(

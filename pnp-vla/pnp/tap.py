@@ -116,6 +116,7 @@ class RolloutTap:
     def invasive(self) -> bool:
         """Whether the action changes inference (drives the sampler's measure-only path)."""
         return (self.config.refine or self._correcting
+                or self.config.consensus_candidate_count is not None
                 or self.config.uncertainty_gradient_mode is not None
                 or self.config.q_guidance_ckpt_id is not None)
 
@@ -126,7 +127,8 @@ class RolloutTap:
             (self.config.refine and (
                 self.config.refine_threshold is not None
                 or self.config.refine_start_chunk is not None
-                or self.config.consensus_projection_k is not None))
+                or self.config.consensus_projection_k is not None
+                or self.config.consensus_average_only))
             or self.config.uncertainty_gradient_action_rms_max is not None
             or self.config.q_guidance_ckpt_id is not None)
 
@@ -136,24 +138,37 @@ class RolloutTap:
     def _projection_generators(self):
         return None
 
-    def project_consensus_action(self, baseline_action, refined_action, vfield, ctx):
-        """Project the stock/refined clean-chunk average back onto the flow manifold."""
+    def candidate_initial_noises(self, base_noise, count):
+        noises = [base_noise]
+        for _ in range(1, int(count)):
+            noises.append(torch.empty_like(base_noise).normal_(
+                generator=_pnp_gen(base_noise.device)))
+        return torch.cat(noises, dim=0)
+
+    def average_candidate_actions(self, candidates):
+        """Average candidate-major clean chunks; avoid invalid averaged gripper commands."""
+        consensus = candidates.mean(dim=0)
+        if min(self.adim, consensus.shape[-1]) > 6:
+            grippers = candidates[..., 6]
+            disagree = (grippers.min(dim=0).values * grippers.max(dim=0).values) < 0
+            consensus[..., 6] = torch.where(
+                disagree, candidates[0, ..., 6], consensus[..., 6])
+        return consensus
+
+    def average_stock_refined(self, baseline_action, refined_action):
+        return self.average_candidate_actions(torch.stack(
+            [baseline_action, refined_action], dim=0))
+
+    def project_clean_consensus(self, consensus, vfield, ctx):
+        """Forward-noise a clean consensus and project it back through the frozen flow."""
         cfg = self.config
         if cfg.consensus_projection_k is None:
-            return refined_action
+            return consensus
         num_steps = int(ctx.num_steps)
         step = int(cfg.consensus_projection_step)
         s = 1.0 - step / num_steps
         if not 0.0 < s < 1.0:
             raise ValueError("consensus projection requires an interior flow time")
-
-        consensus = 0.5 * (baseline_action + refined_action)
-        # Averaging opposite gripper commands can create an invalid near-zero command. Keep the
-        # stock command only on disagreement; continuous arm dimensions remain true averages.
-        if min(self.adim, consensus.shape[-1]) > 6:
-            disagree = baseline_action[..., 6] * refined_action[..., 6] < 0
-            consensus[..., 6] = torch.where(
-                disagree, baseline_action[..., 6], consensus[..., 6])
 
         initial_noise = self._projection_noise(consensus)
         x_t = (1.0 - s) * consensus + s * initial_noise
@@ -170,6 +185,11 @@ class RolloutTap:
             remaining_s = 1.0 + remaining_step * dt
             x_t = x_t + dt * vfield(x_t, remaining_s)
         return x_t
+
+    def project_consensus_action(self, baseline_action, refined_action, vfield, ctx):
+        """Project the stock/refined clean-chunk average back onto the flow manifold."""
+        return self.project_clean_consensus(
+            self.average_stock_refined(baseline_action, refined_action), vfield, ctx)
 
     def begin_chunk(self) -> None:
         self._chunk_idx += 1
@@ -528,7 +548,7 @@ class BatchedRolloutTap:
     """Probe/refinement strategy with independent sinks and perturbation RNG per lane."""
     def __init__(self, config, recorders, seeds, device, adim):
         self.config, self.recorders, self.adim = config, recorders, adim
-        self.invasive = config.refine
+        self.invasive = bool(config.refine or config.consensus_candidate_count is not None)
         self.save_pcp = config.save_pcp_features
         self.capture_training_prefix = config.save_training_data
         self.records_uncertainty = config.records_uncertainty or config.compute_multimodal
@@ -547,7 +567,9 @@ class BatchedRolloutTap:
 
     @property
     def needs_baseline_fallback(self):
-        return self.config.consensus_projection_k is not None
+        return bool(self.config.refine and (
+            self.config.consensus_projection_k is not None
+            or self.config.consensus_average_only))
 
     def _projection_noise(self, like):
         noise = torch.empty_like(like)
@@ -558,7 +580,19 @@ class BatchedRolloutTap:
     def _projection_generators(self):
         return self.generators
 
+    def candidate_initial_noises(self, base_noise, count):
+        noises = [base_noise]
+        for _ in range(1, int(count)):
+            candidate = torch.empty_like(base_noise)
+            for lane, generator in enumerate(self.generators):
+                candidate[lane:lane + 1].normal_(generator=generator)
+            noises.append(candidate)
+        return torch.cat(noises, dim=0)
+
     project_consensus_action = RolloutTap.project_consensus_action
+    project_clean_consensus = RolloutTap.project_clean_consensus
+    average_candidate_actions = RolloutTap.average_candidate_actions
+    average_stock_refined = RolloutTap.average_stock_refined
 
     @staticmethod
     def finalize_action(baseline_action, candidate_action):

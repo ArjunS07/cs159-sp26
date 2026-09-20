@@ -107,6 +107,9 @@ class Method:
     SMOLVLA_PNP_S123_K311 = "smolvla_pnp_steps123_k311"
     SMOLVLA_CONSENSUS_PROJECT_K3 = "smolvla_consensus_project_s05_k3"
     SMOLVLA_CONSENSUS_PROJECT_K5 = "smolvla_consensus_project_s05_k5"
+    SMOLVLA_STOCK_REFINE_RAW_AVERAGE = "smolvla_stock_refine_raw_average"
+    SMOLVLA_FOUR_CANDIDATE_PROJECT_K3 = "smolvla_four_candidate_average_project_s05_k3"
+    SMOLVLA_CONSENSUS_PROJECT_K3_A1 = "smolvla_consensus_project_s05_k3_a1"
     SMOLVLA_STOCK_A1 = "smolvla_stock_a1"
     SMOLVLA_PNP_S123_K311_A1 = "smolvla_pnp_steps123_k311_a1"
     QPLANNING_Q10 = "qplanning_q10"
@@ -144,6 +147,9 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.THREE_STEP_SINGLE_QUERY, Method.SMOLVLA_PNP_S123_K311,
                Method.SMOLVLA_CONSENSUS_PROJECT_K3,
                Method.SMOLVLA_CONSENSUS_PROJECT_K5,
+               Method.SMOLVLA_STOCK_REFINE_RAW_AVERAGE,
+               Method.SMOLVLA_FOUR_CANDIDATE_PROJECT_K3,
+               Method.SMOLVLA_CONSENSUS_PROJECT_K3_A1,
                Method.SMOLVLA_STOCK_A1,
                Method.SMOLVLA_PNP_S123_K311_A1,
                Method.QPLANNING_Q10,
@@ -217,6 +223,12 @@ class RolloutConfig:
     # refined parent; these fields define only the subsequent projection.
     consensus_projection_k: Optional[int] = None
     consensus_projection_step: Optional[int] = None
+    # Ablations around consensus projection. The first returns the raw 50/50 stock/refined
+    # average. The second batches N independent ordinary candidates at a cheaper integration
+    # count, averages them, and projects that average with the projection settings above.
+    consensus_average_only: bool = False
+    consensus_candidate_count: Optional[int] = None
+    consensus_candidate_inference_steps: Optional[int] = None
     # Differentiate exact P&P uncertainty through the frozen VLA and update only the live latent.
     # The random mode still computes the gradient, then applies an equal-RMS random direction.
     uncertainty_gradient_mode: Optional[str] = None  # None | "descent" | "random"
@@ -310,10 +322,12 @@ class RolloutConfig:
                     raise ValueError("every pnp_k_by_step value must be a positive integer")
         n_actions = int(self.refine) + int(self.correction_lambda is not None) \
             + int(self.num_samples is not None) + int(self.uncertainty_gradient_mode is not None) \
-            + int(self.q_guidance_ckpt_id is not None)
+            + int(self.q_guidance_ckpt_id is not None) \
+            + int(self.consensus_candidate_count is not None)
         if n_actions > 1:
             raise ValueError(
-                "at most one action: refine / correction / samples / U-gradient / Q-guidance")
+                "at most one action: refine / correction / samples / U-gradient / Q-guidance "
+                "/ candidate consensus")
         # Refine/correction feed off the probe, so a probe is mandatory for them.
         if (self.refine or self.correction_lambda is not None) and not self.has_probe:
             raise ValueError("refine/correction requires a probe (set pnp_steps or pnp_time_min)")
@@ -518,12 +532,38 @@ class RolloutConfig:
                     or not 0 < float(self.refine_inner_strength) <= 1):
                 raise ValueError("refine_inner_strength must lie in (0, 1]")
         projection_fields = (self.consensus_projection_k, self.consensus_projection_step)
+        candidate_fields = (
+            self.consensus_candidate_count, self.consensus_candidate_inference_steps)
+        if any(value is not None for value in candidate_fields):
+            if not all(value is not None for value in candidate_fields):
+                raise ValueError(
+                    "candidate consensus requires both count and inference_steps")
+            if (isinstance(self.consensus_candidate_count, bool)
+                    or int(self.consensus_candidate_count) != self.consensus_candidate_count
+                    or int(self.consensus_candidate_count) < 2):
+                raise ValueError("consensus_candidate_count must be an integer >= 2")
+            if (isinstance(self.consensus_candidate_inference_steps, bool)
+                    or int(self.consensus_candidate_inference_steps)
+                    != self.consensus_candidate_inference_steps
+                    or int(self.consensus_candidate_inference_steps) < 1):
+                raise ValueError(
+                    "consensus_candidate_inference_steps must be a positive integer")
+            if self.refine:
+                raise ValueError("candidate consensus is separate from stock/refine consensus")
+            if not all(value is not None for value in projection_fields):
+                raise ValueError("candidate consensus requires projection settings")
+        if self.consensus_average_only:
+            if not self.refine:
+                raise ValueError("consensus_average_only requires a P&P-refined parent")
+            if any(value is not None for value in projection_fields):
+                raise ValueError("raw consensus averaging and projection are separate arms")
         if any(value is not None for value in projection_fields):
             if not all(value is not None for value in projection_fields):
                 raise ValueError(
                     "consensus projection requires both projection_k and projection_step")
-            if not self.refine:
-                raise ValueError("consensus projection requires a P&P-refined parent")
+            if not self.refine and self.consensus_candidate_count is None:
+                raise ValueError(
+                    "consensus projection requires a P&P-refined parent or candidate consensus")
             if self.num_inference_steps is None:
                 raise ValueError("consensus projection requires explicit num_inference_steps")
             if (isinstance(self.consensus_projection_k, bool)
@@ -631,6 +671,11 @@ class RolloutConfig:
         if logical.get("consensus_projection_k") is None:
             logical.pop("consensus_projection_k")
             logical.pop("consensus_projection_step")
+        if not logical.get("consensus_average_only"):
+            logical.pop("consensus_average_only")
+        if logical.get("consensus_candidate_count") is None:
+            logical.pop("consensus_candidate_count")
+            logical.pop("consensus_candidate_inference_steps")
         if logical.get("refine_threshold") is None:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
@@ -664,6 +709,8 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_k_by_step", "pnp_time_min", "action
                   "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
                   "refine_prefix_only", "refine_inner_strength",
                   "consensus_projection_k", "consensus_projection_step",
+                  "consensus_average_only", "consensus_candidate_count",
+                  "consensus_candidate_inference_steps",
                   "uncertainty_gradient_mode", "uncertainty_gradient_step_size",
                   "uncertainty_gradient_horizon",
                   "uncertainty_gradient_action_rms_max",
