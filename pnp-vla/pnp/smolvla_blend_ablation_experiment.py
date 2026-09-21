@@ -32,6 +32,7 @@ SMOLVLA_CONSENSUS_A1_EXPERIMENT = "smolvla-libero-a1-consensus-project-s05-k3-v1
 SMOLVLA_CONSENSUS_A20_EXPERIMENT = "smolvla-libero-a20-consensus-project-s05-k3-v1"
 SMOLVLA_MIXED_PARENT_EXPERIMENT = (
     "smolvla-libero-a10-two-stock-two-refine-project-s05-k3-v1")
+SMOLVLA_CONSENSUS_S07_EXPERIMENT = "smolvla-libero-a10-consensus-project-s07-k3-v1"
 
 
 def build_smolvla_blend_ablation_methods():
@@ -117,6 +118,24 @@ def build_smolvla_mixed_parent_method():
         render_lead=LIBERO_RENDER_LEAD,
     )
     return Method.SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3, config
+
+
+def build_smolvla_consensus_s07_method():
+    config = RolloutConfig(
+        pnp_steps=SMOLVLA_SCHEDULE_STEPS,
+        pnp_k=max(SMOLVLA_SCHEDULE_K_BY_STEP),
+        pnp_k_by_step=SMOLVLA_SCHEDULE_K_BY_STEP,
+        refine=True,
+        num_inference_steps=10,
+        n_action_steps=10,
+        consensus_projection_k=3,
+        consensus_projection_step=3,
+        save_time_uncertainty=True,
+        save_trajectory=True,
+        skip_unused_renders=LIBERO_SKIP_RENDERS,
+        render_lead=LIBERO_RENDER_LEAD,
+    )
+    return Method.SMOLVLA_CONSENSUS_PROJECT_S07_K3, config
 
 
 def _matched_historical_projection_k3(store, episodes):
@@ -388,6 +407,71 @@ def run_smolvla_mixed_parent_eval_worker(
         matched_reference_outcomes={
             "historic stock A10": historical_stock,
             "historic K3 projection A10": historical_projected_a10,
+        },
+        initial_identity_outcomes=existing,
+        rollout_batch_size=rollout_batch_size,
+        provenance=provenance,
+        resume_completed_only=True,
+    )
+
+
+def run_smolvla_consensus_s07_eval_worker(
+        *, rollout_batch_size: int = 8,
+        experiment: str = SMOLVLA_CONSENSUS_S07_EXPERIMENT):
+    """Run stock/refine K3 consensus projection from the earlier s=0.7 boundary."""
+    from . import models
+
+    episodes = _prepare_libero_episodes()
+    method, config = build_smolvla_consensus_s07_method()
+    store = SupabaseStore()
+    historical_stock = _matched_historical_stock(store, episodes)
+    historical_refine = _matched_historical_schedule(store, episodes)
+    historical_projected_s05 = _matched_historical_projection_k3(store, episodes)
+    existing = _existing_outcomes(
+        store, experiment=experiment, method=method, config=config, episodes=episodes)
+    print({
+        "experiment": experiment,
+        "model": SMOLVLA_REPO_ID,
+        "cohort": "worker-85/96 standard LIBERO identities: indices 0-9",
+        "identities": len(episodes),
+        "arm": "stock + refined 50/50 average, K3 projection from s=0.7",
+        "parent_refine": "P&P steps=(1,2,3), K=(3,1,1)",
+        "consensus_weights": [0.5, 0.5],
+        "projection": {"step": 3, "s": 0.7, "k": 3, "remaining_euler_updates": 7},
+        "integration_steps": 10,
+        "n_action_steps": 10,
+        "rollout_batch_size": rollout_batch_size,
+        "video": "off",
+    })
+    print("Periodic output: s=0.7 projection plus exact-matched stock, refine, and s=0.5 K3 every 10 identities.")
+
+    policy, preprocess, postprocess = models.load_smolvla()
+    provenance = gather_provenance(model_repo_id=SMOLVLA_REPO_ID)
+    provenance["policy_model"] = "smolvla"
+    _run_collection(
+        store=store, policy=policy, preprocess=preprocess, postprocess=postprocess,
+        device=models.default_device(), experiment=experiment, episodes=episodes,
+        methods=[(method, config)], cohort="smolvla_consensus_project_s07_k3_a10",
+        shard_count=1, shard_index=0, benchmark="libero",
+        driver="smolvla_consensus_project_s07_k3_eval",
+        run_metadata={
+            "model_repo_id": SMOLVLA_REPO_ID,
+            "target_identities": len(episodes),
+            "episode_idxs": list(range(10)),
+            "parent_pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
+            "parent_pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
+            "consensus_weights": [0.5, 0.5],
+            "projection_step": 3,
+            "projection_s": 0.7,
+            "projection_k": 3,
+            "n_action_steps": 10,
+            "video": "off",
+        },
+        report_every=0, report_every_identities=10,
+        matched_reference_outcomes={
+            "historic stock A10": historical_stock,
+            "historic P&P A10": historical_refine,
+            "historic K3 s=0.5 A10": historical_projected_s05,
         },
         initial_identity_outcomes=existing,
         rollout_batch_size=rollout_batch_size,
