@@ -1,5 +1,32 @@
 # Colab rollout workers
 
+## SmolVLA success Q10 and RL Token program (prepared, not launched)
+
+Notebooks 109–114 pull branch `codex/smolvla-q-program` and contain only setup and
+experiment parameters; implementation lives under `pnp/`. Set Colab Secrets
+`GH_PAT`, `HF_TOKEN`, `SUPABASE_URL`, and `SUPABASE_SERVICE_KEY` before use.
+Notebook 109 requires **800 complete v4 fresh8 trees** and freezes one snapshot
+before training. The root-MC and tree-TD arms use the same roots and architecture;
+the training target differs. Compare them on the same held-out roots and run a
+nested root-count learning curve before relying on either Q.
+
+| Notebook | Role | Interpretation |
+| --- | --- | --- |
+| `109_smolvla_success_q10_fresh8_train.ipynb` | Train success Q10, root MC or tree TD | P&P proposal and P&P continuation distribution |
+| `110_smolvla_q10_pnp_gate_offline.ipynb` | Paired accept/reject audit on recorded candidates | Offline one-intervention diagnostic, not deployed success |
+| `111_smolvla_contextual_rl_token.ipynb` | Extract contextual VLM states, train reconstruction bottleneck, train root-MC Q ablation | Genuine RL Token representation pilot; source roots only |
+| `112_smolvla_q10_vanilla_rerank_transfer.ipynb` | Simulator evaluation over ordinary SmolVLA draws | Deployment uses no P&P; Q is still trained on P&P continuation, so this is a transfer test |
+| `113_smolvla_q10_pcp_gradient_diagnostic.ipynb` | Bounded offline action-gradient proposal | Score/displacement smoke only; no corrected-action outcome |
+| `114_smolvla_q10_latent_guidance_transfer.ipynb` | Live Q-gradient correction during flow denoising | Simulator pilot against paired ordinary-policy stock; not a trained PCP MLP |
+
+The final independent ordinary-policy reranker needs **ordinary-policy training
+proposals and ordinary-policy continuation outcomes**. Fresh8 does not provide
+those labels. A full PCP claim needs simulator execution of corrected chunks and
+paired controls. The RLT ablation needs live contextual-token extraction before
+its Q can be deployed; notebook 112 accepts the existing prefill-prefix Q only.
+All expensive cells are opt-in. Notebook 112 defaults to one evaluation identity
+per shard. Nothing is launched by creating these notebooks.
+
 These are stable launchers for stock LIBERO and the canonical LIBERO-PRO collection. Mutable
 experiment logic lives in `pnp.experiments`; every launcher pulls `main` before importing it.
 Do not copy rollout logic into these notebooks.

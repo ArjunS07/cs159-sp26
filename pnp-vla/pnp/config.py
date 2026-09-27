@@ -119,6 +119,8 @@ class Method:
     SMOLVLA_CONSENSUS_PROJECT_S07_K3 = "smolvla_consensus_project_s07_k3"
     SMOLVLA_STOCK_A1 = "smolvla_stock_a1"
     SMOLVLA_PNP_S123_K311_A1 = "smolvla_pnp_steps123_k311_a1"
+    SMOLVLA_Q10_VANILLA_RERANK_TRANSFER = "smolvla_q10_vanilla_rerank_transfer"
+    SMOLVLA_Q10_LATENT_GUIDANCE_TRANSFER = "smolvla_q10_latent_guidance_transfer"
     QPLANNING_Q10 = "qplanning_q10"
     QPLANNING_Q50 = "qplanning_q50"
     QPLANNING_Q50_U025 = "qplanning_q50_u20_beta025"
@@ -164,6 +166,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.SMOLVLA_CONSENSUS_PROJECT_S07_K3,
                Method.SMOLVLA_STOCK_A1,
                Method.SMOLVLA_PNP_S123_K311_A1,
+               Method.SMOLVLA_Q10_VANILLA_RERANK_TRANSFER,
+               Method.SMOLVLA_Q10_LATENT_GUIDANCE_TRANSFER,
                Method.QPLANNING_Q10,
                Method.QPLANNING_Q50, Method.QPLANNING_Q50_U025,
                Method.QPLANNING_Q50_U050, Method.QPLANNING_Q50_U100,

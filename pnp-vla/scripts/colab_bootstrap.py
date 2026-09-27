@@ -2,10 +2,11 @@
 
 Notebooks fetch this from raw GitHub and ``exec()`` it in their global namespace,
 so after it runs ``repo_dir``, ``package_dir``, and ``pnp`` are defined in the
-notebook. Callers may set two globals before exec:
+notebook. Callers may set three globals before exec:
 
     EXTRAS    -- pip extras to install, e.g. "sim" or "sim,analysis"  (default "sim,analysis")
     SETUP_ENV -- when True, also run pnp.env_setup.setup_environment() (default False)
+    REPO_REF  -- Git branch to clone/pull (default "main")
 
 This keeps the per-notebook setup cell down to a three-line fetch-and-exec. There
 is no import from ``pnp`` here because the package isn't installed until we run.
@@ -16,6 +17,7 @@ import sys
 
 EXTRAS = globals().get("EXTRAS", "sim,analysis")
 SETUP_ENV = bool(globals().get("SETUP_ENV", False))
+REPO_REF = str(globals().get("REPO_REF", "main"))
 
 try:
     from google.colab import userdata
@@ -31,9 +33,11 @@ try:
     gh_pat = userdata.get("GH_PAT")
     repo_url = f"https://{gh_pat}@github.com/ArjunS07/cs159-sp26.git"
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
-        subprocess.run(["git", "clone", "--branch", "main", repo_url, repo_dir], check=True)
+        subprocess.run(["git", "clone", "--branch", REPO_REF, repo_url, repo_dir], check=True)
     else:
-        subprocess.run(["git", "-C", repo_dir, "pull", "--ff-only", "origin", "main"], check=True)
+        subprocess.run(["git", "-C", repo_dir, "fetch", "origin", REPO_REF], check=True)
+        subprocess.run(["git", "-C", repo_dir, "checkout", REPO_REF], check=True)
+        subprocess.run(["git", "-C", repo_dir, "pull", "--ff-only", "origin", REPO_REF], check=True)
 except ImportError:  # not on Colab -- run against the local checkout
     repo_dir = os.path.abspath("..") if os.path.basename(os.getcwd()) == "pnp-vla" else os.getcwd()
 

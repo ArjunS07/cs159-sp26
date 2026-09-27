@@ -1,6 +1,6 @@
 """Success-probability Q10 controls for one SmolVLA intervention then frozen-policy continuation.
 
-Both arms use only v3 tree data. The TD arm evaluates the recorded SmolVLA
+Both arms use an immutable tree snapshot. The TD arm evaluates the recorded SmolVLA
 continuation policy with gamma=1; the root-MC arm uses the observed terminal
 success of each same-state alternative. The old demo/TD checkpoints remain
 separate historical controls.
@@ -50,10 +50,13 @@ def remaining_fraction(suite: str, root_chunk_idx: int, local_step: int) -> floa
 
 
 class TimedRoots:
-    def __init__(self, cache: dict, group_ids, groups: dict[str, dict]):
+    def __init__(self, cache: dict, group_ids, groups: dict[str, dict],
+                 root_token_dir: str | Path | None = None):
         self.base = RootTreeDataset(cache, group_ids)
         self.entries = self.base.entries
         self.groups = groups
+        self.root_token_dir = Path(root_token_dir) if root_token_dir is not None else None
+        self.snapshot_digest = cache["snapshot_digest"]
 
     def __len__(self):
         return len(self.base)
@@ -64,6 +67,15 @@ class TimedRoots:
         group = self.groups[entry["candidate_group_id"]]
         time_left = remaining_fraction(group["suite"], group["chunk_idx"], 0)
         item["robot"] = np.r_[item["robot"], np.float32(time_left)].astype(np.float32)
+        if self.root_token_dir is not None:
+            gid = entry["candidate_group_id"]
+            path = self.root_token_dir / (hashlib.sha256(gid.encode()).hexdigest()[:24] + ".npz")
+            with np.load(path, allow_pickle=False) as feature:
+                if (str(feature["group_id"]) != gid or
+                        str(feature["snapshot_digest"]) != self.snapshot_digest):
+                    raise ValueError(f"RL Token root feature mismatch: {path}")
+                item["prefix"] = np.asarray(feature["token"], np.float32)[None]
+                item["pad"] = np.ones(1, bool)
         return item
 
 
@@ -225,6 +237,7 @@ def evaluate_roots(model, dataset: TimedRoots, device) -> dict:
 
 
 def _save(path: Path, *, model, target, optimizer, config, snapshot_digest,
+          representation,
           update: int, history: list[dict]):
     payload = {
         "format": FORMAT, "objective": "success_probability_after_one_intervention",
@@ -232,6 +245,7 @@ def _save(path: Path, *, model, target, optimizer, config, snapshot_digest,
         "gamma": 1.0, "reward": "step_success",
         "time_feature": "remaining_actions_over_suite_limit",
         "snapshot_digest": snapshot_digest, "config": _config_contract(config),
+        "representation": representation,
         "architecture": model.architecture_config(), "update": update,
         "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "target": {k: v.detach().cpu() for k, v in target.state_dict().items()},
@@ -257,6 +271,7 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
                               candidate_kinds: tuple[str, ...] = TREE_Q10_KINDS,
                               updates: int = 2_000, resume: bool = True,
                               checkpoint_interval: int = 500,
+                              root_token_dir: str | Path | None = None,
                               device=None, store=None) -> dict:
     """Train one success-Q arm on an immutable tree snapshot and fixed root split."""
     store = store or SupabaseStore()
@@ -264,16 +279,27 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
     config = SuccessTrainConfig(
         arm=arm, train_root_limit=train_root_limit, updates=updates,
         checkpoint_interval=checkpoint_interval)
+    if root_token_dir is not None and arm != "root_mc":
+        raise ValueError("contextual RL Token features currently support root-MC only; TD branch features were not retained")
     snapshot = load_or_create_tree_snapshot(
         store=store, snapshot_key=snapshot_key, tree_limit=tree_limit,
         experiment=experiment, candidate_kinds=candidate_kinds)
     cache = prepare_tree_bellman_cache(
         snapshot=snapshot, cache_root=cache_root, gamma=1.0,
         success_reward=True, store=store)
+    token_digest = None
+    if root_token_dir is not None:
+        manifest = json.loads((Path(root_token_dir) / "manifest.json").read_text())
+        if (manifest.get("format") != "smolvla_rl_token_root_features_v1" or
+                manifest.get("snapshot_digest") != snapshot["snapshot_digest"] or
+                int(manifest.get("train", -1)) != len(cache["train_group_ids"]) or
+                int(manifest.get("validation", -1)) != len(cache["validation_group_ids"])):
+            raise ValueError("RL Token root feature manifest differs from frozen Q snapshot")
+        token_digest = str(manifest["rlt_checkpoint_digest"])
     groups = {row["candidate_group_id"]: row for row in snapshot["groups"]}
     train_ids = select_training_roots(cache["train_group_ids"], train_root_limit)
-    train_roots = TimedRoots(cache, train_ids, groups)
-    val_roots = TimedRoots(cache, cache["validation_group_ids"], groups)
+    train_roots = TimedRoots(cache, train_ids, groups, root_token_dir)
+    val_roots = TimedRoots(cache, cache["validation_group_ids"], groups, root_token_dir)
     train_windows = TimedWindows(cache, train_ids, groups)
     if not len(train_roots) or not len(val_roots) or not len(train_windows):
         raise ValueError("tree training/validation split is empty")
@@ -284,7 +310,8 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
     first = train_roots[0]
     architecture = QPlanningModelConfig(
         action_horizon=HORIZON, action_dim=7, width=256, n_layers=3,
-        n_heads=8, ffn_width=1024, dropout=.20, prefix_pool_tokens=128)
+        n_heads=8, ffn_width=1024, dropout=.20,
+        prefix_pool_tokens=1 if root_token_dir is not None else 128)
     model = QPlanningCritic(
         prefix_dim=first["prefix"].shape[-1], robot_dim=len(first["robot"]),
         proprio_dim=len(first["proprio"]), config=architecture)
@@ -298,6 +325,10 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
                                   lr=config.learning_rate, weight_decay=1e-4)
 
     directory = Path(output_root).expanduser() / snapshot["snapshot_digest"]
+    representation = (f"contextual_rl_token_reconstruction_v1:{token_digest}"
+                      if root_token_dir is not None else "frozen_prefill_prefix_v1")
+    if root_token_dir is not None:
+        directory = directory / f"rl_token_{token_digest}"
     if train_root_limit is not None:
         directory = directory / f"train_roots_{train_root_limit}"
     directory = directory / arm
@@ -309,6 +340,7 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
         saved = torch.load(path, map_location="cpu", weights_only=False)
         if (saved.get("format") != FORMAT or
             saved.get("snapshot_digest") != snapshot["snapshot_digest"] or
+            saved.get("representation", "frozen_prefill_prefix_v1") != representation or
             saved.get("config") != _config_contract(config) or
             saved.get("architecture") != model.architecture_config()):
             raise ValueError("checkpoint differs from requested success-Q contract")
@@ -384,6 +416,7 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
             path = directory / f"checkpoint_step_{update:06d}.pt"
             _save(path, model=model, target=target, optimizer=optimizer,
                   config=config, snapshot_digest=snapshot["snapshot_digest"],
+                  representation=representation,
                   update=update, history=history)
             print(f"[success-q] saved {path}", flush=True)
     return {

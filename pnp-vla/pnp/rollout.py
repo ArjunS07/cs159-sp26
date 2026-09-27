@@ -410,6 +410,10 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                             raise ValueError(
                                 "qplanning_ckpt_id requires a loaded qplanning_scorer")
                         from .qplanning_critic.inference import qplanning_select
+                        set_remaining = getattr(
+                            config.qplanning_scorer, "set_remaining_fraction", None)
+                        if set_remaining is not None:
+                            set_remaining((max_steps - step) / max_steps)
                         candidate_noises = torch.cat([
                             _noise_of(index) for index in range(config.num_samples)], dim=0)
                         policy_proprio = policy_observation["observation.state"]
@@ -495,6 +499,10 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                 else:
                     batch = preprocess(policy_observation)
                     if config.q_guidance_ckpt_id is not None:
+                        set_remaining = getattr(
+                            config.q_guidance_scorer, "set_remaining_fraction", None)
+                        if set_remaining is not None:
+                            set_remaining((max_steps - step) / max_steps)
                         policy_proprio = policy_observation["observation.state"]
                         if torch.is_tensor(policy_proprio):
                             policy_proprio = policy_proprio.detach().cpu().numpy()
