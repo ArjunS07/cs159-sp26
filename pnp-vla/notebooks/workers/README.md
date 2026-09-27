@@ -4,6 +4,40 @@ These are stable launchers for stock LIBERO and the canonical LIBERO-PRO collect
 experiment logic lives in `pnp.experiments`; every launcher pulls `main` before importing it.
 Do not copy rollout logic into these notebooks.
 
+## SmolVLA fresh8 Q10 trees (not launched)
+
+Notebook 108 uses the 800 completed standard-LIBERO source episodes at indices 10–29. It
+reuses the frozen depth-1 root manifest: 65% high-U10 roots, 35% uniform roots, with one root
+per source episode. Every v4 tree has the exact stored source continuation plus eight
+fresh-initial-noise P&P alternatives. At roots with a complete v3 tree, the first four fresh
+branches reuse their persisted outcomes and Bellman artifacts; the worker generates and executes
+only fresh seeds 5–8. Other roots generate and execute all eight. Each new alternative
+executes ten actions and then follows the same frozen P&P continuation. The old v3 trees and
+artifacts are untouched; v4 candidate records link to the reused artifacts with provenance.
+
+An L4 is known to run the previous eight-candidate tree collector. An A100 is not required;
+T4 fit and speed remain unmeasured. Choose a GPU runtime, grant `GH_PAT`, `HF_TOKEN`, `SUPABASE_URL`, and
+`SUPABASE_SERVICE_KEY` notebook access, and run one worker with `TREE_LIMIT = 1` first. Inspect
+the stored group and the printed GPU peak memory/tree time. Set `TREE_LIMIT = None` and rerun
+the same worker for its full 266- or 267-root shard. Each completed tree is persisted; an interrupted
+worker can be restarted with the same shard index. New candidates are generated in a four- or
+eight-lane batch; simulator rollouts remain sequential because each branch must start from the exact
+saved MuJoCo state. The A100 may therefore be underused; compare completed-tree time and Colab
+credit consumption in the smoke run before choosing a GPU. Three independent workers allow
+parallelism across separate Colab runtimes when available. Keep the three-shard assignment
+fixed after collection begins.
+
+| Shard | Launcher |
+| ---: | --- |
+| 0 | [Open fresh8 worker 0 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_0.ipynb) |
+| 1 | [Open fresh8 worker 1 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_1.ipynb) |
+| 2 | [Open fresh8 worker 2 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_2.ipynb) |
+
+This 800-root cohort supports a within-distribution learning curve. A later independent test
+of new initial states should collect source episodes from different episode indices and freeze
+their roots before looking at their branch outcomes. Keep those identities out of model
+selection on the 10–29 cohort.
+
 ## SmolVLA standard LIBERO A10 pilot
 
 Notebook 83 restores SmolVLA to the current unified rollout framework and covers the standard

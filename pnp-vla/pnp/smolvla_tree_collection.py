@@ -357,28 +357,33 @@ def _clone_generator(generator: torch.Generator, device) -> torch.Generator:
     return clone
 
 
-def _generate_alternatives(policy, batch, device, *, item: dict, source: dict):
+def _generate_alternatives(policy, batch, device, *, item: dict, source: dict,
+                           fresh_count: int = 4, perturb_count: int = 4,
+                           fresh_start_index: int = 1):
     model = policy.model
-    kinds = ([f"fresh_seed_{index}" for index in range(1, 5)]
-             + [f"pnp_perturb_{index}" for index in range(1, 5)])
+    if fresh_count < 1 or perturb_count < 0 or fresh_start_index < 1:
+        raise ValueError("need at least one fresh lane and no negative perturb lanes")
+    fresh_indices = range(fresh_start_index, fresh_start_index + fresh_count)
+    kinds = ([f"fresh_seed_{index}" for index in fresh_indices]
+             + [f"pnp_perturb_{index}" for index in range(1, perturb_count + 1)])
     fresh_initial_seeds = [
         _seed("fresh-initial", item["source_rollout_id"], item["chunk_idx"], index)
-        for index in range(1, 5)
+        for index in fresh_indices
     ]
     pnp_perturb_seeds = [
         _seed("candidate-perturb", item["source_rollout_id"], item["chunk_idx"], kind)
-        for kind in kinds[4:]
+        for kind in kinds[fresh_count:]
     ]
     source_noise_seed = int(source["noise_seed"])
-    # Four lanes vary only initial flow noise; four hold the source initial noise fixed and vary
+    # Fresh lanes vary only initial flow noise; perturb lanes hold it fixed and vary
     # only the P&P perturbation stream. The exact source is read from its immutable artifact and
     # deliberately does not enter this batch: calibration showed that decoding it again can be
     # batch-shape-sensitive even with the exact stored input and RNG streams.
-    initial_seeds = [*fresh_initial_seeds, *([source_noise_seed] * 4)]
+    initial_seeds = [*fresh_initial_seeds, *([source_noise_seed] * perturb_count)]
     source_generator = _source_perturb_generator(
         policy, device, perturb_seed=int(np.asarray(source["perturb_seed"])),
         completed_chunks=int(item["chunk_idx"]))
-    generators = [_clone_generator(source_generator, device) for _ in range(4)]
+    generators = [_clone_generator(source_generator, device) for _ in range(fresh_count)]
     for seed in pnp_perturb_seeds:
         generator = torch.Generator(device=torch.device(device))
         generator.manual_seed(int(seed))
@@ -417,8 +422,8 @@ def _generate_alternatives(policy, batch, device, *, item: dict, source: dict):
                                  else "fixed_initial_noise_new_pnp_perturbation"),
             "initial_noise_seed": int(initial_seeds[index]),
             "perturbation_seed": int(
-                np.asarray(source["perturb_seed"]) if index < 4
-                else pnp_perturb_seeds[index - 4]),
+                np.asarray(source["perturb_seed"]) if index < fresh_count
+                else pnp_perturb_seeds[index - fresh_count]),
             "pnp_u10": _candidate_u10(recorders[index]),
         }
         for index, kind in enumerate(kinds)
@@ -709,7 +714,11 @@ def _run_training_continuation(
 
 
 def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device, *,
-                                item: dict, bundle: dict, manifest_hash: str) -> tuple[dict, list]:
+                                item: dict, bundle: dict, manifest_hash: str,
+                                experiment: str = SMOLVLA_TREE_EXPERIMENT,
+                                fresh_count: int = 4,
+                                perturb_count: int = 4,
+                                fresh_start_index: int = 1) -> tuple[dict, list]:
     source = _source_boundary(bundle, item)
     source["perturb_seed"] = np.asarray(bundle["arrays"]["perturb_seed"])
     root_step = int(source["root_step"])
@@ -736,7 +745,9 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
     batch = preprocess(policy_observation)
     (kinds, alternatives, alternative_meta, obs_enc,
      source_next_perturb_state) = _generate_alternatives(
-        policy, batch, device, item=item, source=source)
+        policy, batch, device, item=item, source=source,
+        fresh_count=fresh_count, perturb_count=perturb_count,
+        fresh_start_index=fresh_start_index)
 
     policy_chunks = {"stored_source": np.asarray(source["policy_chunk"], np.float32)}
     policy_chunks.update({kind: alternatives[index] for index, kind in enumerate(kinds)})
@@ -751,7 +762,7 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
 
     group_id = candidate_group_id(
         "libero", item["suite"], item["task_idx"], item["episode_idx"],
-        item["chunk_idx"], namespace=SMOLVLA_TREE_EXPERIMENT,
+        item["chunk_idx"], namespace=experiment,
         trajectory_seed=item["source_episode_seed"])
     candidates = []
     for kind in policy_chunks:
@@ -821,12 +832,13 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
             },
         })
     group = {
-        "candidate_group_id": group_id, "experiment": SMOLVLA_TREE_EXPERIMENT,
+        "candidate_group_id": group_id, "experiment": experiment,
         "benchmark": "libero", "suite": item["suite"],
         "task_idx": int(item["task_idx"]), "episode_idx": int(item["episode_idx"]),
         "chunk_idx": int(item["chunk_idx"]),
         "uncertainty_stratum": item["selection_strategy"],
-        "pairing_mode": "exact_source_root_hybrid_candidates",
+        "pairing_mode": ("exact_source_root_hybrid_candidates" if perturb_count
+                         else "exact_source_root_fresh_noise_candidates"),
         "prefix_length": SMOLVLA_TREE_ACTIONS, "snapshot_validated": True,
         "trajectory_seed": int(item["source_episode_seed"]),
         "collection_split": "smolvla_tree_train",
@@ -840,9 +852,10 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
             "source_u10_profile": item["source_u10_profile"],
             "root_selection_strategy": item["selection_strategy"],
             "short_episode_root_fallback": bool(item["short_episode_root_fallback"]),
-            "candidate_families": {"stored_source": 1, "fresh_initial_noise": 4,
-                                   "fixed_initial_noise_new_pnp_perturbation": 4},
-            "candidate_count": SMOLVLA_TREE_CANDIDATES,
+            "candidate_families": {"stored_source": 1,
+                                   "fresh_initial_noise": fresh_count,
+                                   "fixed_initial_noise_new_pnp_perturbation": perturb_count},
+            "candidate_count": 1 + fresh_count + perturb_count,
             "integration_steps": SMOLVLA_TREE_INTEGRATION_STEPS,
             "n_action_steps": SMOLVLA_TREE_ACTIONS,
             "pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
@@ -857,7 +870,7 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
             "common_continuation_replan_start": int(item["chunk_idx"]) + 1,
             "chunk_position_stride": int(policy.config.chunk_size),
             "source_candidate_mode": "exact_stored_artifact_no_redecode",
-            "counterfactual_generation_batch_size": 8,
+            "counterfactual_generation_batch_size": fresh_count + perturb_count,
             "counterfactual_artifact": (
                 "Q10 current/next frozen prefixes, physical states, generated/executed "
                 "actions, rewards, and terminal masks"),
