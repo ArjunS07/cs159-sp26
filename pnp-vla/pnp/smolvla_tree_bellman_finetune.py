@@ -126,11 +126,13 @@ def _atomic_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
     os.replace(temporary, path)
 
 
-def _fetch_tree_snapshot(store, *, tree_limit: int) -> dict:
+def _fetch_tree_snapshot(store, *, tree_limit: int,
+                         experiment: str = SMOLVLA_TREE_EXPERIMENT,
+                         candidate_kinds: tuple[str, ...] = TREE_Q10_KINDS) -> dict:
     groups = store.fetch_all(
         "verifier_candidate_groups",
         "candidate_group_id,suite,task_idx,episode_idx,chunk_idx,metadata_json",
-        configure=lambda query: query.eq("experiment", SMOLVLA_TREE_EXPERIMENT),
+        configure=lambda query: query.eq("experiment", experiment),
         order_by=("candidate_group_id",))
     group_ids = [str(row["candidate_group_id"]) for row in groups]
     candidates = []
@@ -144,7 +146,9 @@ def _fetch_tree_snapshot(store, *, tree_limit: int) -> dict:
     by_group = defaultdict(list)
     for row in candidates:
         by_group[str(row["candidate_group_id"])].append(row)
-    expected = set(TREE_Q10_KINDS)
+    if len(candidate_kinds) != len(set(candidate_kinds)) or not candidate_kinds:
+        raise ValueError("candidate kinds must be distinct and nonempty")
+    expected = set(candidate_kinds)
     complete = []
     for group in groups:
         gid = str(group["candidate_group_id"])
@@ -152,15 +156,15 @@ def _fetch_tree_snapshot(store, *, tree_limit: int) -> dict:
         kinds = {str(row["candidate_kind"]) for row in rows}
         paths = [bool((row.get("metadata_json") or {}).get("training_data_path"))
                  for row in rows]
-        if len(rows) == SMOLVLA_TREE_CANDIDATES and kinds == expected and all(paths):
+        if len(rows) == len(candidate_kinds) and kinds == expected and all(paths):
             complete.append(group)
     if len(complete) < tree_limit:
         raise ValueError(
-            f"need at least {tree_limit} complete v3 Bellman trees; found {len(complete)}")
+            f"need at least {tree_limit} complete {experiment} trees; found {len(complete)}")
     complete.sort(key=lambda row: hashlib.sha256(
         str(row["candidate_group_id"]).encode()).hexdigest())
     selected = complete[:tree_limit]
-    rank = {kind: index for index, kind in enumerate(TREE_Q10_KINDS)}
+    rank = {kind: index for index, kind in enumerate(candidate_kinds)}
     result = []
     for group in selected:
         gid = str(group["candidate_group_id"])
@@ -182,20 +186,26 @@ def _fetch_tree_snapshot(store, *, tree_limit: int) -> dict:
         })
     payload = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
-        "experiment": SMOLVLA_TREE_EXPERIMENT,
+        "experiment": experiment,
         "tree_limit": int(tree_limit), "groups": result,
     }
+    if experiment != SMOLVLA_TREE_EXPERIMENT:
+        payload["candidate_kinds"] = list(candidate_kinds)
     payload["snapshot_digest"] = _json_digest(payload)
     return payload
 
 
 def load_or_create_tree_snapshot(*, store, snapshot_key: str,
-                                 tree_limit: int) -> dict:
+                                 tree_limit: int,
+                                 experiment: str = SMOLVLA_TREE_EXPERIMENT,
+                                 candidate_kinds: tuple[str, ...] = TREE_Q10_KINDS) -> dict:
     try:
         payload = json.loads(_download_with_retry(store, snapshot_key))
         created = False
     except Exception:
-        payload = _fetch_tree_snapshot(store, tree_limit=tree_limit)
+        payload = _fetch_tree_snapshot(
+            store, tree_limit=tree_limit, experiment=experiment,
+            candidate_kinds=candidate_kinds)
         store._upload(snapshot_key, json.dumps(payload, sort_keys=True).encode())
         # Re-read the shared object so two simultaneously launched workers use
         # whichever immutable contract won the write race.
@@ -205,8 +215,9 @@ def load_or_create_tree_snapshot(*, store, snapshot_key: str,
     digest = check.pop("snapshot_digest", None)
     if (_json_digest(check) != digest
             or payload.get("schema_version") != SNAPSHOT_SCHEMA_VERSION
-            or payload.get("experiment") != SMOLVLA_TREE_EXPERIMENT
-            or int(payload.get("tree_limit", -1)) != int(tree_limit)):
+            or payload.get("experiment") != experiment
+            or int(payload.get("tree_limit", -1)) != int(tree_limit)
+            or tuple(payload.get("candidate_kinds", TREE_Q10_KINDS)) != candidate_kinds):
         raise ValueError(f"shared tree snapshot is incompatible: {snapshot_key}")
     print({
         "tree_snapshot": snapshot_key, "created_now": created,
@@ -225,7 +236,8 @@ def _pool_windows(windows: dict[str, np.ndarray], tokens: int = 128) -> None:
 
 
 def _materialize_candidate(store, candidate: dict, group_id: str,
-                           destination: Path, *, gamma: float) -> dict:
+                           destination: Path, *, gamma: float,
+                           success_reward: bool = False) -> dict:
     path = destination / f"{candidate['candidate_id']}.npz"
     if path.is_file():
         with np.load(path, allow_pickle=False) as archive:
@@ -238,6 +250,11 @@ def _materialize_candidate(store, candidate: dict, group_id: str,
             }
     arrays = load_training_fields_with_retry(
         store, candidate["training_data_path"], TREE_FIELDS)
+    if success_reward:
+        # The deployment objective is terminal success, irrespective of any
+        # shaping or simulator-specific values in the recorded reward field.
+        arrays = dict(arrays)
+        arrays["rewards"] = np.asarray(arrays["step_success"], np.float32)
     windows = qplanning_windows_from_artifact(
         {"rollout_id": candidate["candidate_id"]}, arrays, horizon=10, gamma=gamma)
     start = int(candidate.get("training_data_start_boundary", 0))
@@ -278,15 +295,26 @@ def _split_groups(groups: list[dict], *, seed: int = 42,
 
 def prepare_tree_bellman_cache(*, snapshot: dict, cache_root: str | Path,
                                download_workers: int = 8, gamma: float = .99,
-                               store=None) -> dict:
+                               success_reward: bool = False, store=None) -> dict:
     store = store or SupabaseStore()
-    root = Path(cache_root).expanduser() / snapshot["snapshot_digest"]
+    if success_reward and gamma != 1.0:
+        raise ValueError("success-probability cache requires gamma=1")
+    candidate_kinds = tuple(snapshot.get("candidate_kinds", TREE_Q10_KINDS))
+    if len(candidate_kinds) != len(set(candidate_kinds)):
+        raise ValueError("snapshot candidate kinds are not distinct")
+    root = Path(cache_root).expanduser()
+    if success_reward:
+        root = root / "success_probability_v1"
+    root = root / snapshot["snapshot_digest"]
     root.mkdir(parents=True, exist_ok=True)
     index_path = root / "cache_index.json"
     if index_path.is_file():
         payload = json.loads(index_path.read_text())
         if (payload.get("schema_version") == CACHE_SCHEMA_VERSION
                 and payload.get("snapshot_digest") == snapshot["snapshot_digest"]
+                and (not success_reward or
+                     (payload.get("gamma") == 1.0
+                      and payload.get("success_reward") is True))
                 and all((root / entry["path"]).is_file()
                         for entry in payload.get("candidate_entries", []))
                 and all((root / entry["path"]).is_file()
@@ -309,7 +337,8 @@ def prepare_tree_bellman_cache(*, snapshot: dict, cache_root: str | Path,
             worker_store = store.fork_for_thread()
             local.store = worker_store
         return _materialize_candidate(
-            worker_store, candidate, gid, root, gamma=gamma)
+            worker_store, candidate, gid, root, gamma=gamma,
+            success_reward=success_reward)
 
     entries = []
     started = time.perf_counter()
@@ -341,7 +370,7 @@ def prepare_tree_bellman_cache(*, snapshot: dict, cache_root: str | Path,
             "actions": np.stack([row["action"] for row in root_rows]),
             "action_valid": np.stack([row["action_valid"] for row in root_rows]),
             "success": np.asarray([row["success"] for row in group["candidates"]], bool),
-            "candidate_kinds": np.asarray(TREE_Q10_KINDS, dtype="U32"),
+            "candidate_kinds": np.asarray(candidate_kinds, dtype="U32"),
         })
         outcomes = [bool(row["success"]) for row in group["candidates"]]
         group_entries.append({
@@ -359,6 +388,7 @@ def prepare_tree_bellman_cache(*, snapshot: dict, cache_root: str | Path,
     payload = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "snapshot_digest": snapshot["snapshot_digest"],
+        "gamma": float(gamma), "success_reward": bool(success_reward),
         "cache_dir": str(root), "candidate_entries": candidate_entries,
         "group_entries": group_entries,
         "train_group_ids": sorted(train_set),
