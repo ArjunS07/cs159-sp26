@@ -41,6 +41,21 @@ import urllib.request
 exec(urllib.request.urlopen('{RAW_BOOTSTRAP}').read().decode())
 '''
 
+SOURCE_BOOT = BOOT.replace('SETUP_ENV = False', 'SETUP_ENV = True')
+EGL = '''# Install NVIDIA EGL before importing MuJoCo.
+import re, subprocess
+driver = subprocess.check_output(
+    ['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'],
+    text=True).splitlines()[0].strip()
+package = f"libnvidia-gl-{re.match(r'\\d+', driver).group()}"
+subprocess.run(['apt-get', 'update', '-qq'], check=True)
+policy = subprocess.check_output(['apt-cache', 'policy', package], text=True)
+if 'Candidate: (none)' in policy:
+    raise RuntimeError(f'{package} is unavailable in this runtime')
+subprocess.run(['apt-get', 'install', '-y', '--no-install-recommends', package], check=True)
+subprocess.run('ldconfig -p | grep libEGL_nvidia', shell=True, check=True)
+'''
+
 
 def main() -> None:
     notebook("109_smolvla_success_q10_fresh8_train.ipynb", [
@@ -352,6 +367,114 @@ roots = TimedRoots(cache, cache['validation_group_ids'], groups)
     print('NO SIMULATOR OUTCOMES FOR CORRECTED ACTIONS; this is a gradient smoke test only.')
 else:
     print('No Q-gradient diagnostic. Set RUN_DIAGNOSTIC=True to run on held-out roots.')
+""")])
+
+    notebook("115_smolvla_q10_checkpoint_analysis_and_small_q.ipynb", [
+        markdown("""# 115 — Diagnose checkpoint 109 and compare a small scalar Q
+
+Run alongside the two new source-data workers. This notebook uses the **existing immutable 800-root fresh8 snapshot** and the same 640/160 root split as notebook 109. The checkpoint analysis reports oracle headroom, root-weighted pair accuracy, score spread, and exploratory Q-margin gates. Optional controls train a compact sigmoid Q10 and a state-only version on the same root-MC labels. Neither a gate threshold nor a checkpoint chosen on these already-inspected validation roots is a confirmatory result. No simulator run occurs here.
+"""), code(BOOT),
+        code("""from pathlib import Path
+import torch
+from pnp.smolvla_small_q import (
+    load_fresh8_roots, analyze_existing_checkpoint,
+    train_small_q, SmallTrainConfig)
+
+SNAPSHOT_DIGEST = '23241dbe9dfeaec615e1f52d'
+LARGE_CHECKPOINT = Path('/content/drive/MyDrive/pnp_smolvla_q10_fresh8') / SNAPSHOT_DIGEST / 'root_mc/checkpoint_step_002000.pt'
+CACHE_ROOT = Path('/content/smolvla_q10_fresh8_cache')
+OUTPUT_ROOT = Path('/content/drive/MyDrive/pnp_smolvla_small_q_fresh8') / SNAPSHOT_DIGEST
+RUN_SMALL_Q = False
+RUN_STATE_ONLY = False
+assert LARGE_CHECKPOINT.is_file(), 'Mount Drive containing notebook 109 checkpoint.'
+assert torch.cuda.is_available(), 'Select a GPU runtime for the model comparisons.'
+snapshot, cache, train, validation = load_fresh8_roots(cache_root=CACHE_ROOT)
+assert snapshot['snapshot_digest'] == SNAPSHOT_DIGEST
+assert len(train) == 640 and len(validation) == 160
+print({'snapshot': SNAPSHOT_DIGEST, 'train_roots': len(train),
+       'validation_roots': len(validation), 'gpu': torch.cuda.get_device_name(0)})
+"""),
+        code("""large_report = analyze_existing_checkpoint(
+    checkpoint=LARGE_CHECKPOINT, validation=validation,
+    snapshot=snapshot, device='cuda')
+for key, value in large_report.items():
+    print(key, value)
+"""),
+        code("""if RUN_SMALL_Q:
+    small_report = train_small_q(
+        train=train, validation=validation,
+        snapshot_digest=SNAPSHOT_DIGEST,
+        output_path=OUTPUT_ROOT/'small_action_q.pt',
+        state_only=False, device='cuda',
+        config=SmallTrainConfig(updates=2000))
+    print(small_report)
+else:
+    print('Small action-conditioned Q not started; set RUN_SMALL_Q=True.')
+"""),
+        code("""if RUN_STATE_ONLY:
+    state_report = train_small_q(
+        train=train, validation=validation,
+        snapshot_digest=SNAPSHOT_DIGEST,
+        output_path=OUTPUT_ROOT/'small_state_only.pt',
+        state_only=True, device='cuda',
+        config=SmallTrainConfig(updates=2000))
+    print(state_report)
+else:
+    print('State-only control not started; set RUN_STATE_ONLY=True.')
+""")])
+
+    for shard in range(2):
+        notebook(f"116_smolvla_scaling_source_worker_{shard}.ipynb", [
+            markdown(f"""# 116 — New SmolVLA P&P source cohort, worker {shard}/2
+
+Collect disjoint LIBERO episode indices **30–49** under the same frozen P&P policy as the original indices 10–29. The 40-task, 800-identity manifest is validated before simulator work; the two workers own 400 identities each and resume completed rows. These are **source episodes**, not yet nine-candidate trees. Once both source shards finish, freeze a new 65% high-U10 / 35% uniform root manifest and run the fresh8 tree workers. Keep evaluation indices 0–9 untouched.
+
+Start with one episode. The full shard is opt-in. Run this concurrently with notebook 115 and the other source worker; no code here starts automatically.
+"""), code(EGL), code(SOURCE_BOOT),
+            code(f"""from pnp.smolvla_scaling_source import (
+    SOURCE_EXPERIMENT, prepare_scaling_source_episodes,
+    run_scaling_source_worker)
+
+SHARD_INDEX = {shard}
+EPISODE_LIMIT = 1  # first smoke; set None for all 400 identities in this shard
+RUN_COLLECTION = False
+episodes = prepare_scaling_source_episodes()
+print({{'experiment': SOURCE_EXPERIMENT,
+       'full_manifest': len(episodes), 'shard': f'{{SHARD_INDEX}}/2',
+       'episode_limit': EPISODE_LIMIT, 'run': RUN_COLLECTION}})
+"""),
+            code("""if RUN_COLLECTION:
+    report = run_scaling_source_worker(
+        shard_index=SHARD_INDEX, episode_limit=EPISODE_LIMIT)
+    print(report)
+else:
+    print('No collection. Set RUN_COLLECTION=True after reviewing the manifest.')
+""")])
+
+        notebook(f"117_smolvla_scaling_fresh8_tree_worker_{shard}.ipynb", [
+            markdown(f"""# 117 — New fresh8 trees, worker {shard}/2
+
+**Run after both notebook 116 source shards finish.** A new immutable root manifest selects one decision boundary from each of the 800 indices-30–49 source episodes: 65% prioritized by weighted U10 and 35% uniform. This worker owns 400 roots and records the exact source plus eight newly generated P&P chunks. No v3 branch reuse is possible in this new cohort. Every branch executes ten actions and then follows the same frozen P&P continuation. The two workers resume completed trees under a new experiment name, leaving v4 untouched.
+
+Start with one tree. Full collection is opt-in. A future combined-data training run must freeze a new **combined** snapshot; notebook 109 remains tied to the original 800-root snapshot.
+"""), code(EGL), code(SOURCE_BOOT),
+            code(f"""from pnp.smolvla_scaling_trees import (
+    TREE_EXPERIMENT, load_or_build_scaling_manifest,
+    run_scaling_fresh8_tree_worker)
+
+SHARD_INDEX = {shard}
+TREE_LIMIT = 1  # smoke; set None for all 400 roots in this shard
+RUN_COLLECTION = False
+print({{'experiment': TREE_EXPERIMENT, 'shard': f'{{SHARD_INDEX}}/2',
+       'tree_limit': TREE_LIMIT, 'run': RUN_COLLECTION,
+       'branches_per_root': 8}})
+"""),
+            code("""if RUN_COLLECTION:
+    report = run_scaling_fresh8_tree_worker(
+        shard_index=SHARD_INDEX, tree_limit=TREE_LIMIT)
+    print(report)
+else:
+    print('No tree collection. Complete both 116 source shards first, then opt in.')
 """)])
 
 

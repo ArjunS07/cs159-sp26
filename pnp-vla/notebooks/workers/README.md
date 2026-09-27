@@ -1,6 +1,6 @@
 # Colab rollout workers
 
-## SmolVLA success Q10 and RL Token program (prepared, not launched)
+## SmolVLA success Q10 and RL Token program
 
 Notebooks 109–114 pull branch `codex/smolvla-q-program` and contain only setup and
 experiment parameters; implementation lives under `pnp/`. Set Colab Secrets
@@ -25,13 +25,39 @@ those labels. A full PCP claim needs simulator execution of corrected chunks and
 paired controls. The RLT ablation needs live contextual-token extraction before
 its Q can be deployed; notebook 112 accepts the existing prefill-prefix Q only.
 All expensive cells are opt-in. Notebook 112 defaults to one evaluation identity
-per shard. Nothing is launched by creating these notebooks.
+per shard. The first 800-root root-MC run completed on snapshot
+`23241dbe9dfeaec615e1f52d`: 640 training roots, 160 validation roots,
+107/160 original successes versus 104/160 chosen by Q at 2,000 updates.
+This has not demonstrated a useful selector.
+
+### Parallel scaling workflow
+
+Use three Colab runtimes concurrently: notebooks `116_*_0` and `116_*_1`
+collect new **source episodes** at indices 30–49, while notebook 115 audits the
+existing root-MC checkpoint and optionally trains a compact sigmoid Q and a
+state-only control on the same fixed 640/160 split. The 116 workers validate
+that all 40 LIBERO tasks expose every requested initial state before any rollout.
+Start each shard with `EPISODE_LIMIT=1`, inspect it, then set `None` to complete
+its 400 identities. They use the exact P&P source policy and rich artifacts of
+the original source collector in a separate Supabase experiment.
+
+After **both** source shards complete, notebooks `117_*_0` and `117_*_1` create
+one immutable 65% high-U10 / 35% uniform root manifest and collect 400 fresh8
+trees per shard. Each new tree needs all eight new P&P branches; there is no
+v3 reuse. Start with `TREE_LIMIT=1`; set `None` only after a successful smoke.
+The earlier v4 one-tree smokes took 76–127 seconds while executing four new
+branches. These new trees execute eight, and simulator continuations are
+sequential, so budget using the measured 117 smoke time rather than assuming
+the old tree rate.
+The resulting 800 trees are a separate experiment. They do **not** silently
+enter notebook 109's already-frozen snapshot; combined-data training requires
+a separately frozen 1,600-root snapshot and an explicit learning-curve run.
 
 These are stable launchers for stock LIBERO and the canonical LIBERO-PRO collection. Mutable
 experiment logic lives in `pnp.experiments`; every launcher pulls `main` before importing it.
 Do not copy rollout logic into these notebooks.
 
-## SmolVLA fresh8 Q10 trees (not launched)
+## SmolVLA fresh8 Q10 trees (completed)
 
 Notebook 108 uses the 800 completed standard-LIBERO source episodes at indices 10–29. It
 reuses the frozen depth-1 root manifest: 65% high-U10 roots, 35% uniform roots, with one root
