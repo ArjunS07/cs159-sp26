@@ -64,6 +64,8 @@ def main() -> None:
 **Estimand:** success after one recorded ten-action intervention, followed by the frozen SmolVLA P&P policy. The eight alternatives in this dataset are **P&P chunks**. This notebook does not train or validate a P&P-independent reranker.
 
 Before training, complete and freeze all 800 v4 roots. Use a GPU runtime for training, but snapshot preparation is CPU work. No run starts until `RUN_TRAIN` is changed.
+
+`TREE_LIMIT` counts distinct roots; `UPDATES` counts optimizer steps. To extend an existing 2,000-step checkpoint, set `UPDATES = 5000`, `EXTENSION_LEARNING_RATE = 3e-5`, and keep all other training settings unchanged. This resumes model, optimizer, and RNG state and uses the explicit constant learning rate after step 2,000. For a new sampling or model-hyperparameter experiment, set a new `EXPERIMENT_TAG` so its checkpoints do not overwrite the original run. `TD_ROOT_FRACTION` controls how often TD samples a fork-root window instead of a continuation window.
 """), code(BOOT),
         code("""from pathlib import Path
 import torch
@@ -74,10 +76,22 @@ from pnp.store import SupabaseStore
 TREE_LIMIT = 800
 ARM = 'root_mc'  # change to 'tree_td' for matched TD arm
 TRAIN_ROOT_LIMIT = None  # optional nested learning curve; max ~640 after split
-UPDATES = 2000
+UPDATES = 2000  # optimizer steps; TREE_LIMIT is distinct root states
+BATCH_SIZE = 8  # MC: roots/update; TD: branches/update, eight windows per branch
+LEARNING_RATE = 1e-4
+WARMUP_UPDATES = 100
+EVAL_INTERVAL = 250
+CHECKPOINT_INTERVAL = 500
+TARGET_RATE = 0.005  # TD target-network EMA
+GRAD_CLIP = 1.0
+TD_ROOT_FRACTION = 0.0  # 0 preserves uniform-window sampling; new runs only
+RESUME = True
+EXTENSION_LEARNING_RATE = None  # e.g. 3e-5 when extending a completed 2000-step run
 RUN_TRAIN = False
 CACHE_ROOT = Path('/content/smolvla_q10_fresh8_cache')
 OUTPUT_ROOT = Path('/content/drive/MyDrive/pnp_smolvla_q10_fresh8')
+EXPERIMENT_TAG = ''  # e.g. 'td_root50_v1' for a fresh, separately stored run
+RUN_OUTPUT_ROOT = OUTPUT_ROOT if not EXPERIMENT_TAG else OUTPUT_ROOT / EXPERIMENT_TAG
 assert torch.cuda.is_available(), 'Select a Colab GPU runtime.'
 store = SupabaseStore()
 snapshot = load_or_create_tree_snapshot(
@@ -95,10 +109,15 @@ print({'snapshot': snapshot['snapshot_digest'], 'train_roots': len(cache['train_
         code("""if RUN_TRAIN:
     from pnp.smolvla_success_critic import train_smolvla_success_q10
     report = train_smolvla_success_q10(
-        arm=ARM, output_root=OUTPUT_ROOT, cache_root=CACHE_ROOT,
+        arm=ARM, output_root=RUN_OUTPUT_ROOT, cache_root=CACHE_ROOT,
         tree_limit=TREE_LIMIT, train_root_limit=TRAIN_ROOT_LIMIT,
         snapshot_key=fresh8_snapshot_key(TREE_LIMIT), experiment=FRESH8_EXPERIMENT,
-        candidate_kinds=FRESH8_KINDS, updates=UPDATES, resume=True,
+        candidate_kinds=FRESH8_KINDS, updates=UPDATES, resume=RESUME,
+        batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE,
+        warmup_updates=WARMUP_UPDATES, eval_interval=EVAL_INTERVAL,
+        checkpoint_interval=CHECKPOINT_INTERVAL, target_rate=TARGET_RATE,
+        grad_clip=GRAD_CLIP, td_root_fraction=TD_ROOT_FRACTION,
+        extension_learning_rate=EXTENSION_LEARNING_RATE,
         device='cuda', store=store)
     print(report)
 else:

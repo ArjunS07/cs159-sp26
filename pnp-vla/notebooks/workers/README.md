@@ -30,6 +30,16 @@ per shard. The first 800-root root-MC run completed on snapshot
 107/160 original successes versus 104/160 chosen by Q at 2,000 updates.
 This has not demonstrated a useful selector.
 
+Notebook 109 now exposes optimizer, evaluation, and TD root-sampling settings.
+`TREE_LIMIT=800` means 640 training and 160 validation roots; `UPDATES` is the
+number of optimizer steps. To continue a completed 2,000-step checkpoint, keep
+the same arm, snapshot, architecture, and sampling settings, set `UPDATES=5000`,
+and choose `EXTENSION_LEARNING_RATE` (for example `3e-5`). The extension uses a
+constant learning rate after step 2,000. For a fresh root-prioritized TD
+comparison, set `TD_ROOT_FRACTION` and a distinct `EXPERIMENT_TAG`; this keeps
+the existing checkpoint intact. Existing runs resume with their optimizer and
+RNG state, while changed training semantics are rejected.
+
 ### Parallel scaling workflow
 
 Use three Colab runtimes concurrently: notebooks `116_*_0` and `116_*_1`

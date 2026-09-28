@@ -3,6 +3,7 @@ import pytest
 
 from pnp.smolvla_success_critic import (
     SuccessTrainConfig, TimedRoots, TimedWindows, _config_contract,
+    _extension_from_checkpoint, _resume_compatible,
     action_statistics, remaining_fraction,
     sample_tree_td_indices, select_training_roots)
 from pnp.smolvla_tree_bellman_finetune import _materialize_candidate
@@ -35,6 +36,7 @@ def test_timed_tree_views_keep_root_and_next_budget_aligned(tmp_path):
     )
     cache = {
         "cache_dir": str(tmp_path),
+        "snapshot_digest": "test-snapshot",
         "group_entries": [{"candidate_group_id": "g", "path": "group_g.npz"}],
         "candidate_entries": [{"candidate_group_id": "g", "path": "candidate.npz",
                                "n_windows": 1}],
@@ -97,6 +99,18 @@ def test_td_sampler_groups_windows_without_changing_marginal_distribution():
     np.testing.assert_allclose(counts, np.full(4, .25), atol=.025)
 
 
+def test_td_sampler_can_prioritize_root_windows():
+    class Dataset:
+        base = type("Base", (), {"entries": [
+            {"n_windows": 2}, {"n_windows": 4}]})()
+
+    rng = np.random.default_rng(9)
+    samples = sample_tree_td_indices(
+        Dataset(), rng, branches=4, per_branch=8, root_fraction=.5)
+    assert len(samples) == 32
+    assert sum(np.isin(samples, (0, 2))) >= 16
+
+
 def test_fresh8_snapshot_orders_only_the_nine_requested_candidate_kinds():
     kinds = ("stored_source", *(f"fresh_seed_{i}" for i in range(1, 9)))
 
@@ -154,3 +168,26 @@ def test_full_data_checkpoint_contract_remains_compatible():
     assert "train_root_limit" not in _config_contract(SuccessTrainConfig(arm="root_mc"))
     assert _config_contract(SuccessTrainConfig(
         arm="root_mc", train_root_limit=100))["train_root_limit"] == 100
+    old = {k: v for k, v in _config_contract(
+        SuccessTrainConfig(arm="tree_td")).items() if k != "td_root_fraction"}
+    extended = _config_contract(SuccessTrainConfig(
+        arm="tree_td", updates=5000, eval_interval=500))
+    assert _resume_compatible(old, extended)
+    changed_sampler = _config_contract(SuccessTrainConfig(
+        arm="tree_td", updates=5000, td_root_fraction=.5))
+    assert not _resume_compatible(old, changed_sampler)
+
+
+def test_completed_cosine_run_needs_explicit_extension_rate():
+    saved = {"update": 2000, "config": {"updates": 2000}}
+    extended = SuccessTrainConfig(arm="tree_td", updates=5000)
+    with pytest.raises(ValueError, match="extension_learning_rate"):
+        _extension_from_checkpoint(saved, extended, None)
+    start, phase = _extension_from_checkpoint(saved, extended, 3e-5)
+    assert start == 2000
+    assert phase == {"start_update": 2000, "learning_rate": 3e-5}
+    resumed = {"update": 2500, "config": {"updates": 5000},
+               "extension": phase}
+    assert _extension_from_checkpoint(resumed, extended, None) == (2500, phase)
+    with pytest.raises(ValueError, match="differs"):
+        _extension_from_checkpoint(resumed, extended, 1e-5)
