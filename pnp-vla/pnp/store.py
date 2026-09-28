@@ -809,6 +809,21 @@ class SupabaseStore:
                 if attempt + 1 == attempts:
                     raise
                 time.sleep(2 ** attempt)
+            except (json.JSONDecodeError, httpx.HTTPStatusError) as exc:
+                # storage3 tries to JSON-decode error responses. An HTML/empty error body
+                # raises JSONDecodeError and hides the original HTTP status in __context__.
+                cause = exc
+                while cause is not None and not isinstance(cause, httpx.HTTPStatusError):
+                    cause = cause.__cause__ or cause.__context__
+                if cause is None:
+                    raise
+                status = cause.response.status_code
+                detail = f"Storage upload failed: HTTP {status}, key={key!r}, bytes={len(data)}"
+                if status not in (408, 429) and status < 500:
+                    raise RuntimeError(detail) from exc
+                if attempt + 1 == attempts:
+                    raise RuntimeError(f"{detail}, attempts={attempts}") from exc
+                time.sleep(2 ** attempt)
 
     def _download(self, key: str) -> bytes:
         return self.client.storage.from_(self.bucket).download(key)
