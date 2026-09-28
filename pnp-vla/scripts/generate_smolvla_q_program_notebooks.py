@@ -470,10 +470,11 @@ else:
     print('No collection. Set RUN_COLLECTION=True after reviewing the manifest.')
 """)])
 
+    for shard in range(3):
         notebook(f"117_smolvla_scaling_fresh8_tree_worker_{shard}.ipynb", [
-            markdown(f"""# 117 — New fresh8 trees, worker {shard}/2
+            markdown(f"""# 117 — New fresh8 trees, worker {shard}/3
 
-**Run after both notebook 116 source shards finish.** A new immutable root manifest selects one decision boundary from each of the 800 indices-30–49 source episodes: 65% prioritized by weighted U10 and 35% uniform. This worker owns 400 roots and records the exact source plus eight newly generated P&P chunks. No v3 branch reuse is possible in this new cohort. Every branch executes ten actions and then follows the same frozen P&P continuation. The two workers resume completed trees under a new experiment name, leaving v4 untouched.
+**Run after both notebook 116 source shards finish.** The existing immutable root manifest selects one decision boundary from each of the 800 indices-30–49 source episodes: 65% prioritized by weighted U10 and 35% uniform. Each tree records the exact source plus eight newly generated P&P chunks. No v3 branch reuse is possible in this new cohort. Every branch executes ten actions and then follows the same frozen P&P continuation. Workers use `SHARD_COUNT` and `SHARD_INDEX` to partition the same manifest; completed trees from the earlier two-worker run are reused. Use the same `SHARD_COUNT` in every concurrently running notebook and a distinct `SHARD_INDEX` for each.
 
 Start with one tree. Full collection is opt-in. A future combined-data training run must freeze a new **combined** snapshot; notebook 109 remains tied to the original 800-root snapshot.
 """), code(EGL), code(SOURCE_BOOT),
@@ -482,18 +483,21 @@ Start with one tree. Full collection is opt-in. A future combined-data training 
     run_scaling_fresh8_tree_worker)
 
 SHARD_INDEX = {shard}
-TREE_LIMIT = 1  # smoke; set None for all 400 roots in this shard
+SHARD_COUNT = 3  # use the same total in every concurrently running 117 notebook
+TREE_LIMIT = 1  # smoke; set None for all roots assigned to this worker
 RUN_COLLECTION = False
-print({{'experiment': TREE_EXPERIMENT, 'shard': f'{{SHARD_INDEX}}/2',
+assert 0 <= SHARD_INDEX < SHARD_COUNT
+print({{'experiment': TREE_EXPERIMENT, 'shard': f'{{SHARD_INDEX}}/{{SHARD_COUNT}}',
        'tree_limit': TREE_LIMIT, 'run': RUN_COLLECTION,
        'branches_per_root': 8}})
 """),
             code("""if RUN_COLLECTION:
     report = run_scaling_fresh8_tree_worker(
-        shard_index=SHARD_INDEX, tree_limit=TREE_LIMIT)
+        shard_index=SHARD_INDEX, shard_count=SHARD_COUNT,
+        tree_limit=TREE_LIMIT)
     print(report)
 else:
-    print('No tree collection. Complete both 116 source shards first, then opt in.')
+    print('Collection disabled (RUN_COLLECTION=False). Set it to True to validate the 800 source episodes, build the root manifest, and run the smoke tree.')
 """)])
 
 

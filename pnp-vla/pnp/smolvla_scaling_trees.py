@@ -17,6 +17,7 @@ from .verifier.collection import candidate_group_id
 
 TREE_EXPERIMENT = "smolvla-libero-depth1-fresh8-trees-idx30-49-v1-bellman"
 MANIFEST_PATH = "smolvla_trees/manifests/idx30_49_depth1_fresh8_v1_bellman.json"
+# This value is part of the already-persisted manifest hash. Do not change it.
 TREE_SHARDS = 2
 KINDS = {"stored_source", *(f"fresh_seed_{index}" for index in range(1, 9))}
 
@@ -159,29 +160,38 @@ def _complete_groups(store, items, manifest_hash):
                     for c in by_group[gid])}
 
 
+def _worker_items(manifest: dict, shard_index: int, shard_count: int) -> list[dict]:
+    if not 1 <= shard_count <= SOURCE_IDENTITIES or shard_index not in range(shard_count):
+        raise ValueError("shard_count must be 1..800 and shard_index must be in range")
+    items = [dict(item) for item in manifest["payload"]["items"]
+             if int(item["ordinal"]) % shard_count == shard_index]
+    expected = sum(index % shard_count == shard_index for index in range(SOURCE_IDENTITIES))
+    if len(items) != expected:
+        raise ValueError("tree worker partition differs from the frozen manifest")
+    return items
+
+
 def run_scaling_fresh8_tree_worker(*, shard_index: int,
+                                   shard_count: int,
                                    tree_limit: int | None = 1,
                                    store=None):
-    """Two fixed, resume-safe shards; all eight new branches per root."""
+    """Resume-safe worker partition over the original immutable root manifest."""
     from . import libero_env, models
 
-    if shard_index not in range(TREE_SHARDS):
-        raise ValueError("tree shards are fixed to 0 and 1")
+    if not 1 <= shard_count <= SOURCE_IDENTITIES or shard_index not in range(shard_count):
+        raise ValueError("shard_count must be 1..800 and shard_index must be in range")
     if tree_limit is not None and tree_limit < 1:
         raise ValueError("tree_limit must be positive or None")
     store = store or SupabaseStore()
     manifest = load_or_build_scaling_manifest(store)
-    items = [dict(item) for item in manifest["payload"]["items"]
-             if int(item["ordinal"]) % TREE_SHARDS == shard_index]
-    if len(items) != SOURCE_IDENTITIES // TREE_SHARDS:
-        raise ValueError("tree shard size differs from manifest")
+    items = _worker_items(manifest, shard_index, shard_count)
     if tree_limit is not None:
         items = items[:tree_limit]
     complete = _complete_groups(store, items, manifest["manifest_hash"])
     pending = [item for item in items if _group_id(item) not in complete]
     print({"experiment": TREE_EXPERIMENT,
            "manifest_hash": manifest["manifest_hash"],
-           "shard": f"{shard_index}/{TREE_SHARDS}",
+           "shard": f"{shard_index}/{shard_count}",
            "requested_roots": len(items), "complete_roots": len(complete),
            "pending_roots": len(pending),
            "new_branches_per_root": 8}, flush=True)
@@ -203,7 +213,7 @@ def run_scaling_fresh8_tree_worker(*, shard_index: int,
     store.start_run(
         "smolvla_scaling_fresh8_tree_collection", "libero", TREE_EXPERIMENT,
         config={"source_manifest_hash": manifest["manifest_hash"],
-                "shard_count": TREE_SHARDS, "shard_index": shard_index,
+                "shard_count": shard_count, "shard_index": shard_index,
                 "requested_roots": len(items), "candidate_count": 9,
                 "fresh_initial_noise_candidates": 8, "integration_steps": 10,
                 "n_action_steps": 10, "source_episode_indices": [30, 49],
@@ -212,6 +222,10 @@ def run_scaling_fresh8_tree_worker(*, shard_index: int,
     began = time.monotonic()
     try:
         for item in pending:
+            tree_began = time.monotonic()
+            print({"starting_tree": completed + 1, "pending_at_start": len(pending),
+                   "ordinal": item["ordinal"], "shard": f"{shard_index}/{shard_count}"},
+                  flush=True)
             row = source_rows[item["source_rollout_id"]]
             bundle = tree._load_source_bundle(store, row)
             ep = lookup[(item["suite"], int(item["task_idx"]), int(item["episode_idx"]))]
@@ -230,11 +244,12 @@ def run_scaling_fresh8_tree_worker(*, shard_index: int,
                 raise RuntimeError("scaling tree violated fresh8 candidate contract")
             store.register_candidate_group(group, candidates)
             completed += 1
-            if completed % 5 == 0 or completed == len(pending):
-                print({"completed_this_run": completed,
-                       "pending_at_start": len(pending),
-                       "elapsed_minutes": round((time.monotonic() - began) / 60, 1)},
-                      flush=True)
+            print({"completed_this_run": completed,
+                   "pending_at_start": len(pending),
+                   "ordinal": item["ordinal"],
+                   "tree_seconds": round(time.monotonic() - tree_began, 1),
+                   "elapsed_minutes": round((time.monotonic() - began) / 60, 1)},
+                  flush=True)
         status = "completed"
     finally:
         store.finish_run(status=status, n_rollouts=8 * completed)

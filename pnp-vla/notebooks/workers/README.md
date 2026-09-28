@@ -51,10 +51,16 @@ Start each shard with `EPISODE_LIMIT=1`, inspect it, then set `None` to complete
 its 400 identities. They use the exact P&P source policy and rich artifacts of
 the original source collector in a separate Supabase experiment.
 
-After **both** source shards complete, notebooks `117_*_0` and `117_*_1` create
-one immutable 65% high-U10 / 35% uniform root manifest and collect 400 fresh8
-trees per shard. Each new tree needs all eight new P&P branches; there is no
-v3 reuse. Start with `TREE_LIMIT=1`; set `None` only after a successful smoke.
+After **both** source shards complete, notebooks `117_*_0`, `117_*_1`, and
+`117_*_2` use one immutable 65% high-U10 / 35% uniform root manifest. Set the
+same `SHARD_COUNT=3` in all three notebooks and distinct `SHARD_INDEX` values
+0, 1, and 2. The worker partition is computed from each root's frozen ordinal;
+the manifest hash and experiment name stay unchanged. The 800 roots are split
+267/267/266. Complete trees from the earlier two-worker run are detected and
+skipped, even when assigned to a different worker. Never run workers with
+different `SHARD_COUNT` values at the same time, since their root assignments
+can overlap. Each new tree needs all eight new P&P branches; there is no v3
+reuse. Start with `TREE_LIMIT=1`; set `None` only after a successful smoke.
 The earlier v4 one-tree smokes took 76–127 seconds while executing four new
 branches. These new trees execute eight, and simulator continuations are
 sequential, so budget using the measured 117 smoke time rather than assuming
