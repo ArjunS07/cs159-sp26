@@ -1,4 +1,4 @@
-"""Leakage-free stock-U20 calibration on standard-LIBERO indices 10--19."""
+"""Leakage-free stock-U20 calibration on standard-LIBERO indices 10--14."""
 from __future__ import annotations
 
 import contextlib
@@ -24,16 +24,16 @@ from .smolvla_followup_experiments import (
     SMOLVLA_SCHEDULE_K_BY_STEP,
     SMOLVLA_SCHEDULE_STEPS,
 )
-from .smolvla_consensus_projection_experiment import (
-    build_smolvla_consensus_projection_methods,
+from .smolvla_blend_ablation_experiment import (
+    build_smolvla_consensus_s03_method,
 )
 from .store import SupabaseStore, gather_provenance
 
 
 SMOLVLA_U20_GATE_CALIBRATION_EXPERIMENT = (
-    "smolvla-libero-stock-u20-gate-calibration-idx10-19-v1")
-SMOLVLA_U20_GATE_CALIBRATION_INDICES = tuple(range(10, 20))
-SMOLVLA_U20_GATE_CALIBRATION_IDENTITIES = 400
+    "smolvla-libero-stock-u20-gate-calibration-idx10-14-s03-v1")
+SMOLVLA_U20_GATE_CALIBRATION_INDICES = tuple(range(10, 15))
+SMOLVLA_U20_GATE_CALIBRATION_IDENTITIES = 200
 SMOLVLA_U20_GATE_QUANTILE = 0.75
 
 _U_TIME_KEY = re.compile(r"^c(?P<chunk>\d+)_s(?P<step>\d+)_u_time$")
@@ -59,22 +59,22 @@ def build_smolvla_u20_gate_calibration_method():
 
 
 def build_smolvla_u20_gate_calibration_methods():
-    """Matched stock-measurement and always-on s=0.5/K=3 blend arms."""
+    """Matched stock-measurement and always-on s=0.3/K=3 blend arms."""
     stock = build_smolvla_u20_gate_calibration_method()
-    blend_name, blend_config = build_smolvla_consensus_projection_methods()[0]
+    blend_name, blend_config = build_smolvla_consensus_s03_method()
     # The calibration only needs the blend outcome. These persistence-only sinks do not alter
     # behavior or config identity and would needlessly duplicate notebook-96's large artifacts.
     blend = (blend_name, replace(
         blend_config, save_time_uncertainty=False, save_trajectory=False))
-    if blend[0] != Method.SMOLVLA_CONSENSUS_PROJECT_K3:
-        raise AssertionError("expected notebook-96 K=3 projection as the blend arm")
-    if blend[1].consensus_projection_step != 5 or blend[1].n_action_steps != 10:
-        raise AssertionError("blend calibration must use s=0.5 and execute 10 actions")
+    if blend[0] != Method.SMOLVLA_CONSENSUS_PROJECT_S03_K3:
+        raise AssertionError("expected notebook-106 s=0.3 K=3 projection as the blend arm")
+    if blend[1].consensus_projection_step != 7 or blend[1].n_action_steps != 10:
+        raise AssertionError("blend calibration must use s=0.3 and execute 10 actions")
     return [stock, blend]
 
 
 def prepare_smolvla_u20_gate_calibration_episodes():
-    """Return all 40 LIBERO tasks at held-out calibration state indices 10--19."""
+    """Return all 40 LIBERO tasks at held-out calibration state indices 10--14."""
     from . import libero_env
 
     captured = io.StringIO()
@@ -117,12 +117,12 @@ def run_smolvla_u20_gate_calibration_worker(
     print({
         "experiment": experiment,
         "model": SMOLVLA_REPO_ID,
-        "calibration_indices": [10, 19],
+        "calibration_indices": [10, 14],
         "evaluation_indices_reserved": [0, 9],
         "identities": len(episodes),
         "arms": [
             "stock chunk with measurement-only P&P",
-            "always-on stock/refine 50/50 average -> s=0.5 K=3 projection",
+            "always-on stock/refine 50/50 average -> s=0.3 K=3 projection",
         ],
         "pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
         "pnp_k_by_step": list(SMOLVLA_SCHEDULE_K_BY_STEP),
@@ -149,7 +149,7 @@ def run_smolvla_u20_gate_calibration_worker(
         experiment=experiment,
         episodes=episodes,
         methods=methods,
-        cohort="smolvla_stock_u20_gate_calibration_idx10_19",
+        cohort="smolvla_stock_u20_gate_calibration_idx10_14_s03",
         shard_count=1,
         shard_index=0,
         benchmark="libero",
@@ -166,8 +166,8 @@ def run_smolvla_u20_gate_calibration_worker(
             "gate_uncertainty_horizon": 20,
             "planned_gate_quantile": SMOLVLA_U20_GATE_QUANTILE,
             "stock_measurement_only": True,
-            "blend_projection_step": 5,
-            "blend_projection_s": 0.5,
+            "blend_projection_step": 7,
+            "blend_projection_s": 0.3,
             "blend_projection_k": 3,
             "video": "off",
         },
