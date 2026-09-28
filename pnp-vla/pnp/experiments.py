@@ -294,6 +294,8 @@ _METHOD_LABELS = {Method.VANILLA: "stock VLA",
                    Method.SMOLVLA_CONSENSUS_PROJECT_K5: "average + project K=5",
                    Method.SMOLVLA_STOCK_A1: "stock SmolVLA, 1 action",
                    Method.SMOLVLA_PNP_S123_K311_A1: "P&P (3,1,1), 1 action",
+                   Method.SMOLVLA_U20_GATED_CONSENSUS_S03_K3:
+                       "online U20-Q75 gated s=0.3 blend",
                    Method.QPLANNING_Q10: "Q10 planner",
                    Method.QPLANNING_Q50: "Q50 planner",
                    Method.QPLANNING_Q50_PRIORITY_FAILURE: "Q50 failure-priority",

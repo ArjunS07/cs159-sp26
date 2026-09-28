@@ -847,6 +847,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                      frames=[] if (config.save_observations or config.video != "off") else None,
                      nan_count=0, inference_ms=0.0, vf_evals=0, perturb_gen=perturb_gen,
                      temporal_previous_projected=None,
+                     consensus_gate_records=[],
                      started_at=now(), t0=time.time(), done=False,
                      skip_rendering=False)
         try:
@@ -948,6 +949,11 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                             target.append(chunk)
                     if tap is not None and tap.capture_training_prefix:
                         state["training_prefixes"].extend(tap.training_prefixes[lane])
+                    if (tap is not None
+                            and config.consensus_projection_gate_threshold is not None):
+                        state["consensus_gate_records"].extend({
+                            **record, "chunk_idx": int(state["ci"] - 1),
+                        } for record in tap.consensus_gate_records[lane])
             except Exception as exc:
                 for i in infer_ids:
                     states[i].update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
@@ -1105,6 +1111,20 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                               if state["generated"] is not None else None),
             training_data=training_data,
             obs_frames=frames if config.save_observations else None, video=video)
+        if config.consensus_projection_gate_threshold is not None:
+            gate_records = list(state["consensus_gate_records"])
+            gate_fired = sum(bool(row["gate_fired"]) for row in gate_records)
+            result["refinement_gate_telemetry"] = {
+                "n_corrections_applied": gate_fired,
+                "gate_fire_rate": gate_fired / max(len(gate_records), 1),
+                "consensus_projection_gate": {
+                    "records": gate_records,
+                    "n_considered": len(gate_records),
+                    "n_fired": gate_fired,
+                    "threshold": float(config.consensus_projection_gate_threshold),
+                    "horizon": int(config.consensus_projection_gate_horizon),
+                },
+            }
         if config.save_pcp_features: result["pcp_chunks"] = state.get("pcp_chunks", [])
         results.append(result)
     return results

@@ -111,6 +111,7 @@ class RolloutTap:
         self._training_prefixes: list[dict] = []
         self._pending_variable_probe = None
         self._temporal_previous_projected = None
+        self._consensus_gate_records: list[dict] = []
 
     # ── sampler-facing interface ────────────────────────────────────────────
     @property
@@ -237,8 +238,65 @@ class RolloutTap:
 
     def project_consensus_action(self, baseline_action, refined_action, vfield, ctx):
         """Project the stock/refined clean-chunk average back onto the flow manifold."""
-        return self.project_clean_consensus(
+        threshold = self.config.consensus_projection_gate_threshold
+        if threshold is None:
+            return self.project_clean_consensus(
+                self.average_stock_refined(baseline_action, refined_action), vfield, ctx)
+
+        records = ctx.records
+        batched = bool(records and isinstance(records[0], list))
+        lanes = records if batched else [records]
+        weights = dict(zip(
+            map(int, self.config.pnp_steps),
+            map(int, self.config.pnp_k_by_step or (
+                [self.config.pnp_k] * len(self.config.pnp_steps)))))
+        horizon = int(self.config.consensus_projection_gate_horizon)
+        scores = []
+        for lane_records in lanes:
+            by_step = {}
+            for record in lane_records:
+                step = int(record["step"])
+                if step not in weights:
+                    continue
+                profile = np.asarray(record["u_time"], dtype=np.float32).reshape(-1)
+                if len(profile) < horizon:
+                    raise ValueError(
+                        f"consensus gate horizon {horizon} exceeds profile length "
+                        f"{len(profile)}")
+                by_step[step] = float(profile[:horizon].mean())
+            if set(by_step) != set(weights):
+                raise RuntimeError(
+                    f"consensus gate observed P&P steps {sorted(by_step)}, "
+                    f"expected {sorted(weights)}")
+            scores.append(sum(weights[step] * by_step[step] for step in weights)
+                          / sum(weights.values()))
+        fired = [score >= float(threshold) for score in scores]
+        if batched:
+            for lane, (score, did_fire) in enumerate(zip(scores, fired)):
+                self.consensus_gate_records[lane].append({
+                    "gate_score_u20": float(score),
+                    "gate_threshold": float(threshold),
+                    "gate_fired": bool(did_fire),
+                    "gate_horizon": horizon,
+                })
+        else:
+            self._consensus_gate_records.append({
+                "chunk_idx": int(self._chunk_idx),
+                "gate_score_u20": float(scores[0]),
+                "gate_threshold": float(threshold),
+                "gate_fired": bool(fired[0]),
+                "gate_horizon": horizon,
+            })
+        if not any(fired):
+            return baseline_action
+
+        projected = self.project_clean_consensus(
             self.average_stock_refined(baseline_action, refined_action), vfield, ctx)
+        if not batched:
+            return projected
+        mask = torch.as_tensor(
+            fired, dtype=torch.bool, device=projected.device).reshape(-1, 1, 1)
+        return torch.where(mask, projected, baseline_action)
 
     def begin_chunk(self) -> None:
         self._chunk_idx += 1
@@ -585,6 +643,21 @@ class RolloutTap:
 
     @property
     def refinement_gate_telemetry(self):
+        if self.config.consensus_projection_gate_threshold is not None:
+            records = list(self._consensus_gate_records)
+            fired = sum(bool(row["gate_fired"]) for row in records)
+            return {
+                "n_corrections_applied": fired,
+                "gate_fire_rate": fired / max(len(records), 1),
+                "consensus_projection_gate": {
+                    "records": records,
+                    "n_considered": len(records),
+                    "n_fired": fired,
+                    "threshold": float(
+                        self.config.consensus_projection_gate_threshold),
+                    "horizon": int(self.config.consensus_projection_gate_horizon),
+                },
+            }
         if not self.config.refine or self.config.refine_threshold is None:
             return None
         return {
@@ -614,6 +687,7 @@ class BatchedRolloutTap:
         if len(self.temporal_previous_projected) != len(recorders):
             raise ValueError("previous_projected must align with batched rollout lanes")
         self.temporal_projected_actions = [None] * len(recorders)
+        self.consensus_gate_records = [[] for _ in recorders]
         for seed in seeds:
             if isinstance(seed, torch.Generator):
                 self.generators.append(seed)

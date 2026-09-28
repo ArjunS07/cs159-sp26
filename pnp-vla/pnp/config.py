@@ -118,6 +118,8 @@ class Method:
         "smolvla_temporal_overlap_refined_project_s05_k3")
     SMOLVLA_CONSENSUS_PROJECT_S07_K3 = "smolvla_consensus_project_s07_k3"
     SMOLVLA_CONSENSUS_PROJECT_S03_K3 = "smolvla_consensus_project_s03_k3"
+    SMOLVLA_U20_GATED_CONSENSUS_S03_K3 = (
+        "smolvla_u20_gated_consensus_project_s03_k3")
     SMOLVLA_STOCK_A1 = "smolvla_stock_a1"
     SMOLVLA_PNP_S123_K311_A1 = "smolvla_pnp_steps123_k311_a1"
     QPLANNING_Q10 = "qplanning_q10"
@@ -164,6 +166,7 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.SMOLVLA_TEMPORAL_REFINED_PROJECT_K3,
                Method.SMOLVLA_CONSENSUS_PROJECT_S07_K3,
                Method.SMOLVLA_CONSENSUS_PROJECT_S03_K3,
+               Method.SMOLVLA_U20_GATED_CONSENSUS_S03_K3,
                Method.SMOLVLA_STOCK_A1,
                Method.SMOLVLA_PNP_S123_K311_A1,
                Method.QPLANNING_Q10,
@@ -237,6 +240,11 @@ class RolloutConfig:
     # refined parent; these fields define only the subsequent projection.
     consensus_projection_k: Optional[int] = None
     consensus_projection_step: Optional[int] = None
+    # Optional per-decision reject gate around stock/refine consensus projection. The score is
+    # the K-pair-weighted P&P uncertainty over the requested action prefix, aggregated across
+    # every configured probe step. A rejected chunk returns the exact stock sampler output.
+    consensus_projection_gate_threshold: Optional[float] = None
+    consensus_projection_gate_horizon: Optional[int] = None
     # Ablations around consensus projection. The first returns the raw 50/50 stock/refined
     # average. The second batches N independent ordinary candidates at a cheaper integration
     # count, averages them, and projects that average with the projection settings above.
@@ -615,6 +623,26 @@ class RolloutConfig:
                     or not 1 <= int(self.consensus_projection_step) < int(self.num_inference_steps)):
                 raise ValueError(
                     "consensus_projection_step must lie in [1, num_inference_steps)")
+        gate_fields = (
+            self.consensus_projection_gate_threshold,
+            self.consensus_projection_gate_horizon,
+        )
+        if any(value is not None for value in gate_fields):
+            if not all(value is not None for value in gate_fields):
+                raise ValueError(
+                    "consensus projection gating requires threshold and horizon")
+            if not all(value is not None for value in projection_fields):
+                raise ValueError("consensus projection gating requires projection settings")
+            if (not math.isfinite(float(self.consensus_projection_gate_threshold))
+                    or float(self.consensus_projection_gate_threshold) < 0):
+                raise ValueError(
+                    "consensus_projection_gate_threshold must be finite and non-negative")
+            if (isinstance(self.consensus_projection_gate_horizon, bool)
+                    or int(self.consensus_projection_gate_horizon)
+                    != self.consensus_projection_gate_horizon
+                    or int(self.consensus_projection_gate_horizon) < 1):
+                raise ValueError(
+                    "consensus_projection_gate_horizon must be a positive integer")
         # Probe-derived sinks need a probe.
         for sink in ("save_pcp_features", "save_ahats", "save_time_uncertainty"):
             if getattr(self, sink) and not self.has_probe:
@@ -711,6 +739,9 @@ class RolloutConfig:
         if logical.get("consensus_projection_k") is None:
             logical.pop("consensus_projection_k")
             logical.pop("consensus_projection_step")
+        if logical.get("consensus_projection_gate_threshold") is None:
+            logical.pop("consensus_projection_gate_threshold")
+            logical.pop("consensus_projection_gate_horizon")
         if not logical.get("consensus_average_only"):
             logical.pop("consensus_average_only")
         if logical.get("consensus_candidate_count") is None:
@@ -753,6 +784,8 @@ LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_k_by_step", "pnp_time_min", "action
                   "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
                   "refine_prefix_only", "refine_inner_strength",
                   "consensus_projection_k", "consensus_projection_step",
+                  "consensus_projection_gate_threshold",
+                  "consensus_projection_gate_horizon",
                   "consensus_average_only", "consensus_candidate_count",
                   "consensus_candidate_inference_steps", "consensus_candidate_refine_count",
                   "temporal_overlap_consensus",

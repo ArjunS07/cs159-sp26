@@ -525,8 +525,14 @@ class SupabaseStore:
             row.update(correction_lambda=config.correction_lambda, q_gate=config.q_gate,
                        correction_steps=list(config.pnp_steps),
                        q_ckpt_id=config.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
-        if config.refine_threshold is not None:
+        if (config.refine_threshold is not None
+                or config.consensus_projection_gate_threshold is not None):
             row.update(result.get("refinement_gate_telemetry") or {})
+            telemetry = result.get("refinement_gate_telemetry") or {}
+            if telemetry.get("consensus_projection_gate"):
+                row["ms_candidate_u"] = {
+                    "consensus_projection_gate": telemetry[
+                        "consensus_projection_gate"]}
         if result.get("uncertainty_gradient_telemetry"):
             row["ms_candidate_u"] = {
                 "uncertainty_gradient": result["uncertainty_gradient_telemetry"]}
