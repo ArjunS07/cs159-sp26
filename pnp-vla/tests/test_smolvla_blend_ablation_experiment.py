@@ -16,6 +16,7 @@ from pnp.smolvla_blend_ablation_experiment import (
     build_smolvla_consensus_a20_method,
     build_smolvla_consensus_a1_method,
     build_smolvla_consensus_s07_method,
+    build_smolvla_consensus_s03_method,
     build_smolvla_mixed_parent_method,
 )
 from pnp.tap import RolloutTap
@@ -79,6 +80,18 @@ def test_s07_changes_only_the_projection_boundary():
     assert config.n_action_steps == 10
 
 
+def test_s03_is_the_conservative_projection_boundary():
+    method, config = build_smolvla_consensus_s03_method()
+    assert method == Method.SMOLVLA_CONSENSUS_PROJECT_S03_K3
+    assert config.refine
+    assert tuple(config.pnp_steps) == (1, 2, 3)
+    assert tuple(config.pnp_k_by_step) == (3, 1, 1)
+    assert config.consensus_projection_step == 7
+    assert config.consensus_projection_k == 3
+    assert 1.0 - config.consensus_projection_step / config.num_inference_steps == pytest.approx(0.3)
+    assert config.n_action_steps == 10
+
+
 def test_candidate_refinement_only_updates_final_two_candidate_groups():
     config = build_smolvla_mixed_parent_method()[1]
     tap = RolloutTap(config, SimpleNamespace(), device="cpu", adim=2)
@@ -134,6 +147,8 @@ def test_worker_notebooks_call_the_expected_entrypoints():
             "run_smolvla_mixed_parent_eval_worker",
         "105_smolvla_a10_consensus_projection_s07_k3_eval.ipynb":
             "run_smolvla_consensus_s07_eval_worker",
+        "106_smolvla_a10_consensus_projection_s03_k3_eval.ipynb":
+            "run_smolvla_consensus_s03_eval_worker",
     }
     for filename, entrypoint in expected.items():
         notebook = json.loads((root / filename).read_text())

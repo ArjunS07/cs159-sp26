@@ -117,6 +117,7 @@ class Method:
     SMOLVLA_TEMPORAL_REFINED_PROJECT_K3 = (
         "smolvla_temporal_overlap_refined_project_s05_k3")
     SMOLVLA_CONSENSUS_PROJECT_S07_K3 = "smolvla_consensus_project_s07_k3"
+    SMOLVLA_CONSENSUS_PROJECT_S03_K3 = "smolvla_consensus_project_s03_k3"
     SMOLVLA_STOCK_A1 = "smolvla_stock_a1"
     SMOLVLA_PNP_S123_K311_A1 = "smolvla_pnp_steps123_k311_a1"
     QPLANNING_Q10 = "qplanning_q10"
@@ -162,6 +163,7 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.SMOLVLA_TEMPORAL_STOCK_PROJECT_K3,
                Method.SMOLVLA_TEMPORAL_REFINED_PROJECT_K3,
                Method.SMOLVLA_CONSENSUS_PROJECT_S07_K3,
+               Method.SMOLVLA_CONSENSUS_PROJECT_S03_K3,
                Method.SMOLVLA_STOCK_A1,
                Method.SMOLVLA_PNP_S123_K311_A1,
                Method.QPLANNING_Q10,
