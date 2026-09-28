@@ -527,8 +527,14 @@ class SupabaseStore:
                        q_ckpt_id=config.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
         if (config.refine_threshold is not None
                 or config.consensus_projection_gate_threshold is not None):
-            row.update(result.get("refinement_gate_telemetry") or {})
             telemetry = result.get("refinement_gate_telemetry") or {}
+            # Only these scalar summaries are real columns in ``rollouts``.  Rich
+            # per-boundary telemetry belongs in the existing JSON column below;
+            # forwarding the whole mapping makes PostgREST interpret nested keys
+            # such as ``consensus_projection_gate`` as nonexistent SQL columns.
+            for field in ("n_corrections_applied", "gate_fire_rate"):
+                if field in telemetry:
+                    row[field] = telemetry[field]
             if telemetry.get("consensus_projection_gate"):
                 row["ms_candidate_u"] = {
                     "consensus_projection_gate": telemetry[
