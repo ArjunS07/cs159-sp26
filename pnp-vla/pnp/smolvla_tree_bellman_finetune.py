@@ -128,7 +128,8 @@ def _atomic_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
 
 def _fetch_tree_snapshot(store, *, tree_limit: int,
                          experiment: str = SMOLVLA_TREE_EXPERIMENT,
-                         candidate_kinds: tuple[str, ...] = TREE_Q10_KINDS) -> dict:
+                         candidate_kinds: tuple[str, ...] = TREE_Q10_KINDS,
+                         include_root_sources: bool = False) -> dict:
     groups = store.fetch_all(
         "verifier_candidate_groups",
         "candidate_group_id,suite,task_idx,episode_idx,chunk_idx,metadata_json",
@@ -140,7 +141,8 @@ def _fetch_tree_snapshot(store, *, tree_limit: int,
         ids = group_ids[start:start + 100]
         candidates.extend(store.fetch_all(
             "verifier_candidates",
-            "candidate_id,candidate_group_id,candidate_kind,success,n_steps,metadata_json",
+            "candidate_id,candidate_group_id,candidate_kind,success,n_steps,"
+            "policy_chunk_path,metadata_json",
             configure=lambda query, ids=ids: query.in_("candidate_group_id", ids),
             order_by=("candidate_group_id", "candidate_kind")))
     by_group = defaultdict(list)
@@ -169,11 +171,21 @@ def _fetch_tree_snapshot(store, *, tree_limit: int,
     for group in selected:
         gid = str(group["candidate_group_id"])
         rows = sorted(by_group[gid], key=lambda row: rank[str(row["candidate_kind"])])
+        source = group.get("metadata_json") or {}
+        if include_root_sources and (not source.get("source_training_data_path")
+                                     or source.get("source_boundary_index") is None):
+            raise ValueError(f"tree {gid} lacks source root artifact provenance")
+        if include_root_sources and any(not row.get("policy_chunk_path") for row in rows):
+            raise ValueError(f"tree {gid} lacks a candidate policy chunk")
         result.append({
             "candidate_group_id": gid,
             "suite": str(group["suite"]), "task_idx": int(group["task_idx"]),
             "episode_idx": int(group["episode_idx"]),
             "chunk_idx": int(group["chunk_idx"]),
+            **({"source_experiment": experiment,
+                "source_training_data_path": str(source["source_training_data_path"]),
+                "source_boundary_index": int(source["source_boundary_index"])}
+               if include_root_sources else {}),
             "candidates": [{
                 "candidate_id": str(row["candidate_id"]),
                 "candidate_kind": str(row["candidate_kind"]),
@@ -182,6 +194,8 @@ def _fetch_tree_snapshot(store, *, tree_limit: int,
                     "training_data_path"]),
                 "training_data_start_boundary": int((row.get("metadata_json") or {}).get(
                     "training_data_start_boundary", 0)),
+                **({"policy_chunk_path": str(row["policy_chunk_path"])}
+                   if include_root_sources else {}),
             } for row in rows],
         })
     payload = {

@@ -300,6 +300,7 @@ def _save(path: Path, *, model, target, optimizer, config, snapshot_digest,
         "optimizer": optimizer.state_dict(), "history": history,
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "mps_rng": torch.mps.get_rng_state() if torch.backends.mps.is_available() else None,
         "numpy_rng": np.random.get_state(), "python_rng": random.getstate(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,6 +328,7 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
                               td_root_fraction: float = 0.0,
                               extension_learning_rate: float | None = None,
                               root_token_dir: str | Path | None = None,
+                              root_cache_only: bool = False,
                               device=None, store=None) -> dict:
     """Train one success-Q arm on an immutable tree snapshot and fixed root split."""
     store = store or SupabaseStore()
@@ -341,12 +343,19 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
         raise ValueError("extension_learning_rate must be positive")
     if root_token_dir is not None and arm != "root_mc":
         raise ValueError("contextual RL Token features currently support root-MC only; TD branch features were not retained")
+    if root_cache_only and arm != "root_mc":
+        raise ValueError("root-only cache supports root-MC training, not tree TD")
     snapshot = load_or_create_tree_snapshot(
         store=store, snapshot_key=snapshot_key, tree_limit=tree_limit,
         experiment=experiment, candidate_kinds=candidate_kinds)
-    cache = prepare_tree_bellman_cache(
-        snapshot=snapshot, cache_root=cache_root, gamma=1.0,
-        success_reward=True, store=store)
+    if root_cache_only:
+        from .smolvla_combined_success import prepare_combined_root_cache
+        cache = prepare_combined_root_cache(
+            snapshot=snapshot, cache_root=cache_root, store=store)
+    else:
+        cache = prepare_tree_bellman_cache(
+            snapshot=snapshot, cache_root=cache_root, gamma=1.0,
+            success_reward=True, store=store)
     token_digest = None
     if root_token_dir is not None:
         manifest = json.loads((Path(root_token_dir) / "manifest.json").read_text())
@@ -360,8 +369,8 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
     train_ids = select_training_roots(cache["train_group_ids"], train_root_limit)
     train_roots = TimedRoots(cache, train_ids, groups, root_token_dir)
     val_roots = TimedRoots(cache, cache["validation_group_ids"], groups, root_token_dir)
-    train_windows = TimedWindows(cache, train_ids, groups)
-    if not len(train_roots) or not len(val_roots) or not len(train_windows):
+    train_windows = None if root_cache_only else TimedWindows(cache, train_ids, groups)
+    if not len(train_roots) or not len(val_roots) or (arm == "tree_td" and not len(train_windows)):
         raise ValueError("tree training/validation split is empty")
 
     torch.manual_seed(config.seed)
@@ -422,6 +431,8 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
         torch.set_rng_state(saved["torch_rng"])
         if saved["cuda_rng"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(saved["cuda_rng"])
+        if saved.get("mps_rng") is not None and torch.backends.mps.is_available():
+            torch.mps.set_rng_state(saved["mps_rng"])
         np.random.set_state(saved["numpy_rng"])
         random.setstate(saved["python_rng"])
         history = list(saved["history"])
@@ -431,7 +442,7 @@ def train_smolvla_success_q10(*, arm: str, output_root: str | Path,
     print({"arm": arm, "snapshot": snapshot["snapshot_digest"],
            "train_root_limit": train_root_limit,
            "train_roots": len(train_roots), "validation_roots": len(val_roots),
-           "train_windows": len(train_windows), "gamma": 1.0,
+           "train_windows": 0 if train_windows is None else len(train_windows), "gamma": 1.0,
            "reward": "step_success", "demo_replay_fraction": 0,
            "time_feature": "remaining_actions_over_suite_limit",
            "start_update": start_update, "planned_updates": config.updates,

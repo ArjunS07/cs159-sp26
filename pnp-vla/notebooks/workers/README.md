@@ -69,6 +69,28 @@ The resulting 800 trees are a separate experiment. They do **not** silently
 enter notebook 109's already-frozen snapshot; combined-data training requires
 a separately frozen 1,600-root snapshot and an explicit learning-curve run.
 
+### Local combined root-MC training
+
+`scripts/train_smolvla_combined_local.py` freezes the complete 800+800 tree
+snapshot under `smolvla_trees/manifests/combined_fresh8_success_q10_1600_v1.json`.
+It builds a resumable root-only cache from each tree's saved source context and
+nine policy-space ten-action chunks, then trains the same root-MC success critic
+on the Mac Metal GPU. It keeps each cohort's deterministic 80/20 split separate
+before combining the training roots, so the original 160 validation identities
+remain held out. Checkpoints and cache default to `~/pnp-vla-runs`.
+
+From the repository root, run:
+
+```sh
+pnp-vla/.venv/bin/python pnp-vla/scripts/train_smolvla_combined_local.py
+```
+
+The command resumes its cache and training checkpoint after interruption. Use
+`--prepare-only` to build the cache without training. This is a root-MC run;
+TD still requires the much larger continuation cache. Candidate proposals and
+continuation policy remain P&P, so this does not validate ordinary-policy
+reranking or action-gradient correction.
+
 These are stable launchers for stock LIBERO and the canonical LIBERO-PRO collection. Mutable
 experiment logic lives in `pnp.experiments`; every launcher pulls `main` before importing it.
 Do not copy rollout logic into these notebooks.
