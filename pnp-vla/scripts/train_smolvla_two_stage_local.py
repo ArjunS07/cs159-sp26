@@ -129,6 +129,9 @@ def main() -> None:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--skip-pretrain", action="store_true",
                         help="control: same fine-tuning and replay, random initialization")
+    parser.add_argument("--model-scale", choices=("original", "small"),
+                        default="original",
+                        help="small uses one 128-wide decoder block; all data and losses stay fixed")
     parser.add_argument("--run-root", type=Path, default=Path.home() / "pnp-vla-runs")
     args = parser.parse_args()
     if (min(args.pretrain_updates, args.finetune_updates, args.trajectory_batch,
@@ -158,10 +161,13 @@ def main() -> None:
     train_roots = TimedRoots(root_cache, root_cache["train_group_ids"], groups)
     validation = TimedRoots(root_cache, root_cache["validation_group_ids"], groups)
     first = train_roots[0]
+    architecture = ({"width": 256, "n_layers": 3, "n_heads": 8,
+                     "ffn_width": 1024} if args.model_scale == "original" else
+                    {"width": 128, "n_layers": 1, "n_heads": 4,
+                     "ffn_width": 512})
     cfg = QPlanningModelConfig(
-        action_horizon=10, action_dim=7, width=256,
-        n_layers=3, n_heads=8, ffn_width=1024, dropout=.20,
-        prefix_pool_tokens=128)
+        action_horizon=10, action_dim=7, dropout=.20,
+        prefix_pool_tokens=128, **architecture)
     model = QPlanningCritic(
         prefix_dim=first["prefix"].shape[-1],
         robot_dim=len(first["robot"]), proprio_dim=len(first["proprio"]),
@@ -177,6 +183,8 @@ def main() -> None:
 
     config = {
         "seed": SEED, "device": "mps", "pretrain_updates": args.pretrain_updates,
+        "model_scale": args.model_scale,
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "skip_pretrain": args.skip_pretrain,
         "finetune_updates": args.finetune_updates,
         "trajectory_batch": args.trajectory_batch, "root_batch": args.root_batch,
@@ -188,7 +196,9 @@ def main() -> None:
         "objective": "binary MC success, then BCE plus within-root logistic ranking",
         "snapshot_digest": snapshot["snapshot_digest"],
     }
-    checkpoint_dir = root / "checkpoints" / EXPERIMENT / snapshot["snapshot_digest"]
+    experiment_name = (EXPERIMENT if args.model_scale == "original" else
+                       "smolvla-q10-small-trajectory-pretrain-root-rank-v1")
+    checkpoint_dir = root / "checkpoints" / experiment_name / snapshot["snapshot_digest"]
     checkpoint_dir = checkpoint_dir / ("no_pretrain_control" if args.skip_pretrain
                                        else "trajectory_pretrained")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -197,10 +207,10 @@ def main() -> None:
     db_path = tracking_dir / "tracking.db"
     mlflow.set_tracking_uri("sqlite:///" + str(db_path))
     client = MlflowClient()
-    experiment = client.get_experiment_by_name(EXPERIMENT)
+    experiment = client.get_experiment_by_name(experiment_name)
     if experiment is None:
         experiment_id = client.create_experiment(
-            EXPERIMENT, artifact_location=(tracking_dir / "artifacts").as_uri())
+            experiment_name, artifact_location=(tracking_dir / "artifacts").as_uri())
     else:
         experiment_id = experiment.experiment_id
     baseline_metrics = None
@@ -208,10 +218,14 @@ def main() -> None:
         saved = torch.load(BASELINE, map_location="cpu", weights_only=False)
         if saved.get("snapshot_digest") != snapshot["snapshot_digest"]:
             raise ValueError("baseline checkpoint snapshot differs")
+        baseline_architecture = dict(saved["architecture"])
+        baseline_config = QPlanningModelConfig(**{
+            key: value for key, value in baseline_architecture.items()
+            if key not in ("prefix_dim", "robot_dim", "proprio_dim")})
         baseline_model = QPlanningCritic(
             prefix_dim=first["prefix"].shape[-1],
             robot_dim=len(first["robot"]), proprio_dim=len(first["proprio"]),
-            config=cfg)
+            config=baseline_config)
         baseline_model.load_state_dict(saved["model"])
         baseline_model.to(device)
         baseline_metrics = evaluate_roots(baseline_model, validation, device)

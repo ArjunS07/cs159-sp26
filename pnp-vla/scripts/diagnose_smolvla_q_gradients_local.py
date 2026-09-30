@@ -1,6 +1,7 @@
 """Measure held-out Q10 action gradients for reranking and PCP diagnostics."""
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 import sys
@@ -27,6 +28,7 @@ from pnp.store import SupabaseStore  # noqa: E402
 DIGEST = "671b5b211099997fc83d1277"
 ROOT = Path.home() / "pnp-vla-runs"
 PRIMARY_DIR = ROOT / "checkpoints/smolvla-q10-trajectory-pretrain-root-rank-v1" / DIGEST
+SMALL_DIR = ROOT / "checkpoints/smolvla-q10-small-trajectory-pretrain-root-rank-v1" / DIGEST
 CHECKPOINTS = {
     "root_only_bce": ROOT / "checkpoints/combined_1600_root_mc_v1" / DIGEST
                      / "root_mc/checkpoint_step_002000.pt",
@@ -183,6 +185,10 @@ def diagnose(model: QPlanningCritic, dataset: TimedRoots,
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--small-only", action="store_true",
+                        help="diagnose and log only the smaller model checkpoints")
+    args = parser.parse_args()
     if not torch.backends.mps.is_available():
         raise RuntimeError("Mac Metal GPU required")
     _load_local_credentials()
@@ -197,7 +203,12 @@ def main() -> None:
     device = torch.device("mps")
     report = {"snapshot_digest": DIGEST, "validation_roots": len(validation),
               "models": {}}
-    for name, checkpoint in CHECKPOINTS.items():
+    checkpoints = ({
+        "small_trajectory_pretrained": SMALL_DIR / "trajectory_pretrained/pretrained.pt",
+        "small_trajectory_ranked": SMALL_DIR / "trajectory_pretrained/finetuned.pt",
+        "small_no_pretrain_ranked": SMALL_DIR / "no_pretrain_control/finetuned.pt",
+    } if args.small_only else CHECKPOINTS)
+    for name, checkpoint in checkpoints.items():
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
         model = _load_model(checkpoint, device)
@@ -208,22 +219,26 @@ def main() -> None:
         del model
     destination = ROOT / "diagnostics" / DIGEST
     destination.mkdir(parents=True, exist_ok=True)
-    path = destination / "action_gradients.json"
+    path = destination / ("action_gradients_small.json" if args.small_only
+                          else "action_gradients.json")
     path.write_text(json.dumps(report, indent=2, sort_keys=True))
     mlflow.set_tracking_uri("sqlite:///" + str(ROOT / "mlflow/tracking.db"))
     client = MlflowClient()
-    primary_id = "ff8b8bfa127849b7aea82671b5769bf9"
-    control_id = "19fdcc892b304baf816bb7d2ea4059c0"
+    primary_id = ("177ba6a9d27f44c5a37427762cd858d9" if args.small_only
+                  else "ff8b8bfa127849b7aea82671b5769bf9")
+    control_id = ("297bc79c6dac46b3b8a27344b498d690" if args.small_only
+                  else "19fdcc892b304baf816bb7d2ea4059c0")
     for name, row in report["models"].items():
-        run_id = control_id if name.startswith(("no_pretrain", "control_step")) else primary_id
+        run_id = (control_id if name.startswith(("no_pretrain", "control_step",
+                                                 "small_no_pretrain")) else primary_id)
         for key, value in row.items():
             if isinstance(value, (int, float)) and np.isfinite(value):
                 client.log_metric(run_id, f"grad_{name}/{key}", float(value))
     client.log_artifact(primary_id, str(path))
     client.log_artifact(control_id, str(path))
     print({"report": str(path),
-           "mlflow_primary": f"http://127.0.0.1:5000/#/experiments/1/runs/{primary_id}",
-           "mlflow_control": f"http://127.0.0.1:5000/#/experiments/1/runs/{control_id}"},
+           "mlflow_primary": f"http://127.0.0.1:5000/#/experiments/{2 if args.small_only else 1}/runs/{primary_id}",
+           "mlflow_control": f"http://127.0.0.1:5000/#/experiments/{2 if args.small_only else 1}/runs/{control_id}"},
           flush=True)
 
 

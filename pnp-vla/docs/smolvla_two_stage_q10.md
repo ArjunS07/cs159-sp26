@@ -69,6 +69,35 @@ The SQLite MLflow store, artifacts and checkpoints live under
 `~/pnp-vla-runs`. The local UI serves at `http://127.0.0.1:5000` when
 `mlflow server` is running against that database.
 
+## Smaller-capacity comparison
+
+The same script accepts `--model-scale small`. This uses one decoder block,
+width 128, four attention heads and FFN width 512, for 408,073 trainable
+parameters. The original uses three blocks, width 256, eight heads and FFN
+width 1024. Both keep dropout 0.20, the 101-bin expected-value head, the same
+cached data, seed, training schedule and root split. The small model's runs
+use a separate MLflow experiment and checkpoint directory. Run it with and
+without `--skip-pretrain` to measure the contribution of trajectory
+pretraining at the new capacity. Comparisons on the already-used validation
+split are exploratory.
+
+At the fixed 1,000-update fine-tuning endpoint, the small two-stage model
+selects 201/320 successful chunks versus 209/320 for stock, with held-out
+pair accuracy 0.496 and Brier 0.097. Its matched no-pretraining control
+selects 195/320, with pair accuracy 0.464 and Brier 0.155. The original
+two-stage model selects 201/320, with pair accuracy 0.565 and Brier 0.092.
+Thus pretraining helps the small model relative to its control, but reducing
+capacity does not improve reranking. All three final models trail stock.
+
+The original two-stage model has training-root pair accuracy 0.498 and Brier
+0.094; the small model has 0.499 and 0.104, respectively. These train-versus-
+validation comparisons provide no evidence that excess capacity is the main
+reason action ranking fails. They instead suggest that the current features
+or losses emphasize state success over within-state action effects. The
+small final model's gradient at failed stock chunks points toward a recorded
+successful alternative on only 8/17 rescueable validation roots; the
+diagnostic is in `action_gradients_small.json` under the local run directory.
+
 ## Action-gradient diagnostic for PCP
 
 `scripts/diagnose_smolvla_q_gradients_local.py` differentiates the expected
