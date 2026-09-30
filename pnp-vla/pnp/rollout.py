@@ -808,11 +808,14 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                                     postprocess, device, config)]
     if (config.num_samples is not None or config.correction_lambda is not None
             or config.uncertainty_gradient_mode is not None
-            or config.q_guidance_ckpt_id is not None):
+            or config.q_guidance_ckpt_id is not None
+            or config.refine_chunk_gate_threshold is not None):
         reason = ("multi-sample selection" if config.num_samples is not None
                   else "learned PCP correction" if config.correction_lambda is not None
                   else "Q latent-gradient guidance"
                   if config.q_guidance_ckpt_id is not None
+                  else "chunk-level uncertainty-gated refinement"
+                  if config.refine_chunk_gate_threshold is not None
                   else "U20 latent-gradient correction")
         print(f"[rollout] {reason} is not batch-enabled; using serial runner for this collection")
         return [_run_episode_serial(env, ep, policy, preprocess, postprocess, device, config)

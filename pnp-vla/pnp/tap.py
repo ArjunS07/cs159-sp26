@@ -112,6 +112,7 @@ class RolloutTap:
         self._pending_variable_probe = None
         self._temporal_previous_projected = None
         self._consensus_gate_records: list[dict] = []
+        self._chunk_refine_gate_fired = None
 
     # ── sampler-facing interface ────────────────────────────────────────────
     @property
@@ -129,6 +130,7 @@ class RolloutTap:
         return bool(
             (self.config.refine and (
                 self.config.refine_threshold is not None
+                or self.config.refine_chunk_gate_threshold is not None
                 or self.config.refine_start_chunk is not None
                 or (self.config.consensus_projection_k is not None
                     and not self.config.temporal_overlap_consensus)
@@ -301,8 +303,45 @@ class RolloutTap:
     def begin_chunk(self) -> None:
         self._chunk_idx += 1
         self._chunk_refine_applied = 0
+        self._chunk_refine_gate_fired = None
         if self.config.q_guidance_gate_threshold is None:
             self._q_guidance_gate_pending = None
+
+    def _finish_chunk_refinement_gate(self, records) -> None:
+        """Aggregate all configured P&P probes into one stock-vs-refine decision."""
+        threshold = self.config.refine_chunk_gate_threshold
+        if threshold is None:
+            return
+        weights = dict(zip(
+            map(int, self.config.pnp_steps),
+            map(int, self.config.pnp_k_by_step or (
+                [self.config.pnp_k] * len(self.config.pnp_steps)))))
+        horizon = int(self.config.refine_chunk_gate_horizon)
+        by_step = {}
+        for record in records:
+            step = int(record["step"])
+            if step not in weights:
+                continue
+            profile = np.asarray(record["u_time"], dtype=np.float32).reshape(-1)
+            if len(profile) < horizon:
+                raise ValueError(
+                    f"refinement gate horizon {horizon} exceeds profile length "
+                    f"{len(profile)}")
+            by_step[step] = float(profile[:horizon].mean())
+        if set(by_step) != set(weights):
+            raise RuntimeError(
+                f"refinement gate observed P&P steps {sorted(by_step)}, "
+                f"expected {sorted(weights)}")
+        score = sum(weights[step] * by_step[step] for step in weights) / sum(weights.values())
+        fired = score >= float(threshold)
+        self._chunk_refine_gate_fired = bool(fired)
+        self._consensus_gate_records.append({
+            "chunk_idx": int(self._chunk_idx),
+            "gate_score_u20": float(score),
+            "gate_threshold": float(threshold),
+            "gate_fired": bool(fired),
+            "gate_horizon": horizon,
+        })
 
     def set_q_guidance_context(self, robot_state, policy_proprio) -> None:
         self._q_guidance_context = (robot_state, policy_proprio)
@@ -351,6 +390,10 @@ class RolloutTap:
 
     def finalize_action(self, baseline_action, candidate_action):
         """Choose between exact-stock and candidate after both chunks are fully decoded."""
+        if self.config.refine_chunk_gate_threshold is not None:
+            if self._chunk_refine_gate_fired is None:
+                raise RuntimeError("chunk-level refinement gate was not finalized")
+            return candidate_action if self._chunk_refine_gate_fired else baseline_action
         if self.config.q_guidance_ckpt_id is not None:
             if self._q_guidance_applied < 1 or not self._q_guidance_records:
                 return baseline_action
@@ -553,6 +596,7 @@ class RolloutTap:
     def finish(self, ctx):
         if self._pending_variable_probe is not None:
             raise RuntimeError("variable-K probe was not finalized by the sampler")
+        self._finish_chunk_refinement_gate(ctx.records)
         if self.records_uncertainty or self.config.compute_multimodal:
             self.recorder.log_chunk({"num_steps": ctx.num_steps, "steps": ctx.records})
         if self.save_pcp:
@@ -643,6 +687,20 @@ class RolloutTap:
 
     @property
     def refinement_gate_telemetry(self):
+        if self.config.refine_chunk_gate_threshold is not None:
+            records = list(self._consensus_gate_records)
+            fired = sum(bool(row["gate_fired"]) for row in records)
+            return {
+                "n_corrections_applied": fired,
+                "gate_fire_rate": fired / max(len(records), 1),
+                "refinement_chunk_gate": {
+                    "records": records,
+                    "n_considered": len(records),
+                    "n_fired": fired,
+                    "threshold": float(self.config.refine_chunk_gate_threshold),
+                    "horizon": int(self.config.refine_chunk_gate_horizon),
+                },
+            }
         if self.config.consensus_projection_gate_threshold is not None:
             records = list(self._consensus_gate_records)
             fired = sum(bool(row["gate_fired"]) for row in records)

@@ -526,6 +526,7 @@ class SupabaseStore:
                        correction_steps=list(config.pnp_steps),
                        q_ckpt_id=config.q_ckpt_id, **(result.get("pcp_telemetry") or {}))
         if (config.refine_threshold is not None
+                or config.refine_chunk_gate_threshold is not None
                 or config.consensus_projection_gate_threshold is not None):
             telemetry = result.get("refinement_gate_telemetry") or {}
             # Only these scalar summaries are real columns in ``rollouts``.  Rich
@@ -539,6 +540,10 @@ class SupabaseStore:
                 row["ms_candidate_u"] = {
                     "consensus_projection_gate": telemetry[
                         "consensus_projection_gate"]}
+            if telemetry.get("refinement_chunk_gate"):
+                row["ms_candidate_u"] = {
+                    "refinement_chunk_gate": telemetry[
+                        "refinement_chunk_gate"]}
         if result.get("uncertainty_gradient_telemetry"):
             row["ms_candidate_u"] = {
                 "uncertainty_gradient": result["uncertainty_gradient_telemetry"]}

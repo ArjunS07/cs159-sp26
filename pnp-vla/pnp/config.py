@@ -120,6 +120,7 @@ class Method:
     SMOLVLA_CONSENSUS_PROJECT_S03_K3 = "smolvla_consensus_project_s03_k3"
     SMOLVLA_U20_GATED_CONSENSUS_S03_K3 = (
         "smolvla_u20_gated_consensus_project_s03_k3")
+    SMOLVLA_U20_GATED_REFINEMENT_K311 = "smolvla_u20_gated_refinement_k311"
     SMOLVLA_STOCK_A1 = "smolvla_stock_a1"
     SMOLVLA_PNP_S123_K311_A1 = "smolvla_pnp_steps123_k311_a1"
     QPLANNING_Q10 = "qplanning_q10"
@@ -167,6 +168,7 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.SMOLVLA_CONSENSUS_PROJECT_S07_K3,
                Method.SMOLVLA_CONSENSUS_PROJECT_S03_K3,
                Method.SMOLVLA_U20_GATED_CONSENSUS_S03_K3,
+               Method.SMOLVLA_U20_GATED_REFINEMENT_K311,
                Method.SMOLVLA_STOCK_A1,
                Method.SMOLVLA_PNP_S123_K311_A1,
                Method.QPLANNING_Q10,
@@ -225,6 +227,11 @@ class RolloutConfig:
     refine_threshold: Optional[float] = None    # refine selected Euler step iff u_mean >= this
     # None gates on full-chunk uncertainty; an integer gates on that many leading actions.
     refine_uncertainty_horizon: Optional[int] = None
+    # Per-decision gate around the completed plain-refinement chunk. Unlike refine_threshold,
+    # this aggregates uncertainty across every configured probe step, then returns either the
+    # fully refined chunk or the exact stock chunk for that boundary.
+    refine_chunk_gate_threshold: Optional[float] = None
+    refine_chunk_gate_horizon: Optional[int] = None
     refine_start_chunk: Optional[int] = None    # leave chunks [0, this) exact-stock; then refine
     # Full P&P feedback through n_action_steps, then a linear decay to zero at this action index.
     # Applied inside every P&P iteration, not merely to the final sampler state.
@@ -523,6 +530,28 @@ class RolloutConfig:
                     or int(self.refine_uncertainty_horizon) != self.refine_uncertainty_horizon
                     or self.refine_uncertainty_horizon < 1):
                 raise ValueError("refine_uncertainty_horizon must be a positive integer")
+        refine_chunk_gate_fields = (
+            self.refine_chunk_gate_threshold, self.refine_chunk_gate_horizon)
+        if any(value is not None for value in refine_chunk_gate_fields):
+            if not all(value is not None for value in refine_chunk_gate_fields):
+                raise ValueError(
+                    "chunk-level refinement gating requires threshold and horizon")
+            if not self.refine or not self.has_probe:
+                raise ValueError(
+                    "chunk-level refinement gating requires P&P refinement")
+            if self.refine_threshold is not None:
+                raise ValueError(
+                    "per-step and chunk-level refinement gates are mutually exclusive")
+            if (not math.isfinite(float(self.refine_chunk_gate_threshold))
+                    or float(self.refine_chunk_gate_threshold) < 0):
+                raise ValueError(
+                    "refine_chunk_gate_threshold must be finite and non-negative")
+            if (isinstance(self.refine_chunk_gate_horizon, bool)
+                    or int(self.refine_chunk_gate_horizon)
+                    != self.refine_chunk_gate_horizon
+                    or int(self.refine_chunk_gate_horizon) < 1):
+                raise ValueError(
+                    "refine_chunk_gate_horizon must be a positive integer")
         if self.refine_start_chunk is not None:
             if not self.refine:
                 raise ValueError("refine_start_chunk requires refine=True")
@@ -643,6 +672,12 @@ class RolloutConfig:
                     or int(self.consensus_projection_gate_horizon) < 1):
                 raise ValueError(
                     "consensus_projection_gate_horizon must be a positive integer")
+        if (self.refine_chunk_gate_threshold is not None
+                and (any(value is not None for value in projection_fields)
+                     or self.consensus_average_only
+                     or self.consensus_projection_gate_threshold is not None)):
+            raise ValueError(
+                "chunk-level plain-refinement gating cannot also average or project")
         # Probe-derived sinks need a probe.
         for sink in ("save_pcp_features", "save_ahats", "save_time_uncertainty"):
             if getattr(self, sink) and not self.has_probe:
@@ -755,6 +790,9 @@ class RolloutConfig:
             logical.pop("refine_threshold")
         if logical.get("refine_uncertainty_horizon") is None:
             logical.pop("refine_uncertainty_horizon")
+        if logical.get("refine_chunk_gate_threshold") is None:
+            logical.pop("refine_chunk_gate_threshold")
+            logical.pop("refine_chunk_gate_horizon")
         if logical.get("refine_start_chunk") is None:
             logical.pop("refine_start_chunk")
         if logical.get("refine_horizon_m") is None:
@@ -781,7 +819,8 @@ class RolloutConfig:
 # Behavior-defining fields of RolloutConfig (see RolloutConfig.logical_dict).
 LOGICAL_FIELDS = ("pnp_steps", "pnp_k", "pnp_k_by_step", "pnp_time_min", "action_dim",
                   "refine", "refine_average", "refine_horizon_m", "refine_threshold",
-                  "refine_uncertainty_horizon", "refine_start_chunk", "refine_tail_decay_end",
+                  "refine_uncertainty_horizon", "refine_chunk_gate_threshold",
+                  "refine_chunk_gate_horizon", "refine_start_chunk", "refine_tail_decay_end",
                   "refine_prefix_only", "refine_inner_strength",
                   "consensus_projection_k", "consensus_projection_step",
                   "consensus_projection_gate_threshold",
