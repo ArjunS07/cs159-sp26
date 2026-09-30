@@ -721,13 +721,12 @@ def _root_batch(items: list[dict]):
 def _root_scores(model, batch):
     trees, candidates = batch["action"].shape[:2]
     repeat = lambda value: value.repeat_interleave(candidates, 0)
-    logits = model(
+    values = model.expected_value(
         repeat(batch["prefix"]), repeat(batch["pad"]), repeat(batch["robot"]),
         repeat(batch["proprio"]),
         batch["action"].reshape(trees * candidates, 10, -1),
         batch["action_valid"].reshape(trees * candidates, 10))
-    return ((logits.float().softmax(-1) * model.value_bins.float()).sum(-1)
-            .reshape(trees, candidates))
+    return values.reshape(trees, candidates)
 
 
 def _listwise_root_loss(scores, success, *, temperature: float):
