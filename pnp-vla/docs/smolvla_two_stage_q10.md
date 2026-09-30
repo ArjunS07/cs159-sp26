@@ -98,6 +98,27 @@ small final model's gradient at failed stock chunks points toward a recorded
 successful alternative on only 8/17 rescueable validation roots; the
 diagnostic is in `action_gradients_small.json` under the local run directory.
 
+## Larger-capacity check
+
+`--model-scale large` uses four decoder blocks, width 296, eight attention
+heads and FFN width 1184: 5,959,057 trainable parameters for the stored
+SmolVLA feature dimensions. It retains all original data, objectives, seed,
+dropout, update counts and evaluation rules. Its separate MLflow experiment
+and checkpoint directory prevent overwriting earlier runs. Three capacity
+points can test a trend in this setup, but they do not establish a scaling
+law, especially with a repeatedly used 320-root validation split.
+
+At the fixed endpoint, the 6M model has held-out pair accuracy 0.567, Brier
+0.095, and selects 206/320 successes, versus 209/320 for stock. The 3.45M
+model selects 201/320. On paired roots, the 6M model wins seven cases where
+the 3.45M model fails and loses two cases where the 3.45M model wins, for a net
+gain of five; a root bootstrap gives a descriptive 95% interval of -1 to 11
+extra successes. Training-root pair accuracy is only 0.510, compared with
+0.498 for the 3.45M model. Thus the increased capacity gives a small but
+uncertain selection gain without convincing within-root action learning.
+The final 6M action gradient points toward a recorded successful chunk on
+7/17 rescueable stock failures. It should not yet drive PCP.
+
 ## Action-gradient diagnostic for PCP
 
 `scripts/diagnose_smolvla_q_gradients_local.py` differentiates the expected

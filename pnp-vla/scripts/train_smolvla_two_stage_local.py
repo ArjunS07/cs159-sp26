@@ -129,9 +129,9 @@ def main() -> None:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--skip-pretrain", action="store_true",
                         help="control: same fine-tuning and replay, random initialization")
-    parser.add_argument("--model-scale", choices=("original", "small"),
+    parser.add_argument("--model-scale", choices=("original", "small", "large"),
                         default="original",
-                        help="small uses one 128-wide decoder block; all data and losses stay fixed")
+                        help="small: 408k parameters; large: about 6M; data and losses stay fixed")
     parser.add_argument("--run-root", type=Path, default=Path.home() / "pnp-vla-runs")
     args = parser.parse_args()
     if (min(args.pretrain_updates, args.finetune_updates, args.trajectory_batch,
@@ -161,13 +161,17 @@ def main() -> None:
     train_roots = TimedRoots(root_cache, root_cache["train_group_ids"], groups)
     validation = TimedRoots(root_cache, root_cache["validation_group_ids"], groups)
     first = train_roots[0]
-    architecture = ({"width": 256, "n_layers": 3, "n_heads": 8,
-                     "ffn_width": 1024} if args.model_scale == "original" else
-                    {"width": 128, "n_layers": 1, "n_heads": 4,
-                     "ffn_width": 512})
+    architectures = {
+        "small": {"width": 128, "n_layers": 1, "n_heads": 4,
+                  "ffn_width": 512},
+        "original": {"width": 256, "n_layers": 3, "n_heads": 8,
+                     "ffn_width": 1024},
+        "large": {"width": 296, "n_layers": 4, "n_heads": 8,
+                  "ffn_width": 1184},
+    }
     cfg = QPlanningModelConfig(
         action_horizon=10, action_dim=7, dropout=.20,
-        prefix_pool_tokens=128, **architecture)
+        prefix_pool_tokens=128, **architectures[args.model_scale])
     model = QPlanningCritic(
         prefix_dim=first["prefix"].shape[-1],
         robot_dim=len(first["robot"]), proprio_dim=len(first["proprio"]),
@@ -196,8 +200,11 @@ def main() -> None:
         "objective": "binary MC success, then BCE plus within-root logistic ranking",
         "snapshot_digest": snapshot["snapshot_digest"],
     }
-    experiment_name = (EXPERIMENT if args.model_scale == "original" else
-                       "smolvla-q10-small-trajectory-pretrain-root-rank-v1")
+    experiment_name = {
+        "original": EXPERIMENT,
+        "small": "smolvla-q10-small-trajectory-pretrain-root-rank-v1",
+        "large": "smolvla-q10-large-trajectory-pretrain-root-rank-v1",
+    }[args.model_scale]
     checkpoint_dir = root / "checkpoints" / experiment_name / snapshot["snapshot_digest"]
     checkpoint_dir = checkpoint_dir / ("no_pretrain_control" if args.skip_pretrain
                                        else "trajectory_pretrained")
