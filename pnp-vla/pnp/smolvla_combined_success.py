@@ -14,6 +14,7 @@ import torch
 from .pcp_critic.resumable_snapshot import (
     _download_with_retry, load_training_fields_with_retry,
 )
+from .config import resolve_max_steps
 from .qplanning_critic.model import pool_prefix_tokens
 from .smolvla_q_selection import FRESH8_EXPERIMENT, FRESH8_KINDS
 from .smolvla_scaling_trees import TREE_EXPERIMENT as NEW_EXPERIMENT
@@ -27,7 +28,8 @@ from .store import SupabaseStore
 COMBINED_EXPERIMENT = "smolvla-libero-fresh8-combined-1600-v1"
 COMBINED_SNAPSHOT_KEY = "smolvla_trees/manifests/combined_fresh8_success_q10_1600_v1.json"
 SOURCE_EXPERIMENTS = (FRESH8_EXPERIMENT, NEW_EXPERIMENT)
-ROOT_CACHE_FORMAT = "smolvla-success-q10-root-only-v1"
+ROOT_CACHE_FORMAT = "smolvla-success-q10-root-only-v2-preaction"
+LEGACY_ROOT_CACHE_FORMAT = "smolvla-success-q10-root-only-v1"
 ROOT_FIELDS = (
     "prefix/prefix_embeddings", "prefix/prefix_pad_masks",
     "boundary/raw_robot_state", "boundary/policy_proprio",
@@ -78,14 +80,31 @@ def load_or_create_combined_snapshot(store=None) -> dict:
     return saved
 
 
-def _read_root_group(store, group: dict, destination: Path) -> dict:
+def _read_root_group(store, group: dict, destination: Path,
+                     legacy_root: Path | None = None) -> dict:
     path = destination / f"group_{group['candidate_group_id']}.npz"
     if path.is_file():
         with np.load(path, allow_pickle=False) as archive:
             if (set(("prefix", "pad", "robot", "proprio", "actions",
-                     "action_valid", "success")) <= set(archive.files)
+                     "action_valid", "success", "input_contract")) <= set(archive.files)
+                    and str(archive["input_contract"]) == ROOT_CACHE_FORMAT
                     and archive["actions"].shape == (9, 10, 7)):
                 return _group_entry(group, path)
+    if legacy_root is not None:
+        legacy_path = legacy_root / path.name
+        if legacy_path.is_file():
+            with np.load(legacy_path, allow_pickle=False) as old:
+                # A full old mask means all ten proposed actions were kept;
+                # only these roots can be migrated without fetching chunks.
+                if (old["actions"].shape == (9, 10, 7)
+                        and np.asarray(old["action_valid"], bool).all()):
+                    _atomic_npz(path, {
+                        **{name: np.asarray(old[name]).copy() for name in (
+                            "prefix", "pad", "robot", "proprio", "actions",
+                            "action_valid", "success")},
+                        "input_contract": np.asarray(ROOT_CACHE_FORMAT),
+                    })
+                    return _group_entry(group, path)
     arrays = load_training_fields_with_retry(
         store, group["source_training_data_path"], ROOT_FIELDS)
     boundary = int(group["source_boundary_index"])
@@ -95,6 +114,11 @@ def _read_root_group(store, group: dict, destination: Path) -> dict:
         torch.from_numpy(prefix.astype(np.float32))[None],
         torch.from_numpy(pad)[None], 128)
     root_step = int(np.asarray(arrays["boundary/step"])[boundary])
+    # The environment deadline is known before action selection. Candidate
+    # termination time is an outcome and must never define a model input.
+    width = min(10, resolve_max_steps(group["suite"]) - root_step)
+    if width < 1:
+        raise ValueError(f"root has no remaining action budget: {group['candidate_group_id']}")
     actions, masks, outcomes = [], [], []
     for candidate in group["candidates"]:
         with np.load(io.BytesIO(_download_with_retry(store, candidate["policy_chunk_path"])),
@@ -102,9 +126,6 @@ def _read_root_group(store, group: dict, destination: Path) -> dict:
             chunk = np.asarray(archive["actions"], np.float32)
         if chunk.ndim != 2 or chunk.shape[0] < 10 or chunk.shape[1] < 7:
             raise ValueError(f"invalid candidate action shape for {candidate['candidate_id']}")
-        width = min(10, int(candidate["n_steps"]) - root_step)
-        if width < 1:
-            raise ValueError(f"candidate has no executed action at root: {candidate['candidate_id']}")
         action = np.zeros((10, 7), np.float32)
         action[:width] = chunk[:width, :7]
         mask = np.arange(10) < width
@@ -112,7 +133,6 @@ def _read_root_group(store, group: dict, destination: Path) -> dict:
         masks.append(mask)
         outcomes.append(bool(candidate["success"]))
     source_action = np.asarray(arrays["bellman/action"][boundary], np.float32)
-    width = int(masks[0].sum())
     if float(np.max(np.abs(source_action[:width, :7] - actions[0][:width]))) > 1e-6:
         raise ValueError(f"stored source action mismatch for {group['candidate_group_id']}")
     _atomic_npz(path, {
@@ -122,6 +142,7 @@ def _read_root_group(store, group: dict, destination: Path) -> dict:
         "proprio": np.asarray(arrays["boundary/policy_proprio"][boundary], np.float32).reshape(-1),
         "actions": np.stack(actions), "action_valid": np.stack(masks),
         "success": np.asarray(outcomes, bool),
+        "input_contract": np.asarray(ROOT_CACHE_FORMAT),
     })
     return _group_entry(group, path)
 
@@ -143,6 +164,8 @@ def prepare_combined_root_cache(*, snapshot: dict, cache_root: str | Path,
         raise ValueError("download_workers must be in [1,8]")
     store = store or SupabaseStore()
     root = Path(cache_root).expanduser() / ROOT_CACHE_FORMAT / snapshot["snapshot_digest"]
+    legacy_root = (Path(cache_root).expanduser() / LEGACY_ROOT_CACHE_FORMAT
+                   / snapshot["snapshot_digest"])
     root.mkdir(parents=True, exist_ok=True)
     index_path = root / "cache_index.json"
     groups = snapshot["groups"]
@@ -164,7 +187,7 @@ def prepare_combined_root_cache(*, snapshot: dict, cache_root: str | Path,
         if worker_store is None:
             worker_store = store.fork_for_thread()
             local.store = worker_store
-        return _read_root_group(worker_store, group, root)
+        return _read_root_group(worker_store, group, root, legacy_root)
 
     print({"root_cache": str(root), "ready": len(ready), "missing": len(missing),
            "download_workers": download_workers}, flush=True)

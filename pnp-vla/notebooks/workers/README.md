@@ -124,6 +124,25 @@ fixed after collection begins.
 | 1 | [Open fresh8 worker 1 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_1.ipynb) |
 | 2 | [Open fresh8 worker 2 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_2.ipynb) |
 
+### Q10 action-contrast pilot (notebook 119)
+
+The original 1,600 trees use source episode indices 10–49. Notebook 119 tests whether
+larger, controlled action differences make root outcomes more informative before
+collecting another large fresh-noise cohort. It selects 18 existing source roots
+without looking at their counterfactual outcomes, balanced across suite and
+source success where possible. Each tree has the exact stored stock chunk, one
+fresh-noise P&P candidate, and twelve smooth normalized translation offsets:
+positive/negative x, y, and z at scales 0.02 and 0.06. Every branch uses the same
+frozen P&P continuation seed. The new experiment is
+`smolvla-libero-q10-action-contrast-pilot-v1`; completed groups are skipped on
+rerun, and all branch artifacts go to Supabase. These 18 roots overlap the old
+source cohort and are a collection pilot, not an independent test set.
+
+Open [the configurable worker](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/codex/smolvla-q-program/pnp-vla/notebooks/workers/119_smolvla_action_contrast_pilot.ipynb)
+in up to three Colab runtimes. Set distinct `SHARD_INDEX` values 0, 1, 2. Keep
+`TREE_LIMIT=1` for the first smoke run, then set it to `None` for all six roots
+assigned to each shard. Collection starts only when `RUN_COLLECTION=True`.
+
 This 800-root cohort supports a within-distribution learning curve. A later independent test
 of new initial states should collect source episodes from different episode indices and freeze
 their roots before looking at their branch outcomes. Keep those identities out of model

@@ -26,7 +26,7 @@ from scripts.train_smolvla_combined_local import _load_local_credentials  # noqa
 from pnp.qplanning_critic.config import QPlanningModelConfig  # noqa: E402
 from pnp.qplanning_critic.model import QPlanningCritic  # noqa: E402
 from pnp.smolvla_combined_success import (  # noqa: E402
-    SOURCE_EXPERIMENTS, load_or_create_combined_snapshot,
+    ROOT_CACHE_FORMAT, SOURCE_EXPERIMENTS, load_or_create_combined_snapshot,
     prepare_combined_root_cache,
 )
 from pnp.smolvla_success_critic import (  # noqa: E402
@@ -34,13 +34,13 @@ from pnp.smolvla_success_critic import (  # noqa: E402
 )
 from pnp.smolvla_tree_bellman_finetune import _root_batch, _root_scores, _to  # noqa: E402
 from pnp.smolvla_two_stage import (  # noqa: E402
-    PRETRAIN_KINDS, TrajectorySampler, pairwise_root_loss,
+    CACHE_FORMAT, PRETRAIN_KINDS, TrajectorySampler, pairwise_root_loss,
     prepare_trajectory_cache, score_single, single_batch,
 )
 from pnp.store import SupabaseStore  # noqa: E402
 
 
-EXPERIMENT = "smolvla-q10-trajectory-pretrain-root-rank-v1"
+EXPERIMENT = "smolvla-q10-trajectory-pretrain-root-rank-v2-preaction"
 SEED = 42
 BASELINE = (Path.home() / "pnp-vla-runs/checkpoints/combined_1600_root_mc_v1"
             / "671b5b211099997fc83d1277/root_mc/checkpoint_step_002000.pt")
@@ -198,12 +198,15 @@ def main() -> None:
         "root_sampling": "half mixed, half uniform",
         "trajectory_sampling": "uniform root, uniform among 3 trajectories, uniform window",
         "objective": "binary MC success, then BCE plus within-root logistic ranking",
+        "input_contract": "full proposed Q10 actions before execution",
+        "root_cache_format": ROOT_CACHE_FORMAT,
+        "trajectory_cache_format": CACHE_FORMAT,
         "snapshot_digest": snapshot["snapshot_digest"],
     }
     experiment_name = {
         "original": EXPERIMENT,
-        "small": "smolvla-q10-small-trajectory-pretrain-root-rank-v1",
-        "large": "smolvla-q10-large-trajectory-pretrain-root-rank-v1",
+        "small": "smolvla-q10-small-trajectory-pretrain-root-rank-v2-preaction",
+        "large": "smolvla-q10-large-trajectory-pretrain-root-rank-v2-preaction",
     }[args.model_scale]
     checkpoint_dir = root / "checkpoints" / experiment_name / snapshot["snapshot_digest"]
     checkpoint_dir = checkpoint_dir / ("no_pretrain_control" if args.skip_pretrain

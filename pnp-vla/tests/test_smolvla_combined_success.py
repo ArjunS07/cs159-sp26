@@ -17,7 +17,7 @@ def _bytes(**arrays):
     return handle.getvalue()
 
 
-def test_root_cache_matches_source_actions_and_masks_terminal_tail(tmp_path):
+def test_root_cache_keeps_full_proposals_when_candidate_terminates_early(tmp_path):
     source = np.arange(70, dtype=np.float32).reshape(10, 7) / 100
     paths = {"source.npz": _bytes(**{
         "prefix/prefix_embeddings": np.ones((2, 1, 4, 8), np.float16),
@@ -45,8 +45,8 @@ def test_root_cache_matches_source_actions_and_masks_terminal_tail(tmp_path):
     entry = _read_root_group(Store(), group, tmp_path)
     with np.load(tmp_path / entry["path"]) as archive:
         np.testing.assert_array_equal(archive["actions"][0], source)
-        np.testing.assert_array_equal(archive["actions"][1, :6], source[:6] + .1)
-        assert not archive["action_valid"][1, 6:].any()
+        np.testing.assert_array_equal(archive["actions"][1], source + .1)
+        assert archive["action_valid"].all()
         assert archive["actions"].shape == (9, 10, 7)
         assert archive["prefix"].shape == (128, 8)
         assert archive["success"].sum() == 1

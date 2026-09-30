@@ -1,5 +1,10 @@
 # SmolVLA Q10 trajectory pretraining and root ranking
 
+The original v1 experiments below used an outcome-dependent action mask on
+short terminal chunks. They are historical diagnostics, not deployable
+reranking estimates. The pre-action v2 repair and fresh experiments are
+documented at the end of this note.
+
 This experiment asks whether extra recorded trajectories improve *within-state*
 action ranking. It uses the immutable 1,600-tree fresh8 snapshot
 `671b5b211099997fc83d1277` and the existing 1,280/320 root split.
@@ -131,3 +136,33 @@ receive a separate alignment measure. Gradients are compared in
 training-standardized action coordinates. Positive alignment is necessary
 but not sufficient for PCP: interpolation can leave the policy distribution,
 and the recorded outcome is only one rollout per candidate.
+
+## Pre-action input repair and diagnostics
+
+The v1 root cache derived each candidate's action mask from its observed
+termination time. For a short successful rollout this exposed future outcome
+information before the candidate was chosen. The v2 root cache uses the full
+stored proposed Q10 chunk and a mask based only on the known episode deadline.
+All nine candidates at each of the 1,600 roots now have the same full ten-
+action mask. This repaired 82 candidate masks across 18 roots. Old cache
+files and run outputs remain separately versioned.
+
+The v2 trajectory pretraining cache excludes partial terminal windows whose
+v1 cached actions had been zero-padded after observed termination. It retains
+54,014 full ten-action windows, each with a full mask, versus 56,135 v1
+windows. Evaluated on corrected roots without retraining, the old 3.45M
+checkpoint selects 199/320 successful chunks (formerly 201), and the old
+5.96M checkpoint selects 205/320 (formerly 206); stock remains 209/320.
+These old weights were still trained with v1 inputs. A new two-stage run uses
+the v2 caches and separate MLflow/checkpoint names.
+
+On 32 fixed mixed training roots, a two-layer 660k scalar-logit critic with
+dropout zero and pair-only loss reached only 0.724 training pair accuracy
+after 2,000 updates with globally normalized absolute actions. Successful
+and failed chunks in those roots were extremely close: median global-
+standardized Q10 L2 distance 0.018 across 70 coordinates. A controlled
+variant using 100x scaled candidate-minus-stock actions reached 1.000 pair
+accuracy and perfectly ordered all 32 roots by update 500. This establishes
+that the root labels can be memorized from the proposed actions when their
+small within-root differences are represented at useful scale. It does not
+establish held-out generalization or calibrated success probabilities.

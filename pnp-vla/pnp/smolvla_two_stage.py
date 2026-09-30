@@ -24,7 +24,8 @@ from .qplanning_critic.model import pool_prefix_tokens
 from .smolvla_tree_bellman_finetune import _atomic_json, _atomic_npz
 
 
-CACHE_FORMAT = "smolvla_two_stage_trajectory_v1"
+CACHE_FORMAT = "smolvla_two_stage_trajectory_v2_full_chunks"
+LEGACY_CACHE_FORMAT = "smolvla_two_stage_trajectory_v1"
 PRETRAIN_KINDS = ("stored_source", "fresh_seed_1", "fresh_seed_5")
 TRAJECTORY_FIELDS = (
     "prefix/prefix_embeddings", "prefix/prefix_pad_masks",
@@ -51,7 +52,8 @@ def trajectory_spec(group: dict, kind: str) -> dict:
     }
 
 
-def _materialize(store, spec: dict, destination: Path) -> dict:
+def _materialize(store, spec: dict, destination: Path,
+                 legacy_dir: Path | None = None) -> dict:
     key = hashlib.sha256(
         (spec["group_id"] + "|" + spec["kind"]).encode()).hexdigest()[:24]
     path = destination / f"trajectory_{key}.npz"
@@ -63,6 +65,30 @@ def _materialize(store, spec: dict, destination: Path) -> dict:
                     or len(old["success"]) < 1):
                 raise ValueError(f"invalid cached trajectory {path}")
             return {**spec, "file": path.name, "windows": len(old["success"])}
+    if legacy_dir is not None:
+        legacy_path = legacy_dir / path.name
+        if legacy_path.is_file():
+            with np.load(legacy_path, allow_pickle=False) as old:
+                if (str(old["group_id"]) != spec["group_id"]
+                        or str(old["kind"]) != spec["kind"]
+                        or str(old["format"]) != LEGACY_CACHE_FORMAT
+                        or not np.all(old["success"] == spec["success"])):
+                    raise ValueError(f"invalid legacy trajectory {legacy_path}")
+                keep = np.asarray(old["action_valid"], bool).all(axis=1)
+                if not keep.any():
+                    return {**spec, "file": None, "windows": 0}
+                # The old cache preserved all proposed actions on full ten-
+                # action windows. Its partial terminal windows zeroed future
+                # actions, so discard those rather than importing leakage.
+                _atomic_npz(path, {
+                    "format": np.asarray(CACHE_FORMAT),
+                    "group_id": np.asarray(spec["group_id"]),
+                    "kind": np.asarray(spec["kind"]),
+                    **{name: np.asarray(old[name])[keep].copy() for name in (
+                        "prefix", "pad", "robot", "proprio", "action",
+                        "action_valid", "success")},
+                })
+                return {**spec, "file": path.name, "windows": int(keep.sum())}
     arrays = load_training_fields_with_retry(
         store, spec["path"], TRAJECTORY_FIELDS)
     actions = np.asarray(arrays["bellman/action"], np.float32)
@@ -85,35 +111,38 @@ def _materialize(store, spec: dict, destination: Path) -> dict:
     if bool(np.asarray(arrays["step_success"]).any()) != spec["success"]:
         raise ValueError(f"trajectory success disagrees with candidate label: {spec['group_id']}")
     start = spec["start"]
-    if start >= n:
+    # A full proposed chunk is available at every decision boundary, but the
+    # executed-validity mask reveals when the episode ended. Exclude partial
+    # transitions from pretraining; root comparisons retain the full proposal.
+    kept = np.flatnonzero(valid[start:n].all(axis=1)) + start
+    if not len(kept):
         if spec["kind"] == "stored_source":
-            raise ValueError(f"source has no windows: {spec['group_id']}")
+            raise ValueError(f"source has no full Q10 windows: {spec['group_id']}")
         # A branch can finish during the ten intervened actions. It still
         # belongs in the root-ranking stage, but has no continuation example.
         return {**spec, "file": None, "windows": 0}
     pooled, pooled_valid = pool_prefix_tokens(
-        torch.from_numpy(prefix[start:n]), torch.from_numpy(pad[start:n]), 128)
+        torch.from_numpy(prefix[kept]), torch.from_numpy(pad[kept]), 128)
     maximum = resolve_max_steps(spec["suite"])
-    absolute_steps = steps[start:n] + spec["step_offset"]
-    if np.any(absolute_steps < 0) or np.any(absolute_steps > maximum):
+    absolute_steps = steps[kept] + spec["step_offset"]
+    if np.any(absolute_steps < 0) or np.any(absolute_steps + 10 > maximum):
         raise ValueError(f"trajectory boundary time out of range: {spec['group_id']}")
     time_left = ((maximum - absolute_steps) / maximum).astype(np.float32)
     robot_with_time = np.concatenate(
-        [robot[start:n], time_left[:, None]], axis=1)
-    action = np.asarray(actions[start:n, :10, :7], np.float32).copy()
-    mask = np.asarray(valid[start:n], bool).copy()
-    action[~mask] = 0
+        [robot[kept], time_left[:, None]], axis=1)
+    action = np.asarray(actions[kept, :10, :7], np.float32).copy()
+    mask = np.ones((len(kept), 10), bool)
     _atomic_npz(path, {
         "format": np.asarray(CACHE_FORMAT), "group_id": np.asarray(spec["group_id"]),
         "kind": np.asarray(spec["kind"]),
         "prefix": pooled.numpy().astype(np.float16),
         "pad": pooled_valid.numpy().astype(bool),
         "robot": robot_with_time,
-        "proprio": proprio[start:n].copy(),
+        "proprio": proprio[kept].copy(),
         "action": action, "action_valid": mask,
-        "success": np.full(n - start, spec["success"], bool),
+        "success": np.full(len(kept), spec["success"], bool),
     })
-    return {**spec, "file": path.name, "windows": n - start}
+    return {**spec, "file": path.name, "windows": len(kept)}
 
 
 def prepare_trajectory_cache(*, snapshot: dict, root_cache: dict,
@@ -135,6 +164,8 @@ def prepare_trajectory_cache(*, snapshot: dict, root_cache: dict,
     if len(tasks) != 3840 or len({row["path"] for row in tasks}) != 3840:
         raise ValueError("trajectory pretraining paths are missing or duplicated")
     destination = Path(cache_root).expanduser() / CACHE_FORMAT / snapshot["snapshot_digest"]
+    legacy_dir = (Path(cache_root).expanduser() / LEGACY_CACHE_FORMAT
+                  / snapshot["snapshot_digest"])
     destination.mkdir(parents=True, exist_ok=True)
     index_path = destination / "cache_index.json"
     ready = {}
@@ -150,7 +181,7 @@ def prepare_trajectory_cache(*, snapshot: dict, root_cache: dict,
             digest = hashlib.sha256((spec["group_id"] + "|" + spec["kind"]).encode()).hexdigest()[:24]
             path = destination / f"trajectory_{digest}.npz"
             if path.is_file():
-                ready[key] = _materialize(store, spec, destination)
+                ready[key] = _materialize(store, spec, destination, legacy_dir)
     pending = [row for row in tasks if (row["group_id"], row["kind"]) not in ready]
     local = threading.local()
 
@@ -159,7 +190,7 @@ def prepare_trajectory_cache(*, snapshot: dict, root_cache: dict,
         if worker_store is None:
             worker_store = store.fork_for_thread()
             local.store = worker_store
-        return _materialize(worker_store, spec, destination)
+        return _materialize(worker_store, spec, destination, legacy_dir)
 
     print({"trajectory_cache": str(destination), "ready": len(ready),
            "pending": len(pending), "total": len(tasks)}, flush=True)
