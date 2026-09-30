@@ -124,6 +124,12 @@ fixed after collection begins.
 | 1 | [Open fresh8 worker 1 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_1.ipynb) |
 | 2 | [Open fresh8 worker 2 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_2.ipynb) |
 
+### Flow-step PCP pilot (notebook 121)
+
+Use [notebook 121](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/codex/smolvla-q-program/pnp-vla/notebooks/workers/121_smolvla_flow_pcp_pilot.ipynb) for correction inside SmolVLA generation. Upload the scalar MC or TD checkpoint, set `RUN_INTERVENTION=True` on a CUDA runtime, and start with `ROOT_LIMIT=1`. The default corrects the existing K=1 P&P probe at zero-based step 3 (`s=.7`), re-noises with its shared epsilon, then completes Euler denoising. Matched controls are zero, positive/negative Q gradient and independent random directions at two strengths. Zero must exactly reproduce live P&P, including the full chunk and perturbation RNG position. Three copies use `SHARD_INDEX=0,1,2`; `ROOT_LIMIT=None` expands to six roots each.
+
+The worker saves branch artifacts and paired outcomes in a separate configuration-specific Supabase experiment and skips complete groups on restart. Progress prints after each completed root. This is a root-only intervention followed by the frozen P&P continuation; reused roots and a critic trained on completed proposals make the results exploratory. Notebook 120 remains the earlier post-generation diagnostic.
+
 ### Q10 action-contrast pilot (notebook 119)
 
 The original 1,600 trees use source episode indices 10–49. Notebook 119 tests whether

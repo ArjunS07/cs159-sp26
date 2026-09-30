@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -136,7 +137,8 @@ def controlled_chunks(stock, direction, valid, seed):
 
 def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
                   run_intervention=False, cache_root="/content/pcp_pilot_cache",
-                  output_path="/content/pcp_pilot_report.json", device="cpu", store=None):
+                  output_path="/content/pcp_pilot_report.json", device="cpu", store=None,
+                  _proposal_generator=None, _method_config=None, _experiment_base=EXPERIMENT):
     if shard_index not in range(SHARD_COUNT) or (root_limit is not None and root_limit < 1):
         raise ValueError("invalid shard/root limit")
     store = store or SupabaseStore()
@@ -146,6 +148,8 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
     if _json_digest({k: v for k, v in snapshot.items() if k != "snapshot_digest"}) != claimed:
         raise ValueError("frozen snapshot digest mismatch")
     model, metadata = load_scalar_checkpoint(checkpoint_path, snapshot, device)
+    if _method_config:
+        metadata.update(_method_config)
     items, source_manifest = _pilot_items(store)
     items = [i for i in items if i["ordinal"] % SHARD_COUNT == shard_index][:root_limit]
     source_rows = {r["rollout_id"]: r for r in tree._source_rows(store)}
@@ -156,7 +160,9 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
         train, validation = _split_groups([g for g in snapshot["groups"] if g["source_experiment"] == source])
         split.update({gid: "train" for gid in train})
         split.update({gid: "validation" for gid in validation})
-    experiment = EXPERIMENT + "-" + metadata["critic_sha256"][:16]
+    experiment = _experiment_base + "-" + metadata["critic_sha256"][:16]
+    if _method_config:
+        experiment += "-" + tree._digest(_method_config)[:12]
     manifest = tree._digest({"source_manifest": source_manifest, "critic": {k: v for k, v in metadata.items() if k != "checkpoint_path"},
                             "kinds": sorted(KINDS)})
     destination = Path(cache_root) / ROOT_CACHE_FORMAT / claimed
@@ -190,7 +196,7 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
     print(json.dumps(result, indent=2), flush=True)
     if not run_intervention:
         return result
-    if not all(r["gradient_usable"] for r in diagnostics):
+    if _proposal_generator is None and not all(r["gradient_usable"] for r in diagnostics):
         raise ValueError("unusable gradient; simulator collection refused")
     from . import libero_env, models
     from .smolvla_tree_source_experiment import prepare_smolvla_tree_source_episodes
@@ -198,8 +204,10 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
         raise RuntimeError("intervention requires a CUDA runtime with NVIDIA EGL")
     episodes = {(e["suite"], e["task_idx"], e["ep_idx"]): e for e in prepare_smolvla_tree_source_episodes()}
     policy, preprocess, postprocess = models.load_smolvla()
-    store.start_run("smolvla_postgeneration_pcp_pilot", "libero", experiment, config=result)
+    driver = "smolvla_flow_step_pcp_pilot" if _proposal_generator else "smolvla_postgeneration_pcp_pilot"
+    store.start_run(driver, "libero", experiment, config=result)
     status = "failed"
+    started = time.monotonic()
     try:
         for item, source_row, row, direction, report in planned:
             from .verifier.collection import candidate_group_id
@@ -224,7 +232,14 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
             if not np.array_equal(valid, row["action_valid"][0]) or not np.allclose(source["policy_chunk"][:10, :7][valid], row["actions"][0][valid], atol=1e-6):
                 raise ValueError("cached proposal and immutable replay source disagree")
             seed = tree._seed("pcp-pilot-random", item["source_rollout_id"], item["chunk_idx"])
-            extras = controlled_chunks(source["policy_chunk"], direction, valid, seed)
+            if _proposal_generator is None:
+                extras = controlled_chunks(source["policy_chunk"], direction, valid, seed)
+            else:
+                print({"phase": "flow_candidate_generation", "source_group_id": report["source_group_id"],
+                       "completed_roots": len(result["intervention_outcomes"]), "requested_roots": len(planned)}, flush=True)
+                extras = _proposal_generator(policy=policy, preprocess=preprocess,
+                    item=item, bundle=bundle, source=source, row=row, critic=model,
+                    valid=valid, random_seed=seed)
             ep = episodes[(item["suite"], item["task_idx"], item["episode_idx"])]
             env = libero_env.make_env(ep["bddl_path"])
             try:
@@ -245,9 +260,16 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
                 "success_by_control": {c["candidate_kind"]: c["success"] for c in candidates},
                 "steps_by_control": {c["candidate_kind"]: c["n_steps"] for c in candidates}})
             result["new_roots"] += 1
+            print({"phase": "root_completed", "completed_roots": len(result["intervention_outcomes"]),
+                   "requested_roots": len(planned), "elapsed_minutes": round((time.monotonic() - started) / 60, 1),
+                   "success_by_control": result["intervention_outcomes"][-1]["success_by_control"]}, flush=True)
         store._upload(f"smolvla_pcp_pilot/reports/{experiment}/shard_{shard_index}.json",
                       json.dumps(result, sort_keys=True).encode())
         status = "completed"
+        print({"phase": "intervention_completed", "new_roots": result["new_roots"],
+               "complete_roots": len(result["intervention_outcomes"]),
+               "successes_by_control": {kind: sum(bool(r["success_by_control"].get(kind, False))
+                                                 for r in result["intervention_outcomes"]) for kind in sorted(KINDS)}}, flush=True)
     finally:
         store.finish_run(status=status, n_rollouts=result["new_roots"] * (len(KINDS) - 1))
         Path(output_path).write_text(json.dumps(result, indent=2))
