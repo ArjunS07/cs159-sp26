@@ -93,6 +93,18 @@ with the approved 45-minute limits. The smoke root is resumed without duplicate
 collection. Runtime may yield only a partial cohort; report actual completed
 roots and deterministic order/time-limit truncation, without extending spend.
 
+The user subsequently explicitly approved finishing all 42 roots with longer
+limits and requested frequent result updates. Future invocations now have a
+90-minute limit. The local `scripts/resume_modal_smolvla_flow_pcp.py` supervisor
+waits for the original app to have zero containers, stops it, checks complete
+groups, then resumes the same three shards. Complete roots are skipped using
+the nine-candidate artifact/checkpoint contract; an interrupted incomplete root
+may need to be repeated. No overlapping old/new workers are launched.
+Supervisor log: `/Users/arjunsharma/pnp-vla-runs/diagnostics/modal_pcp_completion_resume.log`.
+The additional cost estimate is $1–$2 based on observed runtime, not actual
+billing. The earlier partial-cohort stop instruction is superseded by this
+explicit completion approval. Progress monitoring now runs every five minutes.
+
 The local CNN extension completed 8,000 additional MC updates: training selected
 854/1,280 versus 832 stock (37 rescues, 15 spoils), fresh pair accuracy .7398;
 validation selected 198/320 versus 209 stock (6 rescues, 17 spoils), fresh pair

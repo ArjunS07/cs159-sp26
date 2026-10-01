@@ -32,7 +32,7 @@ app = modal.App("smolvla-focused-flow-pcp")
 
 
 @app.function(image=image, gpu="L4", cpu=(2, 2), memory=(16384, 16384),
-              timeout=2700, startup_timeout=600, retries=0,
+              timeout=5400, startup_timeout=600, retries=0,
               max_containers=3, single_use_containers=True, scaledown_window=2,
               secrets=[modal.Secret.from_name("pnp-supabase")])
 def worker(shard_index: int, root_limit: int | None = None) -> dict:
