@@ -266,3 +266,19 @@ Regenerate the launchers after an intentional bootstrap change with:
 ```bash
 python scripts/generate_colab_workers.py
 ```
+# Focused follow-up workers (122–123)
+
+- `122_smolvla_focused_flow_pcp_eval.ipynb`: real flow-step PCP on historically
+  mixed original validation roots, excluding prior pilot sources. Requires the
+  fixed late-fusion checkpoint SHA shown in the notebook. Preview by default;
+  opt in to intervention. Reports the actual eligible count and preserves the
+  original split. Results are an enriched exploratory comparison.
+- `123_smolvla_training_action_contrast.ipynb`: twelve original training roots
+  (six mixed, three all failures, three all successes), with smooth signed
+  translation offsets and full frozen-policy continuation artifacts in Supabase.
+  Three configurable shards; preview and one-root smoke before setting
+  `TREE_LIMIT = None`. New data is staged separately from ongoing training.
+
+Short PCP runs can instead use `scripts/modal_smolvla_flow_pcp.py` after explicit
+spending approval. The checkpoint is uploaded only for the approved run; code
+uploads exclude dotenv files. See `docs/smolvla_focused_followup_20260930.md`.

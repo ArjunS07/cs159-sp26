@@ -135,11 +135,22 @@ def controlled_chunks(stock, direction, valid, seed):
     return extras
 
 
+
+def complete_candidate_contract(candidates, *, expected_critic_sha=None):
+    if len(candidates) != len(KINDS) or {c["candidate_kind"] for c in candidates} != KINDS:
+        return False
+    return all((c.get("metadata_json") or {}).get("training_data_path")
+               and (expected_critic_sha is None or
+                    (c.get("metadata_json") or {}).get("critic_sha256") == expected_critic_sha)
+               for c in candidates)
+
+
 def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
                   run_intervention=False, cache_root="/content/pcp_pilot_cache",
                   output_path="/content/pcp_pilot_report.json", device="cpu", store=None,
-                  _proposal_generator=None, _method_config=None, _experiment_base=EXPERIMENT):
-    if shard_index not in range(SHARD_COUNT) or (root_limit is not None and root_limit < 1):
+                  _proposal_generator=None, _method_config=None, _experiment_base=EXPERIMENT,
+                  _cohort_provider=None, _shard_count=SHARD_COUNT, _expected_checkpoint_sha=None):
+    if _shard_count < 1 or shard_index not in range(_shard_count) or (root_limit is not None and root_limit < 1):
         raise ValueError("invalid shard/root limit")
     store = store or SupabaseStore()
     # Read an already frozen manifest; never create a new training snapshot here.
@@ -148,10 +159,18 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
     if _json_digest({k: v for k, v in snapshot.items() if k != "snapshot_digest"}) != claimed:
         raise ValueError("frozen snapshot digest mismatch")
     model, metadata = load_scalar_checkpoint(checkpoint_path, snapshot, device)
+    if _expected_checkpoint_sha and metadata["critic_sha256"] != _expected_checkpoint_sha:
+        raise ValueError("checkpoint SHA256 differs from the predeclared focused protocol")
     if _method_config:
         metadata.update(_method_config)
-    items, source_manifest = _pilot_items(store)
-    items = [i for i in items if i["ordinal"] % SHARD_COUNT == shard_index][:root_limit]
+    cohort_document = None
+    if _cohort_provider:
+        cohort_document = _cohort_provider(snapshot, store, metadata)
+        items, source_manifest = cohort_document["items"], cohort_document["manifest_hash"]
+        metadata["selection_audit"] = cohort_document["audit"]
+    else:
+        items, source_manifest = _pilot_items(store)
+    items = [i for i in items if i["ordinal"] % _shard_count == shard_index][:root_limit]
     source_rows = {r["rollout_id"]: r for r in tree._source_rows(store)}
     groups_by_key = {(g["suite"], g["task_idx"], g["episode_idx"], g["chunk_idx"],
                       g["source_training_data_path"]): g for g in snapshot["groups"]}
@@ -189,13 +208,26 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
         diagnostics.append(report)
         planned.append((item, source_row, row, direction, report))
     result = {"experiment": experiment, "manifest_hash": manifest, **metadata,
-              "shard_index": shard_index, "shard_count": SHARD_COUNT,
+              "shard_index": shard_index, "shard_count": _shard_count,
+              "cohort_manifest": cohort_document,
               "benchmark": diagnostics, "run_intervention": run_intervention, "new_roots": 0,
               "intervention_outcomes": []}
     Path(output_path).write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2), flush=True)
     if not run_intervention:
         return result
+    if cohort_document:
+        path = f"smolvla_pcp_pilot/manifests/{experiment}/{source_manifest}.json"
+        encoded = json.dumps(cohort_document, sort_keys=True).encode()
+        try:
+            existing_manifest = json.loads(_download_with_retry(store, path))
+        except Exception as error:
+            if not any(t in str(error).lower() for t in ("404", "not found", "does not exist")):
+                raise
+            store._upload(path, encoded)
+            existing_manifest = json.loads(_download_with_retry(store, path))
+        if existing_manifest != cohort_document:
+            raise ValueError("immutable focused cohort manifest differs")
     if _proposal_generator is None and not all(r["gradient_usable"] for r in diagnostics):
         raise ValueError("unusable gradient; simulator collection refused")
     from . import libero_env, models
@@ -220,7 +252,7 @@ def run_pcp_pilot(*, checkpoint_path, shard_index=0, root_limit=1,
                     raise ValueError("existing pilot group has a different contract")
                 candidates = store.fetch_all("verifier_candidates", "candidate_kind,metadata_json,success,n_steps",
                                             configure=lambda q: q.eq("candidate_group_id", gid), order_by=("candidate_kind",))
-                if len(candidates) == len(KINDS) and {c["candidate_kind"] for c in candidates} == KINDS and all((c.get("metadata_json") or {}).get("training_data_path") for c in candidates):
+                if complete_candidate_contract(candidates, expected_critic_sha=_expected_checkpoint_sha):
                     result["intervention_outcomes"].append({"candidate_group_id": gid,
                         "original_split": report["original_split"], "resumed_complete": True,
                         "success_by_control": {c["candidate_kind"]: c["success"] for c in candidates},
