@@ -13,17 +13,19 @@ SHA = "9b8800bc9f27116afcb1812f93f8a9f6767ac012c7cdac790502032fbb7d0c8e"
 CHECKPOINT = (Path.home() / "pnp-vla-runs/checkpoints"
               / "smolvla-overnight-20260930-mc_roots_late"
               / "671b5b211099997fc83d1277/mc/latest.pt")
-if not CHECKPOINT.is_file() or hashlib.sha256(CHECKPOINT.read_bytes()).hexdigest() != SHA:
+if modal.is_local() and (not CHECKPOINT.is_file() or hashlib.sha256(CHECKPOINT.read_bytes()).hexdigest() != SHA):
     raise ValueError("The approved frozen late-fusion checkpoint is missing or changed")
 
 image = (modal.Image.debian_slim(python_version="3.13")
-    .apt_install("git", "ffmpeg", "libegl1", "libgl1", "libglib2.0-0")
+    .apt_install("git", "ffmpeg", "libegl1", "libgl1", "libglib2.0-0",
+                 "cmake", "build-essential", "libegl1-mesa-dev", "libgl1-mesa-dev")
     .env({"PYTHONPATH": "/root/pnp-vla", "MUJOCO_GL": "egl",
           "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,graphics",
           "TOKENIZERS_PARALLELISM": "false", "OMP_NUM_THREADS": "2"})
     .add_local_file(str(ROOT / "pyproject.toml"), "/root/pnp-vla/pyproject.toml", copy=True)
     .add_local_file(str(ROOT / "README.md"), "/root/pnp-vla/README.md", copy=True)
-    .add_local_dir(str(ROOT / "pnp"), "/root/pnp-vla/pnp", copy=True)
+    .add_local_dir(str(ROOT / "pnp"), "/root/pnp-vla/pnp", copy=True,
+                   ignore=["**/__pycache__/**", "**/*.pyc"])
     .run_commands("python -m pip install '/root/pnp-vla[sim]'", "python -m pip uninstall -y torchao")
     .add_local_file(str(CHECKPOINT), "/root/critic.pt"))
 app = modal.App("smolvla-focused-flow-pcp")
@@ -31,7 +33,7 @@ app = modal.App("smolvla-focused-flow-pcp")
 
 @app.function(image=image, gpu="L4", cpu=(2, 2), memory=(16384, 16384),
               timeout=2700, startup_timeout=600, retries=0,
-              max_containers=3, single_use_containers=True, scaledown_window=1,
+              max_containers=3, single_use_containers=True, scaledown_window=2,
               secrets=[modal.Secret.from_name("pnp-supabase")])
 def worker(shard_index: int, root_limit: int | None = None) -> dict:
     import os
