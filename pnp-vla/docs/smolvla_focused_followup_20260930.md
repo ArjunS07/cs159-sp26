@@ -72,4 +72,30 @@ timeout, no automatic retries, at most three containers, and single-use workers.
 Explicit spending approval is required before the smoke and full calls.
 Current allocation rate is about $1.02/worker-hour. Expected total is $1–$3;
 the requested $5 operational stop limit is not a provider-enforced billing cap.
-No paid build, checkpoint upload, or GPU call has been performed in preparation.
+## Execution status after explicit approval
+
+The user approved the bounded Modal pilot. The smoke completed one validation
+root in 6.3 minutes. All nine candidate artifacts were saved to Supabase under
+`smolvla-libero-focused-validation-flow-pcp-v1-9b8800bc9f27116a-d4e3295d4fc3`.
+Live zero exactly reproduced the full baseline action chunk. All correction
+controls shared initial noise, clean estimate and probe epsilon; the sampler
+also checked the final perturbation RNG state. Observed latent correction RMS
+was .006/.018 for clean action RMS .02/.06, with finite gradients and Q values.
+
+Live zero failed on this root. Both ascent and descent magnitudes succeeded;
+large random and fresh sampling also succeeded, while small random failed.
+This demonstrates perturbation sensitivity, not a useful gradient direction.
+
+The cohort audit confirmed 42 unique validation roots, eight historical stock
+failures and 34 successes, in three disjoint shards of 14. The full workers
+were dispatched at https://modal.com/apps/arjuns07/main/ap-fR5mrDo1v52MGahm5RRi3F
+with the approved 45-minute limits. The smoke root is resumed without duplicate
+collection. Runtime may yield only a partial cohort; report actual completed
+roots and deterministic order/time-limit truncation, without extending spend.
+
+The local CNN extension completed 8,000 additional MC updates: training selected
+854/1,280 versus 832 stock (37 rescues, 15 spoils), fresh pair accuracy .7398;
+validation selected 198/320 versus 209 stock (6 rescues, 17 spoils), fresh pair
+accuracy .5016 and Brier .1353. It overfits and is not promoted into this PCP
+experiment. The separately initialized TD continuation is still running;
+these arms differ in architecture/data and are not a matched objective test.
