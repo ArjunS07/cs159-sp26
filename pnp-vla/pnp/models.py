@@ -100,8 +100,8 @@ def load_smolvla(device=None, repo_id: str = SMOLVLA_REPO_ID,
     if repo_id == SMOLVLA_REPO_ID and revision is None:
         revision = '6721902bc4d61e50a3bfdb11dfb4cb626f05d102'
     snapshot_path = _ensure_hf_weights(repo_id, revision=revision)
-    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-    cfg = SmolVLAConfig.from_pretrained(snapshot_path)
+    from lerobot.configs.policies import PreTrainedConfig
+    cfg = PreTrainedConfig.from_pretrained(snapshot_path)
     if cfg.vlm_model_name == 'HuggingFaceTB/SmolVLM2-500M-Instruct':
         cfg.vlm_model_name = _ensure_hf_weights(
             cfg.vlm_model_name, revision='7b375e1b73b11138ff12fe22c8f2822d8fe03467')
