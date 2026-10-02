@@ -140,7 +140,7 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
               compute_multimodal: bool = False, suffix_probe_samples: int = 0,
               prefix_horizon: int | None = None,
               temporal_update_weights: torch.Tensor | None = None,
-              generators=None) -> ProbeResult:
+              generators=None, record_telemetry: bool = True) -> ProbeResult:
     """Run K predict-and-perturb iterations at fixed noise level s and measure uncertainty.
 
         predict:  a_hat = x - s * v(x, s)
@@ -192,6 +192,14 @@ def run_probe(x_t, s, vfield, *, k: int, adim: int = ADIM,
         d_consecutive = torch.zeros_like(A[:1])
         u_consecutive = torch.zeros_like(A[0]); a_std = torch.zeros_like(A[0])
     u_time = u_consecutive.mean(dim=(0, 2))
+
+    if not record_telemetry:
+        if compute_multimodal or suffix_probe_samples:
+            raise ValueError("diagnostic probes require telemetry")
+        result = ProbeResult(a_hats=A, z_hat_full=z_hat_full, x_acc=x_acc,
+                             last_eps=last_eps, u_time=u_time, s=float(s), rec={"s":float(s)})
+        result.lane_recs = [{} for _ in range(A.shape[1])]
+        return result
 
     rec = {
         "s": float(s),

@@ -98,6 +98,10 @@ def set_camera_observables(env, enabled: bool) -> bool:
     Returns False when the installed robosuite exposes no observable toggle, so callers can fall
     back to always rendering rather than silently feeding the policy a missing image.
     """
+    remote = getattr(env, "_pnp_set_camera_observables", None)
+    if remote is not None:
+        return remote(enabled)
+
     target = getattr(env, "env", env)
     modify = getattr(target, "modify_observable", None)
     if not callable(modify):

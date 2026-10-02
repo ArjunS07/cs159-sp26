@@ -410,6 +410,10 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                             raise ValueError(
                                 "qplanning_ckpt_id requires a loaded qplanning_scorer")
                         from .qplanning_critic.inference import qplanning_select
+                        set_remaining = getattr(
+                            config.qplanning_scorer, "set_remaining_fraction", None)
+                        if set_remaining is not None:
+                            set_remaining((max_steps - step) / max_steps)
                         candidate_noises = torch.cat([
                             _noise_of(index) for index in range(config.num_samples)], dim=0)
                         policy_proprio = policy_observation["observation.state"]
@@ -495,6 +499,10 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                 else:
                     batch = preprocess(policy_observation)
                     if config.q_guidance_ckpt_id is not None:
+                        set_remaining = getattr(
+                            config.q_guidance_scorer, "set_remaining_fraction", None)
+                        if set_remaining is not None:
+                            set_remaining((max_steps - step) / max_steps)
                         policy_proprio = policy_observation["observation.state"]
                         if torch.is_tensor(policy_proprio):
                             policy_proprio = policy_proprio.detach().cpu().numpy()
@@ -773,7 +781,7 @@ def _stack_batches(items):
 
 
 def _stack_policy_batches(items: list[dict]) -> dict[str, torch.Tensor]:
-    """Batch only the tensor fields consumed by ``PI05Policy.predict_action_chunk``.
+    """Batch tensor policy inputs, padding variable-length task text with masked tokens.
 
     LeRobot's preprocessor returns a canonical transition batch, which also includes bookkeeping
     fields such as reward/done/info.  A singleton policy call ignores those non-tensor fields;
@@ -786,15 +794,32 @@ def _stack_policy_batches(items: list[dict]) -> dict[str, torch.Tensor]:
     keys = set(items[0])
     if any(set(item) != keys for item in items):
         raise ValueError("preprocessor output keys differ across lanes")
-    return {
-        key: _stack_batches([item[key] for item in items])
-        for key in sorted(keys)
-        if all(isinstance(item[key], torch.Tensor) for item in items)
-    }
+    result = {}
+    language_keys = {'observation.language.tokens', 'observation.language.attention_mask'}
+    lengths = [item['observation.language.tokens'].shape[1] for item in items] if 'observation.language.tokens' in keys else None
+    for key in sorted(keys):
+        values = [item[key] for item in items]
+        if not all(isinstance(value, torch.Tensor) for value in values):
+            continue
+        if key in language_keys and lengths is not None:
+            if any(value.ndim != 2 or value.shape[1] != length for value, length in zip(values, lengths)):
+                raise ValueError(f'Inconsistent token/mask shapes for {key}')
+            if 'observation.language.attention_mask' not in keys:
+                raise ValueError('Language tokens require an attention mask for batched padding')
+            # Right padding preserves every existing token and position. Token ID zero is
+            # a valid vocabulary index; appended positions are masked out, regardless of
+            # the tokenizer's pad ID. Mask padding must be false, never a valid token.
+            width = max(lengths)
+            values = [torch.nn.functional.pad(value, (0, width-value.shape[1]), value=0)
+                      for value in values]
+        result[key] = _stack_batches(values)
+    return result
+
 
 
 def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
-                      config: RolloutConfig | None = None):
+                      config: RolloutConfig | None = None, *, tap_factory=None,
+                      env_step_executor=None):
     """Run independent environments with one shared, truly batched policy invocation.
 
     Results preserve input order. Multi-sample and learned-PCP selection intentionally use the
@@ -803,7 +828,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
     config = config or RolloutConfig()
     if len(envs) != len(episodes) or not episodes:
         raise ValueError("envs and episodes must have the same non-zero length")
-    if len(episodes) == 1:
+    if len(episodes) == 1 and tap_factory is None and env_step_executor is None:
         return [_run_episode_serial(envs[0], episodes[0], policy, preprocess,
                                     postprocess, device, config)]
     if (config.num_samples is not None or config.correction_lambda is not None
@@ -833,6 +858,8 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
     recorders = [PnPRecorder() for _ in episodes]
     for recorder, ep in zip(recorders, episodes):
         recorder.new_episode(meta={k: ep.get(k) for k in ("suite", "task_idx", "ep_idx")})
+    batch_started = time.perf_counter()
+    batch_profile = dict(initialization_s=0., preprocessing_s=0., inference_s=0., simulator_s=0.)
     states = []
     now = lambda: dt.datetime.now(dt.timezone.utc).isoformat()
     for env, ep, seed in zip(envs, episodes, seeds):
@@ -853,6 +880,9 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                      consensus_gate_records=[],
                      started_at=now(), t0=time.time(), done=False,
                      skip_rendering=False)
+        states.append(state)
+    def initialize_lane(i):
+        env, ep, state = envs[i], episodes[i], states[i]
         try:
             env.reset()
             state["obs"] = env.set_init_state(ep["init_state"])
@@ -875,13 +905,18 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
         except Exception as exc:
             state.update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
                          terminated_reason="error", done=True)
-        states.append(state)
+    if env_step_executor is None:
+        for i in range(len(states)): initialize_lane(i)
+    else:
+        list(env_step_executor.map(initialize_lane, range(len(states))))
+    batch_profile['initialization_s'] = time.perf_counter()-batch_started
     policy.reset()
 
     while any(not state["done"] for state in states):
         infer_ids = [i for i, state in enumerate(states)
                      if not state["done"] and not state["queue"]]
         if infer_ids:
+            preprocessing_started = time.perf_counter()
             batches, noises, positions = [], [], []
             for i in infer_ids:
                 ep, state = episodes[i], states[i]
@@ -896,6 +931,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                         policy_observation))
                 batches.append(preprocess(policy_observation))
                 positions.append(min(state["ci"] / max(1, round(ep["max_steps"] / chunk_size)), 1.0))
+            batch_profile['preprocessing_s'] += time.perf_counter()-preprocessing_started
             tap = (BatchedRolloutTap(config, [recorders[i] for i in infer_ids],
                                      [states[i]["perturb_gen"] for i in infer_ids], device, adim,
                                      previous_projected=[
@@ -904,6 +940,14 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                    if (config.has_probe or config.consensus_candidate_count is not None
                        or config.temporal_overlap_consensus)
                    else None)
+            if tap_factory is not None:
+                tap = tap_factory(
+                    config=config, recorders=[recorders[i] for i in infer_ids],
+                    seeds=[states[i]["perturb_gen"] for i in infer_ids], device=device,
+                    adim=adim, episodes=[episodes[i] for i in infer_ids],
+                    observations=[states[i]["obs"] for i in infer_ids],
+                    steps=[states[i]["step"] for i in infer_ids],
+                    chunk_indices=[states[i]["ci"] for i in infer_ids], lane_ids=infer_ids)
             _sampler.set_strategy(model, tap)
             model._pnp.chunk_pos = positions
             before_vf = model._pnp.vf_evals
@@ -919,6 +963,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 infer_ms = (time.perf_counter() - started) * 1000.0
                 vf_delta = model._pnp.vf_evals - before_vf
                 arrays = chunks.detach().cpu().numpy()
+                batch_profile['inference_s'] += time.perf_counter()-started
                 for lane, i in enumerate(infer_ids):
                     state = states[i]; arr = arrays[lane]
                     state["inference_ms"] += infer_ms
@@ -975,7 +1020,9 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
         processed = postprocess(torch.cat(raw, dim=0))
         if isinstance(processed, torch.Tensor): processed = processed.detach().cpu().numpy()
         processed = np.asarray(processed)
-        for lane, i in enumerate(step_ids):
+        simulator_started = time.perf_counter()
+        def advance_lane(pair):
+            lane, i = pair
             env, ep, state = envs[i], episodes[i], states[i]
             a, obs = np.asarray(processed[lane]), state["obs"]
             try:
@@ -1014,6 +1061,14 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
             except Exception as exc:
                 state.update(status="errored", error_msg=f"{type(exc).__name__}: {exc}",
                              terminated_reason="error", done=True)
+
+        if env_step_executor is None:
+            for pair in enumerate(step_ids):
+                advance_lane(pair)
+        else:
+            # Intended for subprocess environment proxies; each lane owns its state.
+            list(env_step_executor.map(advance_lane, enumerate(step_ids)))
+        batch_profile['simulator_s'] += time.perf_counter()-simulator_started
 
     # `_run_collection` reuses each environment for later episodes. Restore camera observables
     # even when an episode terminated while most of its queued actions remained unexecuted.
@@ -1130,6 +1185,10 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
             }
         if config.save_pcp_features: result["pcp_chunks"] = state.get("pcp_chunks", [])
         results.append(result)
+    batch_profile['total_s'] = time.perf_counter()-batch_started
+    for result in results: result['batch_performance'] = dict(batch_profile)
+    if tap_factory is not None:
+        print('[batch performance]', {key:round(value,2) for key,value in batch_profile.items()}, flush=True)
     return results
 
 

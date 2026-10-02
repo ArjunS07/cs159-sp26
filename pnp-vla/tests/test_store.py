@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -60,6 +61,55 @@ class StoreSerializationTests(unittest.TestCase):
         self.assertEqual(files.calls, 2)
         self.assertEqual(store._bytes_written, 3)
         sleep.assert_called_once_with(1)
+
+    @patch("pnp.store.time.sleep")
+    def test_upload_retries_non_json_server_error(self, sleep):
+        class Files:
+            calls = 0
+
+            def upload(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    request = httpx.Request("POST", "https://example.test/object")
+                    response = httpx.Response(503, text="<html>unavailable</html>", request=request)
+                    status_error = httpx.HTTPStatusError("unavailable", request=request, response=response)
+                    raise json.JSONDecodeError("Expecting value", "", 0) from status_error
+
+        files = Files()
+        store = SupabaseStore.__new__(SupabaseStore)
+        store.client = SimpleNamespace(storage=SimpleNamespace(from_=lambda _bucket: files))
+        store.bucket = "artifacts"
+        store._bytes_written = 0
+
+        store._upload("x", b"abc", attempts=2)
+
+        self.assertEqual(files.calls, 2)
+        self.assertEqual(store._bytes_written, 3)
+        sleep.assert_called_once_with(1)
+
+    @patch("pnp.store.time.sleep")
+    def test_upload_reports_non_json_permanent_error(self, sleep):
+        class Files:
+            calls = 0
+
+            def upload(self, *_args, **_kwargs):
+                self.calls += 1
+                request = httpx.Request("POST", "https://example.test/object")
+                response = httpx.Response(413, text="too large", request=request)
+                status_error = httpx.HTTPStatusError("too large", request=request, response=response)
+                raise json.JSONDecodeError("Expecting value", "", 0) from status_error
+
+        files = Files()
+        store = SupabaseStore.__new__(SupabaseStore)
+        store.client = SimpleNamespace(storage=SimpleNamespace(from_=lambda _bucket: files))
+        store.bucket = "artifacts"
+        store._bytes_written = 0
+
+        with self.assertRaisesRegex(RuntimeError, r"HTTP 413.*key='x'.*bytes=3"):
+            store._upload("x", b"abc", attempts=5)
+
+        self.assertEqual(files.calls, 1)
+        sleep.assert_not_called()
 
     def test_large_training_artifact_round_trips_through_multipart_storage(self):
         rng = np.random.default_rng(7)

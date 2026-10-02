@@ -1,0 +1,372 @@
+{
+  "standard_error_unit": "episode/root; nine candidates clustered within each root",
+  "interpretation": "Conditional on these trained checkpoints; not training-seed uncertainty. Reused validation is exploratory.",
+  "models": {
+    "pcp_frozen_late_mc": {
+      "train": {
+        "episodes": 1280,
+        "candidate_outcomes": 11520,
+        "brier": {
+          "mean": 0.09172567285869053,
+          "standard_error": 0.004551248082277691,
+          "episodes": 1280
+        },
+        "mc_log_loss": {
+          "mean": 0.2980218532899038,
+          "standard_error": 0.013387481726091159,
+          "episodes": 1280
+        },
+        "classification_error": {
+          "mean": 0.12534722222222222,
+          "standard_error": 0.007010365759714101,
+          "episodes": 1280
+        },
+        "auroc": {
+          "mean": 0.9409671714055197,
+          "standard_error": 0.004710924660220804,
+          "episodes": 1280,
+          "bootstrap_replicates": 1000,
+          "seed": 73026
+        },
+        "action_pair_accuracy": {
+          "mean": 0.5026171066252588,
+          "standard_error": 0.013864678807832365,
+          "episodes": 368
+        },
+        "selected_success_rate": {
+          "mean": 0.61328125,
+          "standard_error": 0.01361733701555417,
+          "episodes": 1280
+        },
+        "fresh_gradient_pair_accuracy": {
+          "mean": 0.5051823638042475,
+          "standard_error": 0.014512462172109143,
+          "episodes": 361
+        },
+        "logit_gradient_standardized_L2": {
+          "mean": 0.5508263053605333,
+          "standard_error": 0.01155416932341049,
+          "episodes": 1280
+        },
+        "probability_gradient_standardized_L2": {
+          "mean": 0.04122404161434755,
+          "standard_error": 0.0019898505327598653,
+          "episodes": 1280
+        },
+        "logit_gradient_median_p95": [
+          0.422942116856575,
+          1.3187113821506498
+        ],
+        "probability_gradient_median_p95": [
+          0.0160928457673368,
+          0.1770076767064046
+        ],
+        "gradient_units": "L2 norm of d(logit or probability)/d standardized action coordinates, masked to known-valid actions. CNN stock reference held fixed."
+      },
+      "validation": {
+        "episodes": 320,
+        "candidate_outcomes": 2880,
+        "brier": {
+          "mean": 0.09647333459186531,
+          "standard_error": 0.0099424401169418,
+          "episodes": 320
+        },
+        "mc_log_loss": {
+          "mean": 0.32808409793241977,
+          "standard_error": 0.031402480799688284,
+          "episodes": 320
+        },
+        "classification_error": {
+          "mean": 0.12430555555555553,
+          "standard_error": 0.014361884515190325,
+          "episodes": 320
+        },
+        "auroc": {
+          "mean": 0.9305872181869587,
+          "standard_error": 0.010806128137485778,
+          "episodes": 320,
+          "bootstrap_replicates": 1000,
+          "seed": 73026
+        },
+        "action_pair_accuracy": {
+          "mean": 0.5622165532879819,
+          "standard_error": 0.02710706145747067,
+          "episodes": 84
+        },
+        "selected_success_rate": {
+          "mean": 0.640625,
+          "standard_error": 0.026864609422436472,
+          "episodes": 320
+        },
+        "fresh_gradient_pair_accuracy": {
+          "mean": 0.574265138154027,
+          "standard_error": 0.028045832162121285,
+          "episodes": 81
+        },
+        "logit_gradient_standardized_L2": {
+          "mean": 0.588583696843125,
+          "standard_error": 0.023543498199362422,
+          "episodes": 320
+        },
+        "probability_gradient_standardized_L2": {
+          "mean": 0.04656726053464066,
+          "standard_error": 0.004633462113300296,
+          "episodes": 320
+        },
+        "logit_gradient_median_p95": [
+          0.46213266253471375,
+          1.2876524448394784
+        ],
+        "probability_gradient_median_p95": [
+          0.016359850178579077,
+          0.1922598763288664
+        ],
+        "gradient_units": "L2 norm of d(logit or probability)/d standardized action coordinates, masked to known-valid actions. CNN stock reference held fixed."
+      }
+    },
+    "cnn_mc_continuation": {
+      "train": {
+        "episodes": 1280,
+        "candidate_outcomes": 11520,
+        "brier": {
+          "mean": 0.049386106580317314,
+          "standard_error": 0.002253183022573698,
+          "episodes": 1280
+        },
+        "mc_log_loss": {
+          "mean": 0.16645977015086905,
+          "standard_error": 0.006691562130139736,
+          "episodes": 1280
+        },
+        "classification_error": {
+          "mean": 0.06553819444444445,
+          "standard_error": 0.003400814213948189,
+          "episodes": 1280
+        },
+        "auroc": {
+          "mean": 0.9797524656904191,
+          "standard_error": 0.0017588224590766015,
+          "episodes": 1280,
+          "bootstrap_replicates": 1000,
+          "seed": 73026
+        },
+        "action_pair_accuracy": {
+          "mean": 0.7425961870255348,
+          "standard_error": 0.011862065298144512,
+          "episodes": 368
+        },
+        "selected_success_rate": {
+          "mean": 0.6671875,
+          "standard_error": 0.013176148868990033,
+          "episodes": 1280
+        },
+        "fresh_gradient_pair_accuracy": {
+          "mean": 0.6614249439387944,
+          "standard_error": 0.013643690967240286,
+          "episodes": 361
+        },
+        "logit_gradient_standardized_L2": {
+          "mean": 627.1342919230461,
+          "standard_error": 8.74170571561196,
+          "episodes": 1280
+        },
+        "probability_gradient_standardized_L2": {
+          "mean": 63.02836460281385,
+          "standard_error": 2.122140635370559,
+          "episodes": 1280
+        },
+        "logit_gradient_median_p95": [
+          620.8375549316406,
+          1150.6953796386715
+        ],
+        "probability_gradient_median_p95": [
+          34.526483946986744,
+          220.15827642684593
+        ],
+        "gradient_units": "L2 norm of d(logit or probability)/d standardized action coordinates, masked to known-valid actions. CNN stock reference held fixed."
+      },
+      "validation": {
+        "episodes": 320,
+        "candidate_outcomes": 2880,
+        "brier": {
+          "mean": 0.13528146590722417,
+          "standard_error": 0.012287923380934696,
+          "episodes": 320
+        },
+        "mc_log_loss": {
+          "mean": 0.6264036124594675,
+          "standard_error": 0.06983132931359141,
+          "episodes": 320
+        },
+        "classification_error": {
+          "mean": 0.16284722222222223,
+          "standard_error": 0.015045139402602938,
+          "episodes": 320
+        },
+        "auroc": {
+          "mean": 0.8774452938749489,
+          "standard_error": 0.016469073296191655,
+          "episodes": 320,
+          "bootstrap_replicates": 1000,
+          "seed": 73026
+        },
+        "action_pair_accuracy": {
+          "mean": 0.5060846560846561,
+          "standard_error": 0.029628293320219073,
+          "episodes": 84
+        },
+        "selected_success_rate": {
+          "mean": 0.61875,
+          "standard_error": 0.027193630402775545,
+          "episodes": 320
+        },
+        "fresh_gradient_pair_accuracy": {
+          "mean": 0.47781452087007636,
+          "standard_error": 0.03036407824638731,
+          "episodes": 81
+        },
+        "logit_gradient_standardized_L2": {
+          "mean": 608.5824716329574,
+          "standard_error": 17.11574626353425,
+          "episodes": 320
+        },
+        "probability_gradient_standardized_L2": {
+          "mean": 61.23933562615673,
+          "standard_error": 4.162753154581356,
+          "episodes": 320
+        },
+        "logit_gradient_median_p95": [
+          605.3057250976562,
+          1114.2274291992192
+        ],
+        "probability_gradient_median_p95": [
+          33.06908084120104,
+          229.51331103407603
+        ],
+        "gradient_units": "L2 norm of d(logit or probability)/d standardized action coordinates, masked to known-valid actions. CNN stock reference held fixed."
+      }
+    },
+    "td_n5_continuation": {
+      "train": {
+        "episodes": 1280,
+        "candidate_outcomes": 11520,
+        "brier": {
+          "mean": 0.08129907677744061,
+          "standard_error": 0.004130241029626203,
+          "episodes": 1280
+        },
+        "mc_log_loss": {
+          "mean": 0.27778170002175623,
+          "standard_error": 0.01296364679396482,
+          "episodes": 1280
+        },
+        "classification_error": {
+          "mean": 0.10199652777777776,
+          "standard_error": 0.005915538988247515,
+          "episodes": 1280
+        },
+        "auroc": {
+          "mean": 0.9469279082714057,
+          "standard_error": 0.004336697888179354,
+          "episodes": 1280,
+          "bootstrap_replicates": 1000,
+          "seed": 73026
+        },
+        "action_pair_accuracy": {
+          "mean": 0.5027443495514148,
+          "standard_error": 0.013408608946427517,
+          "episodes": 368
+        },
+        "selected_success_rate": {
+          "mean": 0.603125,
+          "standard_error": 0.013680288758931807,
+          "episodes": 1280
+        },
+        "fresh_gradient_pair_accuracy": {
+          "mean": 0.5079623400606781,
+          "standard_error": 0.014190936753496513,
+          "episodes": 361
+        },
+        "logit_gradient_standardized_L2": {
+          "mean": 0.4400592972466256,
+          "standard_error": 0.010240297179039315,
+          "episodes": 1280
+        },
+        "probability_gradient_standardized_L2": {
+          "mean": 0.028574098757228633,
+          "standard_error": 0.0014385515308794553,
+          "episodes": 1280
+        },
+        "logit_gradient_median_p95": [
+          0.3404109477996826,
+          1.0933626353740689
+        ],
+        "probability_gradient_median_p95": [
+          0.008600883511018339,
+          0.12841235544531227
+        ],
+        "gradient_units": "L2 norm of d(logit or probability)/d standardized action coordinates, masked to known-valid actions. CNN stock reference held fixed."
+      },
+      "validation": {
+        "episodes": 320,
+        "candidate_outcomes": 2880,
+        "brier": {
+          "mean": 0.08684700243882952,
+          "standard_error": 0.009231028283177824,
+          "episodes": 320
+        },
+        "mc_log_loss": {
+          "mean": 0.30246045032242747,
+          "standard_error": 0.029591805443942895,
+          "episodes": 320
+        },
+        "classification_error": {
+          "mean": 0.11319444444444444,
+          "standard_error": 0.01340541071641857,
+          "episodes": 320
+        },
+        "auroc": {
+          "mean": 0.9357340751378741,
+          "standard_error": 0.01049826182693236,
+          "episodes": 320,
+          "bootstrap_replicates": 1000,
+          "seed": 73026
+        },
+        "action_pair_accuracy": {
+          "mean": 0.5121031746031746,
+          "standard_error": 0.033707221076293994,
+          "episodes": 84
+        },
+        "selected_success_rate": {
+          "mean": 0.625,
+          "standard_error": 0.027105679632478466,
+          "episodes": 320
+        },
+        "fresh_gradient_pair_accuracy": {
+          "mean": 0.5214212228101117,
+          "standard_error": 0.034956696806975836,
+          "episodes": 81
+        },
+        "logit_gradient_standardized_L2": {
+          "mean": 0.4870822869706899,
+          "standard_error": 0.025447043427866016,
+          "episodes": 320
+        },
+        "probability_gradient_standardized_L2": {
+          "mean": 0.0366061814566868,
+          "standard_error": 0.004064253082893619,
+          "episodes": 320
+        },
+        "logit_gradient_median_p95": [
+          0.3592257797718048,
+          1.3254773020744328
+        ],
+        "probability_gradient_median_p95": [
+          0.008843226537152133,
+          0.16744599781596695
+        ],
+        "gradient_units": "L2 norm of d(logit or probability)/d standardized action coordinates, masked to known-valid actions. CNN stock reference held fixed."
+      }
+    }
+  }
+}

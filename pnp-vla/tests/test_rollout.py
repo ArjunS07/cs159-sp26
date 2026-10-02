@@ -412,3 +412,17 @@ def test_run_episode_batch_matches_serial_under_closed_loop_horizon():
         assert lane["n_chunks"] == single["n_chunks"]
         assert np.array_equal(lane["generated_chunks"]["chunks"],
                               single["generated_chunks"]["chunks"])
+
+
+def test_stack_policy_batches_pads_mixed_task_lengths_and_masks():
+    batches=[{'observation.language.tokens':torch.tensor([[11,12,13]]),
+              'observation.language.attention_mask':torch.tensor([[True,True,True]]),
+              'observation.state':torch.ones(1,2)},
+             {'observation.language.tokens':torch.tensor([[21]]),
+              'observation.language.attention_mask':torch.tensor([[True]]),
+              'observation.state':torch.zeros(1,2)}]
+    merged=_stack_policy_batches(batches)
+    assert merged['observation.language.tokens'].tolist()==[[11,12,13],[21,0,0]]
+    assert merged['observation.language.attention_mask'].tolist()==[[True,True,True],[True,False,False]]
+    assert merged['observation.state'].shape==(2,2)
+    assert torch.equal(_stack_policy_batches([batches[1]])['observation.language.tokens'],batches[1]['observation.language.tokens'])

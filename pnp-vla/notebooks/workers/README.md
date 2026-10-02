@@ -1,10 +1,101 @@
 # Colab rollout workers
 
+## SmolVLA success Q10 and RL Token program
+
+Notebooks 109–114 pull branch `codex/smolvla-q-program` and contain only setup and
+experiment parameters; implementation lives under `pnp/`. Set Colab Secrets
+`GH_PAT`, `HF_TOKEN`, `SUPABASE_URL`, and `SUPABASE_SERVICE_KEY` before use.
+Notebook 109 requires **800 complete v4 fresh8 trees** and freezes one snapshot
+before training. The root-MC and tree-TD arms use the same roots and architecture;
+the training target differs. Compare them on the same held-out roots and run a
+nested root-count learning curve before relying on either Q.
+
+| Notebook | Role | Interpretation |
+| --- | --- | --- |
+| `109_smolvla_success_q10_fresh8_train.ipynb` | Train success Q10, root MC or tree TD | P&P proposal and P&P continuation distribution |
+| `110_smolvla_q10_pnp_gate_offline.ipynb` | Paired accept/reject audit on recorded candidates | Offline one-intervention diagnostic, not deployed success |
+| `111_smolvla_contextual_rl_token.ipynb` | Extract contextual VLM states, train reconstruction bottleneck, train root-MC Q ablation | Genuine RL Token representation pilot; source roots only |
+| `112_smolvla_q10_vanilla_rerank_transfer.ipynb` | Simulator evaluation over ordinary SmolVLA draws | Deployment uses no P&P; Q is still trained on P&P continuation, so this is a transfer test |
+| `113_smolvla_q10_pcp_gradient_diagnostic.ipynb` | Bounded offline action-gradient proposal | Score/displacement smoke only; no corrected-action outcome |
+| `114_smolvla_q10_latent_guidance_transfer.ipynb` | Live Q-gradient correction during flow denoising | Simulator pilot against paired ordinary-policy stock; not a trained PCP MLP |
+
+The final independent ordinary-policy reranker needs **ordinary-policy training
+proposals and ordinary-policy continuation outcomes**. Fresh8 does not provide
+those labels. A full PCP claim needs simulator execution of corrected chunks and
+paired controls. The RLT ablation needs live contextual-token extraction before
+its Q can be deployed; notebook 112 accepts the existing prefill-prefix Q only.
+All expensive cells are opt-in. Notebook 112 defaults to one evaluation identity
+per shard. The first 800-root root-MC run completed on snapshot
+`23241dbe9dfeaec615e1f52d`: 640 training roots, 160 validation roots,
+107/160 original successes versus 104/160 chosen by Q at 2,000 updates.
+This has not demonstrated a useful selector.
+
+Notebook 109 now exposes optimizer, evaluation, and TD root-sampling settings.
+`TREE_LIMIT=800` means 640 training and 160 validation roots; `UPDATES` is the
+number of optimizer steps. To continue a completed 2,000-step checkpoint, keep
+the same arm, snapshot, architecture, and sampling settings, set `UPDATES=5000`,
+and choose `EXTENSION_LEARNING_RATE` (for example `3e-5`). The extension uses a
+constant learning rate after step 2,000. For a fresh root-prioritized TD
+comparison, set `TD_ROOT_FRACTION` and a distinct `EXPERIMENT_TAG`; this keeps
+the existing checkpoint intact. Existing runs resume with their optimizer and
+RNG state, while changed training semantics are rejected.
+
+### Parallel scaling workflow
+
+Use three Colab runtimes concurrently: notebooks `116_*_0` and `116_*_1`
+collect new **source episodes** at indices 30–49, while notebook 115 audits the
+existing root-MC checkpoint and optionally trains a compact sigmoid Q and a
+state-only control on the same fixed 640/160 split. The 116 workers validate
+that all 40 LIBERO tasks expose every requested initial state before any rollout.
+Start each shard with `EPISODE_LIMIT=1`, inspect it, then set `None` to complete
+its 400 identities. They use the exact P&P source policy and rich artifacts of
+the original source collector in a separate Supabase experiment.
+
+After **both** source shards complete, notebooks `117_*_0`, `117_*_1`, and
+`117_*_2` use one immutable 65% high-U10 / 35% uniform root manifest. Set the
+same `SHARD_COUNT=3` in all three notebooks and distinct `SHARD_INDEX` values
+0, 1, and 2. The worker partition is computed from each root's frozen ordinal;
+the manifest hash and experiment name stay unchanged. The 800 roots are split
+267/267/266. Complete trees from the earlier two-worker run are detected and
+skipped, even when assigned to a different worker. Never run workers with
+different `SHARD_COUNT` values at the same time, since their root assignments
+can overlap. Each new tree needs all eight new P&P branches; there is no v3
+reuse. Start with `TREE_LIMIT=1`; set `None` only after a successful smoke.
+The earlier v4 one-tree smokes took 76–127 seconds while executing four new
+branches. These new trees execute eight, and simulator continuations are
+sequential, so budget using the measured 117 smoke time rather than assuming
+the old tree rate.
+The resulting 800 trees are a separate experiment. They do **not** silently
+enter notebook 109's already-frozen snapshot; combined-data training requires
+a separately frozen 1,600-root snapshot and an explicit learning-curve run.
+
+### Local combined root-MC training
+
+`scripts/train_smolvla_combined_local.py` freezes the complete 800+800 tree
+snapshot under `smolvla_trees/manifests/combined_fresh8_success_q10_1600_v1.json`.
+It builds a resumable root-only cache from each tree's saved source context and
+nine policy-space ten-action chunks, then trains the same root-MC success critic
+on the Mac Metal GPU. It keeps each cohort's deterministic 80/20 split separate
+before combining the training roots, so the original 160 validation identities
+remain held out. Checkpoints and cache default to `~/pnp-vla-runs`.
+
+From the repository root, run:
+
+```sh
+pnp-vla/.venv/bin/python pnp-vla/scripts/train_smolvla_combined_local.py
+```
+
+The command resumes its cache and training checkpoint after interruption. Use
+`--prepare-only` to build the cache without training. This is a root-MC run;
+TD still requires the much larger continuation cache. Candidate proposals and
+continuation policy remain P&P, so this does not validate ordinary-policy
+reranking or action-gradient correction.
+
 These are stable launchers for stock LIBERO and the canonical LIBERO-PRO collection. Mutable
 experiment logic lives in `pnp.experiments`; every launcher pulls `main` before importing it.
 Do not copy rollout logic into these notebooks.
 
-## SmolVLA fresh8 Q10 trees (not launched)
+## SmolVLA fresh8 Q10 trees (completed)
 
 Notebook 108 uses the 800 completed standard-LIBERO source episodes at indices 10–29. It
 reuses the frozen depth-1 root manifest: 65% high-U10 roots, 35% uniform roots, with one root
@@ -32,6 +123,31 @@ fixed after collection begins.
 | 0 | [Open fresh8 worker 0 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_0.ipynb) |
 | 1 | [Open fresh8 worker 1 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_1.ipynb) |
 | 2 | [Open fresh8 worker 2 in Colab](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/main/pnp-vla/notebooks/workers/108_smolvla_fresh8_tree_worker_2.ipynb) |
+
+### Flow-step PCP pilot (notebook 121)
+
+Use [notebook 121](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/codex/smolvla-q-program/pnp-vla/notebooks/workers/121_smolvla_flow_pcp_pilot.ipynb) for correction inside SmolVLA generation. Upload the scalar MC or TD checkpoint, set `RUN_INTERVENTION=True` on a CUDA runtime, and start with `ROOT_LIMIT=1`. The default corrects the existing K=1 P&P probe at zero-based step 3 (`s=.7`), re-noises with its shared epsilon, then completes Euler denoising. Matched controls are zero, positive/negative Q gradient and independent random directions at two strengths. Zero must exactly reproduce live P&P, including the full chunk and perturbation RNG position. Three copies use `SHARD_INDEX=0,1,2`; `ROOT_LIMIT=None` expands to six roots each.
+
+The worker saves branch artifacts and paired outcomes in a separate configuration-specific Supabase experiment and skips complete groups on restart. Progress prints after each completed root. This is a root-only intervention followed by the frozen P&P continuation; reused roots and a critic trained on completed proposals make the results exploratory. Notebook 120 remains the earlier post-generation diagnostic.
+
+### Q10 action-contrast pilot (notebook 119)
+
+The original 1,600 trees use source episode indices 10–49. Notebook 119 tests whether
+larger, controlled action differences make root outcomes more informative before
+collecting another large fresh-noise cohort. It selects 18 existing source roots
+without looking at their counterfactual outcomes, balanced across suite and
+source success where possible. Each tree has the exact stored stock chunk, one
+fresh-noise P&P candidate, and twelve smooth normalized translation offsets:
+positive/negative x, y, and z at scales 0.02 and 0.06. Every branch uses the same
+frozen P&P continuation seed. The new experiment is
+`smolvla-libero-q10-action-contrast-pilot-v1`; completed groups are skipped on
+rerun, and all branch artifacts go to Supabase. These 18 roots overlap the old
+source cohort and are a collection pilot, not an independent test set.
+
+Open [the configurable worker](https://colab.research.google.com/github/ArjunS07/cs159-sp26/blob/codex/smolvla-q-program/pnp-vla/notebooks/workers/119_smolvla_action_contrast_pilot.ipynb)
+in up to three Colab runtimes. Set distinct `SHARD_INDEX` values 0, 1, 2. Keep
+`TREE_LIMIT=1` for the first smoke run, then set it to `None` for all six roots
+assigned to each shard. Collection starts only when `RUN_COLLECTION=True`.
 
 This 800-root cohort supports a within-distribution learning curve. A later independent test
 of new initial states should collect source episodes from different episode indices and freeze
@@ -150,3 +266,19 @@ Regenerate the launchers after an intentional bootstrap change with:
 ```bash
 python scripts/generate_colab_workers.py
 ```
+# Focused follow-up workers (122–123)
+
+- `122_smolvla_focused_flow_pcp_eval.ipynb`: real flow-step PCP on historically
+  mixed original validation roots, excluding prior pilot sources. Requires the
+  fixed late-fusion checkpoint SHA shown in the notebook. Preview by default;
+  opt in to intervention. Reports the actual eligible count and preserves the
+  original split. Results are an enriched exploratory comparison.
+- `123_smolvla_training_action_contrast.ipynb`: twelve original training roots
+  (six mixed, three all failures, three all successes), with smooth signed
+  translation offsets and full frozen-policy continuation artifacts in Supabase.
+  Three configurable shards; preview and one-root smoke before setting
+  `TREE_LIMIT = None`. New data is staged separately from ongoing training.
+
+Short PCP runs can instead use `scripts/modal_smolvla_flow_pcp.py` after explicit
+spending approval. The checkpoint is uploaded only for the approved run; code
+uploads exclude dotenv files. See `docs/smolvla_focused_followup_20260930.md`.

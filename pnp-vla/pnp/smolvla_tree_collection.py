@@ -718,7 +718,9 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
                                 experiment: str = SMOLVLA_TREE_EXPERIMENT,
                                 fresh_count: int = 4,
                                 perturb_count: int = 4,
-                                fresh_start_index: int = 1) -> tuple[dict, list]:
+                                fresh_start_index: int = 1,
+                                extra_policy_chunks: dict[str, tuple[np.ndarray, dict]] | None = None,
+                                ) -> tuple[dict, list]:
     source = _source_boundary(bundle, item)
     source["perturb_seed"] = np.asarray(bundle["arrays"]["perturb_seed"])
     root_step = int(source["root_step"])
@@ -751,6 +753,21 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
 
     policy_chunks = {"stored_source": np.asarray(source["policy_chunk"], np.float32)}
     policy_chunks.update({kind: alternatives[index] for index, kind in enumerate(kinds)})
+    if extra_policy_chunks:
+        if set(extra_policy_chunks) & set(policy_chunks):
+            raise ValueError("extra candidate kind collides with a policy candidate")
+        source_shape = policy_chunks["stored_source"].shape
+        for kind, (chunk, metadata) in extra_policy_chunks.items():
+            chunk = np.asarray(chunk, np.float32)
+            if chunk.shape != source_shape or not np.isfinite(chunk).all():
+                raise ValueError(f"invalid extra policy chunk {kind}: {chunk.shape}")
+            policy_chunks[kind] = chunk
+            alternative_meta[kind] = {
+                "candidate_family": "controlled_action_perturbation",
+                "initial_noise_seed": int(source["noise_seed"]),
+                "perturbation_seed": int(np.asarray(source["perturb_seed"])),
+                **metadata,
+            }
     env_chunks = {
         kind: postprocess_chunk(chunk, postprocess, device)
         for kind, chunk in policy_chunks.items()
@@ -837,7 +854,9 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
         "task_idx": int(item["task_idx"]), "episode_idx": int(item["episode_idx"]),
         "chunk_idx": int(item["chunk_idx"]),
         "uncertainty_stratum": item["selection_strategy"],
-        "pairing_mode": ("exact_source_root_hybrid_candidates" if perturb_count
+        "pairing_mode": ("exact_source_root_controlled_action_candidates"
+                         if extra_policy_chunks else
+                         "exact_source_root_hybrid_candidates" if perturb_count
                          else "exact_source_root_fresh_noise_candidates"),
         "prefix_length": SMOLVLA_TREE_ACTIONS, "snapshot_validated": True,
         "trajectory_seed": int(item["source_episode_seed"]),
@@ -854,8 +873,10 @@ def collect_smolvla_depth1_tree(env, ep, policy, preprocess, postprocess, device
             "short_episode_root_fallback": bool(item["short_episode_root_fallback"]),
             "candidate_families": {"stored_source": 1,
                                    "fresh_initial_noise": fresh_count,
-                                   "fixed_initial_noise_new_pnp_perturbation": perturb_count},
-            "candidate_count": 1 + fresh_count + perturb_count,
+                                   "fixed_initial_noise_new_pnp_perturbation": perturb_count,
+                                   **({"controlled_action_perturbation": len(extra_policy_chunks)}
+                                      if extra_policy_chunks else {})},
+            "candidate_count": 1 + fresh_count + perturb_count + len(extra_policy_chunks or ()),
             "integration_steps": SMOLVLA_TREE_INTEGRATION_STEPS,
             "n_action_steps": SMOLVLA_TREE_ACTIONS,
             "pnp_steps": list(SMOLVLA_SCHEDULE_STEPS),
@@ -945,6 +966,8 @@ def _print_progress(store, items: list[dict]) -> tuple[set[str], str]:
     any_success = [any(values) for values in outcomes]
     failures = max(1, sum(not value for value in stock))
     pct = lambda value, denominator=len(trees): 100 * value / max(denominator, 1)
+    fresh_rescues = sum(fresh and not base for fresh, base in zip(fresh_any, stock))
+    perturb_rescues = sum(perturb and not base for perturb, base in zip(perturb_any, stock))
     table = (
         "Exact depth-1 SmolVLA trees in THIS shard; partial trees excluded.\n"
         f"trees={len(trees)}/{len(items)} | branches={len(trees) * SMOLVLA_TREE_CANDIDATES} | "
@@ -952,10 +975,8 @@ def _print_progress(store, items: list[dict]) -> tuple[set[str], str]:
         f"mixed={pct(mixed):.1f}%\n"
         f"stock SR={pct(sum(stock)):.1f}% | any-success={pct(sum(any_success)):.1f}% | "
         f"oracle gain={pct(sum(any_success)) - pct(sum(stock)):+.1f} pp\n"
-        f"among stock failures: fresh-seed any-success={pct(sum(
-            fresh and not base for fresh, base in zip(fresh_any, stock)), failures):.1f}% | "
-        f"P&P-perturb any-success={pct(sum(
-            perturb and not base for perturb, base in zip(perturb_any, stock)), failures):.1f}%"
+        f"among stock failures: fresh-seed any-success={pct(fresh_rescues, failures):.1f}% | "
+        f"P&P-perturb any-success={pct(perturb_rescues, failures):.1f}%"
     )
     return complete, table
 

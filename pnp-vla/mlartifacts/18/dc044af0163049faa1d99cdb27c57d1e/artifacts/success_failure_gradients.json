@@ -1,0 +1,131 @@
+{
+  "interpretation": "Gradients evaluated at the stock action; stratified by the eventual outcome of that stock rollout. Observational association, not correction success.",
+  "models": {
+    "pcp_frozen_late_mc": {
+      "train": {
+        "successful": {
+          "episodes": 832,
+          "mean": 0.039911205044352256,
+          "standard_error": 0.002358906862115915,
+          "median": 0.019149130630623117,
+          "p95": 0.14073505434660802,
+          "mean_logit_gradient_norm": 0.5225485799332651,
+          "mean_stock_q": 0.896496153913242
+        },
+        "unsuccessful": {
+          "episodes": 448,
+          "mean": 0.04366216667291023,
+          "standard_error": 0.0036245788339407145,
+          "median": 0.006281573161590332,
+          "p95": 0.22399428662860066,
+          "mean_logit_gradient_norm": 0.6033420811540314,
+          "mean_stock_q": 0.15949205233766822
+        }
+      },
+      "validation": {
+        "successful": {
+          "episodes": 209,
+          "mean": 0.041433203391762714,
+          "standard_error": 0.004163758568506486,
+          "median": 0.018963267564723725,
+          "p95": 0.13761815600282312,
+          "mean_logit_gradient_norm": 0.5575499772383836,
+          "mean_stock_q": 0.8687690388504186
+        },
+        "unsuccessful": {
+          "episodes": 111,
+          "mean": 0.05623408884870813,
+          "standard_error": 0.010791759364969122,
+          "median": 0.007292851867058748,
+          "p95": 0.28101184465605633,
+          "mean_logit_gradient_norm": 0.6470165562790793,
+          "mean_stock_q": 0.15180090667980894
+        }
+      }
+    },
+    "cnn_mc_continuation": {
+      "train": {
+        "successful": {
+          "episodes": 832,
+          "mean": 61.21325976432094,
+          "standard_error": 2.318778470906405,
+          "median": 38.44360648807495,
+          "p95": 197.34881559026155,
+          "mean_logit_gradient_norm": 679.6789266146146,
+          "mean_stock_q": 0.8813301240909165
+        },
+        "unsuccessful": {
+          "episodes": 448,
+          "mean": 66.3992735885864,
+          "standard_error": 4.267794200551762,
+          "median": 18.511679875765683,
+          "p95": 259.31099032897345,
+          "mean_logit_gradient_norm": 529.5513989244189,
+          "mean_stock_q": 0.22323290447547975
+        }
+      },
+      "validation": {
+        "successful": {
+          "episodes": 209,
+          "mean": 63.00096859388236,
+          "standard_error": 4.572665827064704,
+          "median": 42.28673768176638,
+          "p95": 210.17178450789373,
+          "mean_logit_gradient_norm": 678.1909391412324,
+          "mean_stock_q": 0.866267660770293
+        },
+        "unsuccessful": {
+          "episodes": 111,
+          "mean": 57.92238706530396,
+          "standard_error": 8.383014626728794,
+          "median": 9.918385769102796,
+          "p95": 250.47743875131158,
+          "mean_logit_gradient_norm": 477.5178796579172,
+          "mean_stock_q": 0.19527552207113796
+        }
+      }
+    },
+    "td_n5_continuation": {
+      "train": {
+        "successful": {
+          "episodes": 832,
+          "mean": 0.02641535766329364,
+          "standard_error": 0.0015864281277151932,
+          "median": 0.010641259803650684,
+          "p95": 0.1087005497572309,
+          "mean_logit_gradient_norm": 0.4295002111600927,
+          "mean_stock_q": 0.9198344770220579
+        },
+        "unsuccessful": {
+          "episodes": 448,
+          "mean": 0.032583189360250765,
+          "standard_error": 0.0028589089658354635,
+          "median": 0.004276903041756201,
+          "p95": 0.17194343569953008,
+          "mean_logit_gradient_norm": 0.4596690285501869,
+          "mean_stock_q": 0.14099343651251278
+        }
+      },
+      "validation": {
+        "successful": {
+          "episodes": 209,
+          "mean": 0.03115422789570197,
+          "standard_error": 0.003470390372994784,
+          "median": 0.010935791577889641,
+          "p95": 0.13834482905161938,
+          "mean_logit_gradient_norm": 0.44737719147327987,
+          "mean_stock_q": 0.8978358031376581
+        },
+        "unsuccessful": {
+          "episodes": 111,
+          "mean": 0.0468715714949375,
+          "standard_error": 0.009682528266645427,
+          "median": 0.0049337895933831725,
+          "p95": 0.18999625023577155,
+          "mean_logit_gradient_norm": 0.5618423316459935,
+          "mean_stock_q": 0.1565368308859085
+        }
+      }
+    }
+  }
+}

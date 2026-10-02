@@ -497,6 +497,21 @@ def _sample_actions_smolvla_hooked(
                 timestep=_ts,
             )
 
+        # Optional full-proposal search completes each branch to the terminal chunk,
+        # ranks terminal actions, and returns the winner without another Euler pass.
+        complete = getattr(strat, 'complete_chunk', None)
+        if complete is not None and strat.selected(step, s):
+            ctx.step = step
+            def timed_vfield(inp, level):
+                self._pnp.vf_evals += 1
+                ts = torch.tensor(level, dtype=torch.float32, device=device).expand(bsize)
+                return self.denoise_step(prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values, x_t=inp, timestep=ts)
+            completed = complete(x_t, s, vfield, timed_vfield, ctx)
+            if completed is not None:
+                strat.finish(ctx)
+                return completed
+
         selected = strat.selected(step, s)
         if selected:
             ctx.step = step
