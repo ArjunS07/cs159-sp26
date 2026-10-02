@@ -122,17 +122,20 @@ class FlowPCPTap(BatchedRolloutTap):
 
 
 def generate_flow_controls(*, policy, preprocess, item, bundle, source, row, critic,
-                           valid, random_seed, correction_step=CORRECTION_STEP, correction_mode="rms"):
+                           valid, random_seed, correction_step=CORRECTION_STEP, correction_mode="rms",
+                           task_description=None):
     """Generate complete chunks through real sampler hooks; never edit final chunks."""
     device = next(policy.model.parameters()).device
     critic_device = next(critic.parameters()).device
     # The source observation helper needs task text; recover it from the episode
     # manifest instead of inventing or reconstructing a different prompt.
-    from .smolvla_tree_source_experiment import prepare_smolvla_tree_source_episodes
-    ep = next(e for e in prepare_smolvla_tree_source_episodes() if
-              (e["suite"], e["task_idx"], e["ep_idx"]) ==
-              (item["suite"], item["task_idx"], item["episode_idx"]))
-    batch = preprocess(tree._source_policy_observation(bundle["arrays"], source["boundary_index"], ep["task_desc"]))
+    if task_description is None:
+        from .smolvla_tree_source_experiment import prepare_smolvla_tree_source_episodes
+        ep = next(e for e in prepare_smolvla_tree_source_episodes() if
+                  (e["suite"], e["task_idx"], e["ep_idx"]) ==
+                  (item["suite"], item["task_idx"], item["episode_idx"]))
+        task_description = ep["task_desc"]
+    batch = preprocess(tree._source_policy_observation(bundle["arrays"], source["boundary_index"], task_description))
     noise = tree._draw_chunk_noise(policy, device, int(source["noise_seed"]))
     generator = tree._source_perturb_generator(policy, device,
         perturb_seed=int(np.asarray(bundle["arrays"]["perturb_seed"])), completed_chunks=int(item["chunk_idx"]))

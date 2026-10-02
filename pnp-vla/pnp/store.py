@@ -475,7 +475,8 @@ class SupabaseStore:
             summary.update({f"u_mean_d{i}": float(mean_uv[i]) for i in range(ADIM)})
         return euler, vecs, summary
 
-    def log_result(self, rid: str, ep: dict, method: str, config, result: dict) -> str:
+    def log_result(self, rid: str, ep: dict, method: str, config, result: dict,
+                   *, persist_probe_rows: bool = True) -> str:
         """Map a run_episode result onto the canonical rollouts schema and persist it."""
         euler, vecs, summary = self._recorder_to_rows(result.get("recorder_episode"),
                                                        result.get("chunk_noise_seeds", []))
@@ -603,7 +604,8 @@ class SupabaseStore:
                 blobs["ahats"] = ah
         if config.save_pcp_features and result.get("pcp_chunks"):
             blobs["pcp_chunks"] = self._pcp_chunks_df(result["pcp_chunks"])
-        return self.log_episode(row, euler_steps=euler, action_vectors=vecs, blobs=blobs or None)
+        return self.log_episode(row, euler_steps=euler if persist_probe_rows else None,
+                                action_vectors=vecs if persist_probe_rows else None, blobs=blobs or None)
 
     @staticmethod
     def _pcp_chunks_df(pcp_chunks: list):

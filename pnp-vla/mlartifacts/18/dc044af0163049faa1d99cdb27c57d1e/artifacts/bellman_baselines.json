@@ -1,0 +1,635 @@
+{
+  "train_only_equal_trajectory_success_prevalence": 0.6169270833333333,
+  "baselines": {
+    "constant_zero": {
+      "train": {
+        "1": {
+          "episodes": 1280,
+          "trajectories": 3840,
+          "transitions": 58695,
+          "residual_mean": {
+            "mean": -0.09025212658292645,
+            "standard_error": 0.0025591085857655173,
+            "episodes": 1280
+          },
+          "residual_mae": {
+            "mean": 0.09025212658292645,
+            "standard_error": 0.0025591085857655173,
+            "episodes": 1280
+          },
+          "residual_mse": {
+            "mean": 0.09025212658292645,
+            "standard_error": 0.0025591085857655173,
+            "episodes": 1280
+          },
+          "residual_rmse": {
+            "value": 0.30041991708760996,
+            "standard_error_delta_method": 0.004259219246470961
+          },
+          "mc_mse": {
+            "mean": 0.6169270833333333,
+            "standard_error": 0.012565794231259756,
+            "episodes": 1280
+          },
+          "mc_rmse": {
+            "value": 0.7854470595357356,
+            "standard_error_delta_method": 0.007999135064995458
+          },
+          "terminal_mse": {
+            "mean": 0.6169270833333333,
+            "standard_error": 0.012565794231259756,
+            "episodes": 1280
+          },
+          "terminal_rmse": {
+            "value": 0.7854470595357356,
+            "standard_error_delta_method": 0.007999135064995458
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 1280
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        },
+        "5": {
+          "episodes": 1280,
+          "trajectories": 3840,
+          "transitions": 58695,
+          "residual_mean": {
+            "mean": -0.38313997319241,
+            "standard_error": 0.00899558051809626,
+            "episodes": 1280
+          },
+          "residual_mae": {
+            "mean": 0.38313997319241,
+            "standard_error": 0.00899558051809626,
+            "episodes": 1280
+          },
+          "residual_mse": {
+            "mean": 0.38313997319241,
+            "standard_error": 0.00899558051809626,
+            "episodes": 1280
+          },
+          "residual_rmse": {
+            "value": 0.6189830152697325,
+            "standard_error_delta_method": 0.007266419510861926
+          },
+          "mc_mse": {
+            "mean": 0.6169270833333333,
+            "standard_error": 0.012565794231259756,
+            "episodes": 1280
+          },
+          "mc_rmse": {
+            "value": 0.7854470595357356,
+            "standard_error_delta_method": 0.007999135064995458
+          },
+          "terminal_mse": {
+            "mean": 0.6169270833333333,
+            "standard_error": 0.012565794231259756,
+            "episodes": 1280
+          },
+          "terminal_rmse": {
+            "value": 0.7854470595357356,
+            "standard_error_delta_method": 0.007999135064995458
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 1280
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        }
+      },
+      "validation": {
+        "1": {
+          "episodes": 320,
+          "trajectories": 960,
+          "transitions": 14553,
+          "residual_mean": {
+            "mean": -0.09457847649614635,
+            "standard_error": 0.005562291990127073,
+            "episodes": 320
+          },
+          "residual_mae": {
+            "mean": 0.09457847649614635,
+            "standard_error": 0.005562291990127073,
+            "episodes": 320
+          },
+          "residual_mse": {
+            "mean": 0.09457847649614635,
+            "standard_error": 0.005562291990127073,
+            "episodes": 320
+          },
+          "residual_rmse": {
+            "value": 0.3075361385205751,
+            "standard_error_delta_method": 0.009043314416453433
+          },
+          "mc_mse": {
+            "mean": 0.6385416666666666,
+            "standard_error": 0.025184832997019742,
+            "episodes": 320
+          },
+          "mc_rmse": {
+            "value": 0.7990880218515771,
+            "standard_error_delta_method": 0.015758484865449267
+          },
+          "terminal_mse": {
+            "mean": 0.6385416666666666,
+            "standard_error": 0.025184832997019742,
+            "episodes": 320
+          },
+          "terminal_rmse": {
+            "value": 0.7990880218515771,
+            "standard_error_delta_method": 0.015758484865449267
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 320
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        },
+        "5": {
+          "episodes": 320,
+          "trajectories": 960,
+          "transitions": 14553,
+          "residual_mean": {
+            "mean": -0.39398613248073183,
+            "standard_error": 0.018096103057400437,
+            "episodes": 320
+          },
+          "residual_mae": {
+            "mean": 0.39398613248073183,
+            "standard_error": 0.018096103057400437,
+            "episodes": 320
+          },
+          "residual_mse": {
+            "mean": 0.39398613248073183,
+            "standard_error": 0.018096103057400437,
+            "episodes": 320
+          },
+          "residual_rmse": {
+            "value": 0.6276831465641975,
+            "standard_error_delta_method": 0.014414998360601691
+          },
+          "mc_mse": {
+            "mean": 0.6385416666666666,
+            "standard_error": 0.025184832997019742,
+            "episodes": 320
+          },
+          "mc_rmse": {
+            "value": 0.7990880218515771,
+            "standard_error_delta_method": 0.015758484865449267
+          },
+          "terminal_mse": {
+            "mean": 0.6385416666666666,
+            "standard_error": 0.025184832997019742,
+            "episodes": 320
+          },
+          "terminal_rmse": {
+            "value": 0.7990880218515771,
+            "standard_error_delta_method": 0.015758484865449267
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 320
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        }
+      }
+    },
+    "constant_one": {
+      "train": {
+        "1": {
+          "episodes": 1280,
+          "trajectories": 3840,
+          "transitions": 58695,
+          "residual_mean": {
+            "mean": 0.02837758877577078,
+            "standard_error": 0.0013628729300448497,
+            "episodes": 1280
+          },
+          "residual_mae": {
+            "mean": 0.02837758877577078,
+            "standard_error": 0.0013628729300448497,
+            "episodes": 1280
+          },
+          "residual_mse": {
+            "mean": 0.02837758877577078,
+            "standard_error": 0.0013628729300448497,
+            "episodes": 1280
+          },
+          "residual_rmse": {
+            "value": 0.16845648926583617,
+            "standard_error_delta_method": 0.004045177885353352
+          },
+          "mc_mse": {
+            "mean": 0.38307291666666665,
+            "standard_error": 0.012565794231259756,
+            "episodes": 1280
+          },
+          "mc_rmse": {
+            "value": 0.6189288462066271,
+            "standard_error_delta_method": 0.01015124299689266
+          },
+          "terminal_mse": {
+            "mean": 0.38307291666666665,
+            "standard_error": 0.012565794231259756,
+            "episodes": 1280
+          },
+          "terminal_rmse": {
+            "value": 0.6189288462066271,
+            "standard_error_delta_method": 0.01015124299689266
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 1280
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        },
+        "5": {
+          "episodes": 1280,
+          "trajectories": 3840,
+          "transitions": 58695,
+          "residual_mean": {
+            "mean": 0.12967006193440944,
+            "standard_error": 0.005623660282491775,
+            "episodes": 1280
+          },
+          "residual_mae": {
+            "mean": 0.12967006193440944,
+            "standard_error": 0.005623660282491775,
+            "episodes": 1280
+          },
+          "residual_mse": {
+            "mean": 0.12967006193440944,
+            "standard_error": 0.005623660282491775,
+            "episodes": 1280
+          },
+          "residual_rmse": {
+            "value": 0.36009729509454724,
+            "standard_error_delta_method": 0.0078085289157965275
+          },
+          "mc_mse": {
+            "mean": 0.38307291666666665,
+            "standard_error": 0.012565794231259756,
+            "episodes": 1280
+          },
+          "mc_rmse": {
+            "value": 0.6189288462066271,
+            "standard_error_delta_method": 0.01015124299689266
+          },
+          "terminal_mse": {
+            "mean": 0.38307291666666665,
+            "standard_error": 0.012565794231259756,
+            "episodes": 1280
+          },
+          "terminal_rmse": {
+            "value": 0.6189288462066271,
+            "standard_error_delta_method": 0.01015124299689266
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 1280
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        }
+      },
+      "validation": {
+        "1": {
+          "episodes": 320,
+          "trajectories": 960,
+          "transitions": 14553,
+          "residual_mean": {
+            "mean": 0.028540521171287647,
+            "standard_error": 0.0029032985819220257,
+            "episodes": 320
+          },
+          "residual_mae": {
+            "mean": 0.028540521171287647,
+            "standard_error": 0.0029032985819220257,
+            "episodes": 320
+          },
+          "residual_mse": {
+            "mean": 0.028540521171287647,
+            "standard_error": 0.0029032985819220257,
+            "episodes": 320
+          },
+          "residual_rmse": {
+            "value": 0.16893940088471857,
+            "standard_error_delta_method": 0.008592721907138726
+          },
+          "mc_mse": {
+            "mean": 0.3614583333333333,
+            "standard_error": 0.025184832997019742,
+            "episodes": 320
+          },
+          "mc_rmse": {
+            "value": 0.6012140495142585,
+            "standard_error_delta_method": 0.020944980425330575
+          },
+          "terminal_mse": {
+            "mean": 0.3614583333333333,
+            "standard_error": 0.025184832997019742,
+            "episodes": 320
+          },
+          "terminal_rmse": {
+            "value": 0.6012140495142585,
+            "standard_error_delta_method": 0.020944980425330575
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 320
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        },
+        "5": {
+          "episodes": 320,
+          "trajectories": 960,
+          "transitions": 14553,
+          "residual_mean": {
+            "mean": 0.1279456614119938,
+            "standard_error": 0.011754621061404253,
+            "episodes": 320
+          },
+          "residual_mae": {
+            "mean": 0.1279456614119938,
+            "standard_error": 0.011754621061404253,
+            "episodes": 320
+          },
+          "residual_mse": {
+            "mean": 0.1279456614119938,
+            "standard_error": 0.011754621061404253,
+            "episodes": 320
+          },
+          "residual_rmse": {
+            "value": 0.3576949278533228,
+            "standard_error_delta_method": 0.01643107037042524
+          },
+          "mc_mse": {
+            "mean": 0.3614583333333333,
+            "standard_error": 0.025184832997019742,
+            "episodes": 320
+          },
+          "mc_rmse": {
+            "value": 0.6012140495142585,
+            "standard_error_delta_method": 0.020944980425330575
+          },
+          "terminal_mse": {
+            "mean": 0.3614583333333333,
+            "standard_error": 0.025184832997019742,
+            "episodes": 320
+          },
+          "terminal_rmse": {
+            "value": 0.6012140495142585,
+            "standard_error_delta_method": 0.020944980425330575
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 320
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        }
+      }
+    },
+    "train_prevalence": {
+      "train": {
+        "1": {
+          "episodes": 1280,
+          "trajectories": 3840,
+          "transitions": 58695,
+          "residual_mean": {
+            "mean": -0.01706624229002183,
+            "standard_error": 0.001593220959160378,
+            "episodes": 1280
+          },
+          "residual_mae": {
+            "mean": 0.052080048440959835,
+            "standard_error": 0.0008930780564539319,
+            "episodes": 1280
+          },
+          "residual_mse": {
+            "mean": 0.02404451828604768,
+            "standard_error": 0.0004520947399502776,
+            "episodes": 1280
+          },
+          "residual_rmse": {
+            "value": 0.15506294943037707,
+            "standard_error_delta_method": 0.0014577780882249604
+          },
+          "mc_mse": {
+            "mean": 0.23632805718315972,
+            "standard_error": 0.0029385633384560574,
+            "episodes": 1280
+          },
+          "mc_rmse": {
+            "value": 0.48613584231484075,
+            "standard_error_delta_method": 0.003022368526113456
+          },
+          "terminal_mse": {
+            "mean": 0.23632805718315972,
+            "standard_error": 0.002938563338456057,
+            "episodes": 1280
+          },
+          "terminal_rmse": {
+            "value": 0.48613584231484075,
+            "standard_error_delta_method": 0.0030223685261134554
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 1280
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        },
+        "5": {
+          "episodes": 1280,
+          "trajectories": 3840,
+          "transitions": 58695,
+          "residual_mean": {
+            "mean": -0.06677357391755705,
+            "standard_error": 0.006381929343955429,
+            "episodes": 1280
+          },
+          "residual_mae": {
+            "mean": 0.2267675201272529,
+            "standard_error": 0.0026633840054924923,
+            "episodes": 1280
+          },
+          "residual_mse": {
+            "mean": 0.10557612082170376,
+            "standard_error": 0.001532706682100142,
+            "episodes": 1280
+          },
+          "residual_rmse": {
+            "value": 0.32492479256237705,
+            "standard_error_delta_method": 0.0023585560677181973
+          },
+          "mc_mse": {
+            "mean": 0.23632805718315972,
+            "standard_error": 0.0029385633384560574,
+            "episodes": 1280
+          },
+          "mc_rmse": {
+            "value": 0.48613584231484075,
+            "standard_error_delta_method": 0.003022368526113456
+          },
+          "terminal_mse": {
+            "mean": 0.23632805718315972,
+            "standard_error": 0.002938563338456057,
+            "episodes": 1280
+          },
+          "terminal_rmse": {
+            "value": 0.48613584231484075,
+            "standard_error_delta_method": 0.0030223685261134554
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 1280
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        }
+      },
+      "validation": {
+        "1": {
+          "episodes": 320,
+          "trajectories": 960,
+          "transitions": 14553,
+          "residual_mean": {
+            "mean": -0.018623032362252826,
+            "standard_error": 0.003389563257126672,
+            "episodes": 320
+          },
+          "residual_mae": {
+            "mean": 0.053837873328284304,
+            "standard_error": 0.002001852484099721,
+            "episodes": 320
+          },
+          "residual_mse": {
+            "mean": 0.024741399807201653,
+            "standard_error": 0.0010015896861825554,
+            "episodes": 320
+          },
+          "residual_rmse": {
+            "value": 0.15729399164367866,
+            "standard_error_delta_method": 0.0031838141931431092
+          },
+          "mc_mse": {
+            "mean": 0.23127339680989584,
+            "standard_error": 0.005889578133157219,
+            "episodes": 320
+          },
+          "mc_rmse": {
+            "value": 0.48090892777104466,
+            "standard_error_delta_method": 0.006123381988825524
+          },
+          "terminal_mse": {
+            "mean": 0.2312733968098958,
+            "standard_error": 0.005889578133157218,
+            "episodes": 320
+          },
+          "terminal_rmse": {
+            "value": 0.4809089277710446,
+            "standard_error_delta_method": 0.006123381988825524
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 320
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        },
+        "5": {
+          "episodes": 320,
+          "trajectories": 960,
+          "transitions": 14553,
+          "residual_mean": {
+            "mean": -0.07199227317555809,
+            "standard_error": 0.013081974351165414,
+            "episodes": 320
+          },
+          "residual_mae": {
+            "mean": 0.2298585606156692,
+            "standard_error": 0.005490564686543318,
+            "episodes": 320
+          },
+          "residual_mse": {
+            "mean": 0.10651143378288004,
+            "standard_error": 0.003225901885695683,
+            "episodes": 320
+          },
+          "residual_rmse": {
+            "value": 0.32636089499644416,
+            "standard_error_delta_method": 0.004942231031893129
+          },
+          "mc_mse": {
+            "mean": 0.23127339680989584,
+            "standard_error": 0.005889578133157219,
+            "episodes": 320
+          },
+          "mc_rmse": {
+            "value": 0.48090892777104466,
+            "standard_error_delta_method": 0.006123381988825524
+          },
+          "terminal_mse": {
+            "mean": 0.2312733968098958,
+            "standard_error": 0.005889578133157218,
+            "episodes": 320
+          },
+          "terminal_rmse": {
+            "value": 0.4809089277710446,
+            "standard_error_delta_method": 0.006123381988825524
+          },
+          "nonterminal_mse": {
+            "mean": 0.0,
+            "standard_error": 0.0,
+            "episodes": 320
+          },
+          "nonterminal_rmse": {
+            "value": 0.0,
+            "standard_error_delta_method": null
+          }
+        }
+      }
+    }
+  }
+}

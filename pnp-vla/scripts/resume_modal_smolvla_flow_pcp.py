@@ -56,7 +56,10 @@ def main():
             raise TimeoutError("Old app has not drained; refuse overlapping resume workers")
         time.sleep(30)
     # Ensure the old ephemeral app cannot schedule more work after the zero check.
-    subprocess.run([MODAL, "app", "stop", OLD_APP], check=True, timeout=60)
+    stopped = subprocess.run([MODAL, "app", "stop", OLD_APP],
+                             capture_output=True, text=True, timeout=60)
+    if stopped.returncode and "App is already stopped" not in stopped.stdout + stopped.stderr:
+        stopped.check_returncode()
     count = complete_roots()
     print({"phase": "completion_inventory", "complete_roots": count, "planned_roots": 42}, flush=True)
     if count == 42:

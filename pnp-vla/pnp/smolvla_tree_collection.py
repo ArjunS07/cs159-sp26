@@ -966,6 +966,8 @@ def _print_progress(store, items: list[dict]) -> tuple[set[str], str]:
     any_success = [any(values) for values in outcomes]
     failures = max(1, sum(not value for value in stock))
     pct = lambda value, denominator=len(trees): 100 * value / max(denominator, 1)
+    fresh_rescues = sum(fresh and not base for fresh, base in zip(fresh_any, stock))
+    perturb_rescues = sum(perturb and not base for perturb, base in zip(perturb_any, stock))
     table = (
         "Exact depth-1 SmolVLA trees in THIS shard; partial trees excluded.\n"
         f"trees={len(trees)}/{len(items)} | branches={len(trees) * SMOLVLA_TREE_CANDIDATES} | "
@@ -973,10 +975,8 @@ def _print_progress(store, items: list[dict]) -> tuple[set[str], str]:
         f"mixed={pct(mixed):.1f}%\n"
         f"stock SR={pct(sum(stock)):.1f}% | any-success={pct(sum(any_success)):.1f}% | "
         f"oracle gain={pct(sum(any_success)) - pct(sum(stock)):+.1f} pp\n"
-        f"among stock failures: fresh-seed any-success={pct(sum(
-            fresh and not base for fresh, base in zip(fresh_any, stock)), failures):.1f}% | "
-        f"P&P-perturb any-success={pct(sum(
-            perturb and not base for perturb, base in zip(perturb_any, stock)), failures):.1f}%"
+        f"among stock failures: fresh-seed any-success={pct(fresh_rescues, failures):.1f}% | "
+        f"P&P-perturb any-success={pct(perturb_rescues, failures):.1f}%"
     )
     return complete, table
 

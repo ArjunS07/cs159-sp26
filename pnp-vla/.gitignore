@@ -25,3 +25,13 @@ wandb/
 
 
 ROLLOUT_PLAN.md
+
+# Oracle-review working notes (local only)
+oracle-discussion/
+# Local credentials, downloaded checkpoint bundles and build intermediates
+.evn
+output/smolvla_pcp_a100_trial_bundle.zip
+tmp/
+output/**/*.aux
+output/**/*.log
+output/**/*.out

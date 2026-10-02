@@ -1,0 +1,6 @@
+{
+  "verified_model_splits": 6,
+  "checked_trajectories_against_existing_Bellman_audit": 30,
+  "max_MC_MSE_difference": 1.9862484691712812e-08,
+  "validity": "Sampled derivative arrays finite, correct shape, invalid slots zero; every model split has expected total chunk count."
+}
