@@ -9,7 +9,9 @@ between the established SmolVLA experiments and the newer PCP search code.
 from __future__ import annotations
 
 import collections
+import contextlib
 import hashlib
+import io
 import math
 from pathlib import Path
 from typing import Iterable
@@ -392,6 +394,7 @@ def run_independent_critic_guidance_worker(
         SMOLVLA_SCHEDULE_EXPERIMENT, build_smolvla_schedule_method)
     from .smolvla_jeff_replication import configure_precision
     from .store import SupabaseStore, gather_provenance
+    from tqdm.auto import tqdm
 
     if rollout_batch_size < 1:
         raise ValueError("rollout_batch_size must be positive")
@@ -452,6 +455,14 @@ def run_independent_critic_guidance_worker(
         key = _identity(row)
         if key in wanted and row["method"] in method_names:
             identity_outcomes[key][row["method"]] = bool(row["success"])
+    tally = collections.defaultdict(lambda: [0, 0])
+    for key, outcomes in identity_outcomes.items():
+        for method, success in outcomes.items():
+            tally[(key[0], method)][0] += 1
+            tally[(key[0], method)][1] += int(success)
+    pending = sum(
+        store.rollout_id(experiment, episode, method, config) not in done
+        for episode in episodes for method, config in methods)
 
     provenance = gather_provenance(model_repo_id=SMOLVLA_REPO_ID)
     provenance["policy_model"] = "smolvla"
@@ -491,12 +502,22 @@ def run_independent_critic_guidance_worker(
         "historical_references": list(references),
     }, flush=True)
 
-    def report():
-        print(format_matched_progress_table(
+    def report(*, through_tqdm=False):
+        table = format_matched_progress_table(
             identity_outcomes, method_names,
             {name: {key: value for key, value in ref.items() if key in wanted}
-             for name, ref in references.items()}), flush=True)
+             for name, ref in references.items()})
+        if through_tqdm:
+            tqdm.write(table)
+        else:
+            print(table, flush=True)
 
+    progress = tqdm(
+        total=pending,
+        desc=f"critic-guidance {worker_label or f'{shard_index}/{shard_count}'}",
+        unit="rollout",
+        dynamic_ncols=True,
+    )
     try:
         task_keys = sorted({(ep["suite"], ep["task_idx"]) for ep in episodes})
         for task_key in task_keys:
@@ -522,10 +543,14 @@ def run_independent_critic_guidance_worker(
                                     arm=_arm, critic=critic, correction_std=correction_std,
                                     emit=lambda lane, item: _telemetry[lane].append(item),
                                     **kwargs)
-                        results = run_episode_batch(
-                            envs[:len(group)], [item[0] for item in group], policy,
-                            preprocess, postprocess, "cuda", config,
-                            tap_factory=tap_factory)
+                        # The generic tap-aware runner prints one low-level timing line for
+                        # every batch.  Keep this notebook's output to one progress bar plus
+                        # the matched ten-identity reports.
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            results = run_episode_batch(
+                                envs[:len(group)], [item[0] for item in group], policy,
+                                preprocess, postprocess, "cuda", config,
+                                tap_factory=tap_factory)
                         for lane, ((episode, _, _, rollout_id), result) in enumerate(
                                 zip(group, results)):
                             if arm["kind"] in ("pnp", "stock_guided"):
@@ -533,33 +558,39 @@ def run_independent_critic_guidance_worker(
                                     arm, telemetry[lane])
                             store.log_result(rollout_id, episode, method, config, result)
                             completed_new += 1
+                            progress.update(1)
                             if result["status"] == "completed":
                                 key = _identity(episode)
                                 was_complete = set(method_names).issubset(identity_outcomes[key])
                                 identity_outcomes[key][method] = bool(result["success"])
+                                counts = tally[(episode["suite"], method)]
+                                counts[0] += 1
+                                counts[1] += int(result["success"])
+                                progress.set_postfix_str(
+                                    f"{episode['suite'].removeprefix('libero_')} "
+                                    f"{method} sr={counts[1] / counts[0]:.0%} "
+                                    f"({counts[1]}/{counts[0]})",
+                                    refresh=False,
+                                )
                                 is_complete = set(method_names).issubset(identity_outcomes[key])
                                 if is_complete and not was_complete:
                                     complete_count += 1
                             else:
-                                print(
+                                tqdm.write(
                                     f"ERROR {episode['suite']} task={episode['task_idx']} "
-                                    f"ep={episode['ep_idx']} {method}: {result['error_msg']}",
-                                    flush=True)
-                            print(
-                                f"[critic-repro] {completed_new} new | {method} | "
-                                f"{episode['suite']} task {episode['task_idx']} "
-                                f"ep {episode['ep_idx']} | success={bool(result['success'])}",
-                                flush=True)
+                                    f"ep={episode['ep_idx']} {method}: {result['error_msg']}")
                             if complete_count >= next_report:
                                 while complete_count >= next_report:
                                     next_report += report_every_identities
-                                report()
+                                report(through_tqdm=True)
             finally:
                 for env in envs:
                     env.close()
     except BaseException:
         store.finish_run(status="failed", n_rollouts=completed_new)
         raise
+    finally:
+        progress.close()
     store.finish_run(status="completed", n_rollouts=completed_new)
     report()
     return {
