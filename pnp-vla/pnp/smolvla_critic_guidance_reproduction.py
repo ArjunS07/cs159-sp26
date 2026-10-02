@@ -431,6 +431,11 @@ def run_independent_critic_guidance_worker(
             store, all_episodes, experiment=SMOLVLA_SCHEDULE_EXPERIMENT,
             method=parent_method, config=parent_config),
     }
+    parent_kinds = {arm["kind"] for arm in arms}
+    if parent_kinds <= {"stock_guided"}:
+        references = {"hist stock": references["hist stock"]}
+    elif parent_kinds <= {"pnp"}:
+        references = {"hist k311": references["hist k311"]}
 
     critics = {}
     checkpoint_shas = {}
@@ -497,7 +502,10 @@ def run_independent_critic_guidance_worker(
         "identities_in_shard": len(episodes),
         "arms": [arm["name"] for arm in arms],
         "checkpoint_sha256": checkpoint_shas,
-        "parent": "P&P steps 1,2,3 / K 3,1,1; Q update at step 3",
+        "parent": (
+            "stock flow; Q update at step 3"
+            if parent_kinds <= {"stock_guided"}
+            else "P&P steps 1,2,3 / K 3,1,1; Q update at step 3"),
         "radius_units": "frozen-MC standardized RMS over first 10 policy actions",
         "historical_references": list(references),
     }, flush=True)
@@ -518,6 +526,8 @@ def run_independent_critic_guidance_worker(
         unit="rollout",
         dynamic_ncols=True,
     )
+    if complete_count:
+        report(through_tqdm=True)
     try:
         task_keys = sorted({(ep["suite"], ep["task_idx"]) for ep in episodes})
         for task_key in task_keys:
