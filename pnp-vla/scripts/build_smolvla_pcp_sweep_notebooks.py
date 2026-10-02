@@ -24,6 +24,42 @@ def save(path,cells):
   'language_info':{'name':'python'},'gpuClass':'premium'},'cells':cells},indent=1)+'\n')
 
 
+def build_single_replication_notebook():
+ """Reuse the published pins without rebuilding or republishing the code bundle."""
+ source=ROOT/'notebooks/workers/126_smolvla_jeff_stock_replication_worker_0.ipynb'
+ original=json.loads(source.read_text())['cells']
+ intro="""# Replicate Jeff's stock SmolVLA — all 400 episodes
+
+Run this notebook in one **fresh Colab GPU runtime**. Prefer **L4**, matching Jeff's GPU; if Colab assigns another GPU, the notebook prints and records it. Set `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` in Colab Secrets and enable notebook access. `HF_TOKEN` is optional. Then choose **Run all**. The exact code bundle and weights download automatically; no manual uploads are needed.
+
+This evaluates **stock VLA only: no action-changing P&P, no Q critic, no reranking**. It reconstructs the saved historical batch limits, source-run resume boundaries and rendering settings, pins Torch/CUDA and policy/tokenizer snapshots, and uses the same 400 starting states and generation seeds. Shards 0 and 1 run **sequentially** in this runtime. Do not run the separate 126 worker notebooks simultaneously with this notebook.
+
+Results and diagnostic hashes are saved to Supabase under `smolvla-libero-jeff-stock-replication-v2`. Rerunning resumes completed batches; it does not reuse the stopped v1 results. Final output compares all 400 outcomes against Jeff's **255/400**, including individual success/failure flips and seed mismatches. A partial report after shard 0 is expected.
+
+This is our best-effort historical reconstruction, not verified numerical parity. Jeff did not save all runtime versions or historical input hashes. The notebook starts no PCP sweep.
+"""
+ run="""import gc, json, torch
+from pnp.smolvla_jeff_replication import run_replication, comparison
+if torch.__version__ != '2.11.0+cu128':
+    raise RuntimeError('Restart the runtime so the pinned Torch build loads.')
+print('GPU:', torch.cuda.get_device_name(0))
+if torch.cuda.get_device_name(0) != 'NVIDIA L4':
+    print('GPU differs from Jeff L4; runtime provenance will record this difference.')
+for shard_index in (0, 1):
+    print(f'Running historical shard {shard_index + 1}/2', flush=True)
+    report = run_replication(shard_index=shard_index)
+    print(json.dumps({k:v for k,v in report.items() if k != 'outcome_flips'}, indent=2))
+    gc.collect()
+    torch.cuda.empty_cache()
+print('FINAL COMPARISON')
+print(json.dumps(comparison(), indent=2))
+"""
+ save(ROOT/'notebooks/workers/127_smolvla_jeff_stock_replication_all400.ipynb',
+      [cell('markdown',intro),original[1],original[2],cell('code',run),
+       cell('markdown','Refresh saved results at any time with the cell below.'),
+       cell('code',"from pnp.smolvla_jeff_replication import comparison\nprint(json.dumps(comparison(), indent=2))\n")])
+
+
 setup='''import os, sys, subprocess, zipfile
 from pathlib import Path
 os.environ.update(MUJOCO_GL='egl', NVIDIA_DRIVER_CAPABILITIES='compute,utility,graphics',
@@ -237,6 +273,8 @@ print(json.dumps(report,indent=2))
   save(ROOT/f'notebooks/workers/126_smolvla_jeff_stock_replication_worker_{worker}.ipynb',
        [cell('markdown',text),cell('code',cfg),cell('code',replication_setup),cell('code',run),
         cell('markdown','Rerun the next cell after both workers finish to refresh the combined comparison.'),cell('code',read)])
+
+ build_single_replication_notebook()
 
  monitor=[cell('markdown','''# PCP search — live Supabase monitor
 
