@@ -194,6 +194,48 @@ report=run_full_proposal(checkpoint_paths=CHECKPOINT_PATHS, worker_index=WORKER_
                         simulator_processes=SIMULATOR_PROCESSES, output_dir=OUTPUT_DIR)
 """)]
  save(ROOT/'notebooks/workers/125_smolvla_pcp_full_proposal_worker_2.ipynb',cells)
+ # Stock-only parity check: two disjoint shards of Jeff's exact 400 identities.
+ replication_setup=setup.replace("from pnp import env_setup", """subprocess.run([sys.executable,'-m','pip','install',
+                'torch==2.11.0+cu128','torchvision==0.26.0+cu128',
+                '--index-url','https://download.pytorch.org/whl/cu128'],check=True)
+if 'torch' in sys.modules and sys.modules['torch'].__version__ != '2.11.0+cu128':
+    raise RuntimeError('Torch was already imported. Restart the runtime and rerun with the pinned version.')
+from pnp import env_setup""")
+ for worker in (0,1):
+  cfg=f"""WORKER_INDEX = {worker}
+BATCH_SIZE = 8
+SIMULATOR_PROCESSES = 1  # parity runner uses Jeff's direct environment stepping
+BUNDLE_PATH = ''
+BUNDLE_BUCKET = 'artifacts'
+BUNDLE_SHA256 = {bundle_sha!r}
+BUNDLE_STORAGE_KEY = {bundle_key!r}
+CHECKPOINT_SHA256 = {manifest['checkpoints']!r}
+"""
+  text=f"""# Jeff stock replication — Colab worker {worker}
+
+Use this notebook and the other worker in your two separate **fresh GPU runtimes**. Each runs 200 disjoint episodes, totaling the same 400 task/initial-state identities as Jeff. Add Supabase Secrets and Run all. Stop any previous sweep in that runtime first.
+
+This is **stock SmolVLA only: no P&P, no re-noising, no critic and no reranking**. It uses Jeff's stream-0 episode seeds, ten Euler steps, 50 generated actions, ten executed actions, same-task batches (maximum eight; five identities per task in each historical shard), TF32 disabled and highest matmul precision. Torch is pinned to Jeff's 2.11.0+cu128 build. Your Colab GPU may differ from Jeff's L4; outcome agreement is checked rather than assumed.
+
+Episodes resume from completed Supabase rows. At the end each notebook reads the latest combined results and compares every episode against Jeff's saved 255/400 stock arm. It reports successes, outcome flips, seed mismatches and step-count mismatches. A partial report is expected if the other worker is still running. Equal aggregate totals alone do not establish replication. No PCP sweep starts from this notebook.
+"""
+  run=f"""import torch
+if torch.__version__ != '2.11.0+cu128':
+    raise RuntimeError('Restart the runtime so the pinned Torch build loads.')
+from pnp.smolvla_jeff_replication import run_replication
+report = run_replication(shard_index=WORKER_INDEX)
+print(json.dumps({{k:v for k,v in report.items() if k!='outcome_flips'}},indent=2))
+if report['outcome_flips']:
+    print('Episode outcome differences:',json.dumps(report['outcome_flips'],indent=2))
+"""
+  read="""from pnp.smolvla_jeff_replication import comparison
+report = comparison()
+print(json.dumps(report,indent=2))
+"""
+  save(ROOT/f'notebooks/workers/126_smolvla_jeff_stock_replication_worker_{worker}.ipynb',
+       [cell('markdown',text),cell('code',cfg),cell('code',replication_setup),cell('code',run),
+        cell('markdown','Rerun the next cell after both workers finish to refresh the combined comparison.'),cell('code',read)])
+
  monitor=[cell('markdown','''# PCP search — live Supabase monitor
 
 CPU runtime is enough. Add the same Supabase Secrets, then run the cells whenever you want a fresh view. This reads the two worker progress artifacts and can pull all completed/error rollout rows with pagination. It launches no experiments.
