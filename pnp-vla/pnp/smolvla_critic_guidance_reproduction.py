@@ -26,7 +26,7 @@ from .smolvla_scalar_returns import LateFusionScalarCritic, ScalarCritic
 from .tap import BatchedRolloutTap
 
 
-EXPERIMENT = "smolvla-critic-guidance-independent-jeff400-v1"
+EXPERIMENT = "smolvla-critic-guidance-independent-jeff400-v2"
 PARENT_STEPS = (1, 2, 3)
 PARENT_K_BY_STEP = (3, 1, 1)
 GUIDANCE_STEP = 3
@@ -36,41 +36,69 @@ INTEGRATION_STEPS = 10
 
 ARM_LIBRARY = {
     "stock_live": dict(kind="stock", critic=None, mode="none", radius=0.0),
+    "stock_hook_parent": dict(
+        kind="stock_guided", critic=None, mode="none", radius=0.0),
     "pnp_parent": dict(kind="pnp", critic=None, mode="none", radius=0.0),
-    "frozen_mc_ascent_r002": dict(
+    "stock_frozen_mc_ascent_r002": dict(
+        kind="stock_guided", critic="frozen_mc", mode="ascent", radius=0.02),
+    "stock_frozen_mc_descent_r002": dict(
+        kind="stock_guided", critic="frozen_mc", mode="descent", radius=0.02),
+    "stock_td_ascent_r002": dict(
+        kind="stock_guided", critic="td", mode="ascent", radius=0.02),
+    "stock_random_r002": dict(
+        kind="stock_guided", critic=None, mode="random", radius=0.02),
+    "refined_frozen_mc_ascent_r002": dict(
         kind="pnp", critic="frozen_mc", mode="ascent", radius=0.02),
-    "frozen_mc_descent_r002": dict(
+    "refined_frozen_mc_descent_r002": dict(
         kind="pnp", critic="frozen_mc", mode="descent", radius=0.02),
-    "td_ascent_r002": dict(kind="pnp", critic="td", mode="ascent", radius=0.02),
-    "random_r002": dict(kind="pnp", critic=None, mode="random", radius=0.02),
-    "frozen_mc_ascent_r006": dict(
+    "refined_td_ascent_r002": dict(
+        kind="pnp", critic="td", mode="ascent", radius=0.02),
+    "refined_random_r002": dict(
+        kind="pnp", critic=None, mode="random", radius=0.02),
+    "refined_frozen_mc_ascent_r006": dict(
         kind="pnp", critic="frozen_mc", mode="ascent", radius=0.06),
-    "td_ascent_r006": dict(kind="pnp", critic="td", mode="ascent", radius=0.06),
-    "cnn_mc_ascent_r002": dict(
+    "refined_td_ascent_r006": dict(
+        kind="pnp", critic="td", mode="ascent", radius=0.06),
+    "refined_cnn_mc_ascent_r002": dict(
         kind="pnp", critic="cnn_mc", mode="ascent", radius=0.02),
 }
 
-DEFAULT_ARMS = (
+STOCK_PARENT_ARMS = (
     "stock_live",
-    "pnp_parent",
-    "frozen_mc_ascent_r002",
-    "td_ascent_r002",
-    "frozen_mc_descent_r002",
-    "random_r002",
+    "stock_hook_parent",
+    "stock_frozen_mc_ascent_r002",
+    "stock_td_ascent_r002",
+    "stock_frozen_mc_descent_r002",
+    "stock_random_r002",
 )
+
+REFINED_PARENT_ARMS = (
+    "pnp_parent",
+    "refined_frozen_mc_ascent_r002",
+    "refined_td_ascent_r002",
+    "refined_frozen_mc_descent_r002",
+    "refined_random_r002",
+)
+
+DEFAULT_ARMS = REFINED_PARENT_ARMS
 
 
 def _method_name(arm_name: str) -> str:
     aliases = {
         "stock_live": "cg_stock",
+        "stock_hook_parent": "cg_stock_hook",
         "pnp_parent": "cg_parent",
-        "frozen_mc_ascent_r002": "cg_mc_up_002",
-        "frozen_mc_descent_r002": "cg_mc_down_002",
-        "td_ascent_r002": "cg_td_up_002",
-        "random_r002": "cg_random_002",
-        "frozen_mc_ascent_r006": "cg_mc_up_006",
-        "td_ascent_r006": "cg_td_up_006",
-        "cnn_mc_ascent_r002": "cg_cnn_up_002",
+        "stock_frozen_mc_ascent_r002": "cg_stock_mc_up_002",
+        "stock_frozen_mc_descent_r002": "cg_stock_mc_down_002",
+        "stock_td_ascent_r002": "cg_stock_td_up_002",
+        "stock_random_r002": "cg_stock_random_002",
+        "refined_frozen_mc_ascent_r002": "cg_ref_mc_up_002",
+        "refined_frozen_mc_descent_r002": "cg_ref_mc_down_002",
+        "refined_td_ascent_r002": "cg_ref_td_up_002",
+        "refined_random_r002": "cg_ref_random_002",
+        "refined_frozen_mc_ascent_r006": "cg_ref_mc_up_006",
+        "refined_td_ascent_r006": "cg_ref_td_up_006",
+        "refined_cnn_mc_ascent_r002": "cg_ref_cnn_up_002",
     }
     return aliases[arm_name]
 
@@ -144,7 +172,7 @@ def bounded_standardized_move(current, anchor, gradient, valid, std, radius):
 
 
 class IndependentCriticGuidanceTap(BatchedRolloutTap):
-    """P&P parent plus one clean-action Q-gradient update at Euler step 3."""
+    """Stock or P&P parent plus one clean-action Q-gradient update at Euler step 3."""
 
     def __init__(self, *, arm, critic, correction_std, emit, episodes, observations,
                  steps, chunk_indices, lane_ids, **kwargs):
@@ -153,6 +181,9 @@ class IndependentCriticGuidanceTap(BatchedRolloutTap):
         from .rollout import _raw_robot_state
 
         self.arm = arm
+        # A stock-guided arm has no P&P config flag, but it still changes the live sampler.
+        if arm["kind"] == "stock_guided":
+            self.invasive = True
         self.critic = critic
         self.correction_std = correction_std
         self.emit = emit
@@ -178,18 +209,13 @@ class IndependentCriticGuidanceTap(BatchedRolloutTap):
             prefix, prefix_valid, self.robot, self.proprio, action, valid
         ).reshape(-1).sigmoid()
 
-    def step(self, x_t, s, vf, ctx):
-        probe = run_probe(
-            x_t, s, vf, k=self.config.probe_k(ctx.step), adim=self.adim,
-            generators=self.generators, record_telemetry=False)
-        if self._pending_variable_probe is not None:
-            raise RuntimeError("a variable-K probe was not finalized")
-        self._pending_variable_probe = (probe, int(ctx.step))
+    def selected(self, step, s):
+        if self.arm["kind"] == "stock_guided":
+            return int(step) == GUIDANCE_STEP
+        return super().selected(step, s)
 
-        if int(ctx.step) != GUIDANCE_STEP or self.arm["mode"] == "none":
-            return probe.x_acc
-
-        full = probe.z_hat_full.detach()
+    def _guided_state(self, base_state, full, s, ctx):
+        """Score a clean estimate, update its first 10 actions, and alter the live latent."""
         anchor = full[:, :EXECUTED_ACTIONS, :7].clone()
         valid = torch.arange(EXECUTED_ACTIONS, device=full.device)[None] < torch.tensor(
             self.remaining, device=full.device)[:, None]
@@ -245,6 +271,7 @@ class IndependentCriticGuidanceTap(BatchedRolloutTap):
             self.emit(self.lane_ids[lane], {
                 "chunk_index": self.chunk_indices[lane],
                 "euler_step": int(ctx.step),
+                "parent": self.arm["kind"],
                 "mode": self.arm["mode"],
                 "radius": float(self.arm["radius"]),
                 "q_before": clean(before_cpu[lane]),
@@ -253,8 +280,27 @@ class IndependentCriticGuidanceTap(BatchedRolloutTap):
                 "standardized_rms": float(values[1]),
                 "bad_gradient": bool(values[2]),
             })
-        # A clean-action displacement maps back to the current latent with coefficient (1-s).
-        return probe.x_acc + (1.0 - float(s)) * update
+        return base_state + (1.0 - float(s)) * update
+
+    def step(self, x_t, s, vf, ctx):
+        if self.arm["kind"] == "stock_guided":
+            # This repeated deterministic vfield call obtains the exact current stock clean
+            # estimate.  There is no perturbation, re-noising, refinement, or blending.
+            full = (x_t - float(s) * vf(x_t)).detach()
+            if self.arm["mode"] == "none":
+                return x_t
+            return self._guided_state(x_t, full, s, ctx)
+
+        probe = run_probe(
+            x_t, s, vf, k=self.config.probe_k(ctx.step), adim=self.adim,
+            generators=self.generators, record_telemetry=False)
+        if self._pending_variable_probe is not None:
+            raise RuntimeError("a variable-K probe was not finalized")
+        self._pending_variable_probe = (probe, int(ctx.step))
+
+        if int(ctx.step) != GUIDANCE_STEP or self.arm["mode"] == "none":
+            return probe.x_acc
+        return self._guided_state(probe.x_acc, probe.z_hat_full.detach(), s, ctx)
 
     def after_selected_vfield(self, x_t, s, velocity, ctx):
         # The reproduction does not need to copy P&P traces to CPU.  Clearing the pending
@@ -297,7 +343,7 @@ def _arm_config(arm):
         save_trajectory=True,
         video="off",
     )
-    if arm["kind"] == "stock":
+    if arm["kind"] in ("stock", "stock_guided"):
         return RolloutConfig(**common)
     return RolloutConfig(
         pnp_steps=PARENT_STEPS,
@@ -334,7 +380,7 @@ def run_independent_critic_guidance_worker(
         *, checkpoint_paths: dict[str, str], shard_count: int = 2, shard_index: int = 0,
         arm_names: Iterable[str] = DEFAULT_ARMS, rollout_batch_size: int = 8,
         episode_limit: int | None = None, report_every_identities: int = 10,
-        experiment: str = EXPERIMENT):
+        experiment: str = EXPERIMENT, worker_label: str | None = None):
     """Run exact-state, seed-stream-0 critic guidance with matched historical columns."""
     from . import models
     from .experiments import (
@@ -418,6 +464,7 @@ def run_independent_critic_guidance_worker(
             "implementation": "independent_critic_guidance_v1",
             "shard_count": shard_count,
             "shard_index": shard_index,
+            "worker_label": worker_label,
             "arm_names": list(arm_names),
             "identities": len(episodes),
             "checkpoint_sha256": checkpoint_shas,
@@ -435,7 +482,7 @@ def run_independent_critic_guidance_worker(
     completed_new = 0
     print({
         "experiment": experiment,
-        "worker": f"{shard_index}/{shard_count}",
+        "worker": worker_label or f"{shard_index}/{shard_count}",
         "identities_in_shard": len(episodes),
         "arms": [arm["name"] for arm in arms],
         "checkpoint_sha256": checkpoint_shas,
@@ -468,7 +515,7 @@ def run_independent_critic_guidance_worker(
                             continue
                         telemetry = [[] for _ in group]
                         tap_factory = None
-                        if arm["kind"] == "pnp":
+                        if arm["kind"] in ("pnp", "stock_guided"):
                             def tap_factory(*, _arm=arm, _telemetry=telemetry, **kwargs):
                                 critic = critics.get(_arm["critic"])
                                 return IndependentCriticGuidanceTap(
@@ -481,7 +528,7 @@ def run_independent_critic_guidance_worker(
                             tap_factory=tap_factory)
                         for lane, ((episode, _, _, rollout_id), result) in enumerate(
                                 zip(group, results)):
-                            if arm["kind"] == "pnp":
+                            if arm["kind"] in ("pnp", "stock_guided"):
                                 result["q_guidance_telemetry"] = _telemetry_summary(
                                     arm, telemetry[lane])
                             store.log_result(rollout_id, episode, method, config, result)

@@ -3,6 +3,8 @@ import torch
 
 from pnp.smolvla_critic_guidance_reproduction import (
     DEFAULT_ARMS,
+    REFINED_PARENT_ARMS,
+    STOCK_PARENT_ARMS,
     bounded_standardized_move,
     resolve_arms,
 )
@@ -12,8 +14,19 @@ def test_resolve_default_arms_are_unique_and_include_controls():
     arms = resolve_arms(DEFAULT_ARMS)
     assert len({arm["method"] for arm in arms}) == len(arms)
     assert {arm["mode"] for arm in arms} >= {"none", "ascent", "descent", "random"}
-    assert arms[0]["kind"] == "stock"
-    assert arms[1]["kind"] == "pnp" and arms[1]["radius"] == 0
+    assert arms[0]["kind"] == "pnp" and arms[0]["radius"] == 0
+
+
+def test_stock_and_refined_workers_have_disjoint_guided_methods():
+    stock = resolve_arms(STOCK_PARENT_ARMS)
+    refined = resolve_arms(REFINED_PARENT_ARMS)
+    assert stock[0]["kind"] == "stock"
+    assert stock[1]["kind"] == "stock_guided" and stock[1]["mode"] == "none"
+    assert all(arm["kind"] == "stock_guided" for arm in stock[1:])
+    assert refined[0]["kind"] == "pnp" and refined[0]["mode"] == "none"
+    assert all(arm["kind"] == "pnp" for arm in refined[1:])
+    assert {arm["method"] for arm in stock}.isdisjoint(
+        {arm["method"] for arm in refined})
 
 
 def test_bounded_move_hits_standardized_rms_radius_and_masks_tail():
