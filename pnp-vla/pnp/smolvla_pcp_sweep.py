@@ -26,7 +26,7 @@ from .qplanning_critic.model import pool_prefix_tokens
 from .smolvla_scalar_returns import ScalarCritic, LateFusionScalarCritic
 from .smolvla_anchored_critic import AnchoredCritic
 
-EXPERIMENT = 'smolvla-pcp-a100-jeff-matched-stock-v5'
+EXPERIMENT = 'smolvla-pcp-a100-jeff-settings-stock-v6'
 RADII = (.02, .06)
 RUNGS = (400, 2000, 6000)
 OBS_KEYS = ('agentview_image', 'robot0_eye_in_hand_image', 'robot0_eef_pos',
@@ -346,7 +346,7 @@ def guarded_cuda_batch(operation):
     return results,None
 
 
-def run_sweep(*,checkpoint_paths,worker_index,worker_count=2,batch_size=64,
+def run_sweep(*,checkpoint_paths,worker_index,worker_count=2,batch_size=8,
               simulator_processes=8,output_dir='/content/pcp-search',experiment=EXPERIMENT,
               grid_override=None,tap_type=SweepTap,protocol=None):
     """Finite large search plan; no wall-clock budget or automatic paid dispatch."""
@@ -394,9 +394,12 @@ def run_sweep(*,checkpoint_paths,worker_index,worker_count=2,batch_size=64,
         store._upload(manifest_key,json.dumps(manifest).encode());existing=manifest
     if existing!=manifest:raise ValueError('immutable manifest differs')
     policy,preprocess,postprocess=models.load_smolvla(device=device)
+    from .smolvla_jeff_replication import runtime_metadata
+    runtime=runtime_metadata(policy)
     store.start_run('smolvla_pcp_a100_search','libero',experiment,config={
-        **manifest,'worker_index':worker_index,'batch_size':batch_size,'simulator_processes':simulator_processes},
-        provenance=gather_provenance(model_repo_id='HuggingFaceVLA/smolvla_libero'))
+        **manifest,'worker_index':worker_index,'batch_size':batch_size,'simulator_processes':simulator_processes,'runtime':runtime},
+        provenance=gather_provenance(model_repo_id='HuggingFaceVLA/smolvla_libero',
+                                    model_revision=runtime['policy_revision']))
     # Independent per-worker rows and artifacts; each owns its zero baseline.
     rows=store.fetch_all('rollouts','rollout_id,status,success,ms_candidate_u',
                         configure=lambda q:q.eq('experiment',experiment).eq('ms_candidate_u->q_guidance->>worker_index',str(worker_index)).eq('ms_candidate_u->q_guidance->>manifest_hash',manifest['manifest_hash']),order_by=('rollout_id',))
@@ -420,12 +423,12 @@ def run_sweep(*,checkpoint_paths,worker_index,worker_count=2,batch_size=64,
             except Exception:pass
     sampler=threading.Thread(target=sample_gpu,daemon=True);sampler.start()
     started=time.monotonic();completed_new=0;status='failed'
-    def uploader(ep,method,rid,result,telemetry):
+    def uploader(ep,method,rid,result,telemetry,arm_config):
         if not hasattr(thread_state,'store'):
             thread_state.store=store.fork_for_thread();thread_state.store.experiment=experiment;thread_state.store.run_id=store.run_id
         remote=thread_state.store
         remote._upload(f'{prefix}/worker_{worker_index}/chunks/{rid}.json',json.dumps(telemetry,allow_nan=False).encode())
-        remote.log_result(rid,ep,method,cfg,result,persist_probe_rows=False)
+        remote.log_result(rid,ep,method,arm_config,result,persist_probe_rows=False)
     def flush(all_pending=False):
         while pending and (all_pending or len(pending)>=2*batch_size or pending[0].done()):pending.pop(0).result()
     def publish(stage):
@@ -482,9 +485,10 @@ def run_sweep(*,checkpoint_paths,worker_index,worker_count=2,batch_size=64,
                 continue
             for case,ep,result,chunks in zip(ids,eps,results,telemetry):
                 method=f'pcp_search_w{worker_index}_{arm["arm_id"]}_{manifest["manifest_hash"][:12]}'
-                rid=store.rollout_id(experiment,ep,method,cfg)
+                rid=store.rollout_id(experiment,ep,method,arm_config)
                 info={'manifest_hash':manifest['manifest_hash'],'worker_index':worker_index,
                       'case_index':case,'arm_id':arm['arm_id'],'arm':arm,
+                      'actual_rollout_config':arm_config.logical_dict(),
                       'batch_performance':result.get('batch_performance'),
                       'chunk_telemetry_path':f'{prefix}/worker_{worker_index}/chunks/{rid}.json',
                       'n_corrections':sum(x.get('intervened',x['standardized_rms']>0) for x in chunks),
@@ -492,7 +496,7 @@ def run_sweep(*,checkpoint_paths,worker_index,worker_count=2,batch_size=64,
                       'n_searches':sum(x.get('search_open',False) for x in chunks),
                       'n_reranked_candidates':sum(x.get('n_candidates',0) for x in chunks)}
                 result['recorder_episode']=None;result['q_guidance_telemetry']=info
-                pending.append(uploads.submit(uploader,ep,method,rid,result,chunks))
+                pending.append(uploads.submit(uploader,ep,method,rid,result,chunks,arm_config))
                 record=dict(arm_id=arm['arm_id'],case_index=case,success=bool(result['success']),status=result['status'],rollout_id=rid,n_corrections=info['n_corrections'])
                 records[(arm['arm_id'],case)]=record
                 with (directory/f'worker_{worker_index}_journal.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')

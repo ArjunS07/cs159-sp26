@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import glob
 import os
+from pathlib import Path
 
 import torch
 
@@ -96,11 +97,22 @@ def load_smolvla(device=None, repo_id: str = SMOLVLA_REPO_ID,
     from lerobot.policies.factory import make_pre_post_processors
 
     device = device or default_device()
+    if repo_id == SMOLVLA_REPO_ID and revision is None:
+        revision = '6721902bc4d61e50a3bfdb11dfb4cb626f05d102'
     snapshot_path = _ensure_hf_weights(repo_id, revision=revision)
-    policy = SmolVLAPolicy.from_pretrained(snapshot_path).to(device).eval()
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+    cfg = SmolVLAConfig.from_pretrained(snapshot_path)
+    if cfg.vlm_model_name == 'HuggingFaceTB/SmolVLM2-500M-Instruct':
+        cfg.vlm_model_name = _ensure_hf_weights(
+            cfg.vlm_model_name, revision='7b375e1b73b11138ff12fe22c8f2822d8fe03467')
+    policy = SmolVLAPolicy.from_pretrained(snapshot_path, config=cfg).to(device).eval()
+    policy._pnp_policy_snapshot = snapshot_path
+    policy._pnp_policy_revision = revision or Path(snapshot_path).name
+    policy._pnp_vlm_snapshot = cfg.vlm_model_name
     preprocess, postprocess = make_pre_post_processors(
         policy.config, snapshot_path,
-        preprocessor_overrides={"device_processor": {"device": str(device)}},
+        preprocessor_overrides={"device_processor": {"device": str(device)},
+                                "tokenizer_processor": {"tokenizer_name": cfg.vlm_model_name}},
     )
     apply_smolvla_pnp_patch(policy)
     print({

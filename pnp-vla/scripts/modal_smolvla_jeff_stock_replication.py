@@ -12,7 +12,7 @@ image=(modal.Image.debian_slim(python_version='3.13')
  .add_local_file(str(ROOT/'README.md'),'/root/pnp-vla/README.md',copy=True)
  .add_local_dir(str(ROOT/'pnp'),'/root/pnp-vla/pnp',copy=True,
                 ignore=['**/__pycache__/**','**/*.pyc'])
- .run_commands("python -m pip install '/root/pnp-vla[sim]'",
+ .run_commands("python -m pip install '/root/pnp-vla[sim]' torch==2.11.0+cu128 torchvision==0.26.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128",
                'python -m pip uninstall -y torchao',
                'python -m pip install torch==2.11.0+cu128 torchvision==0.26.0+cu128 --index-url https://download.pytorch.org/whl/cu128'))
 app=modal.App('smolvla-jeff-stock-replication')

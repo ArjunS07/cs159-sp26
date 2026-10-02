@@ -216,7 +216,7 @@ def _training_decision(obs, env, task_desc: str, step: int, policy_observation) 
 # The one rollout primitive.
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
-                        config: RolloutConfig | None = None, *, candidate_bundles=None):
+                        config: RolloutConfig | None = None, *, candidate_bundles=None, parity_trace=False):
     """Run one episode under `config`. Returns a result dict (outcome, metrics, trajectory,
     recorder episode, and sink outputs — pcp_chunks / pcp_telemetry / ms_selections).
 
@@ -278,6 +278,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
     executed_actions, normalized_actions = [], []
     robot_states, sim_states = [], []
     rewards, terminated_flags, truncated_flags, step_success_flags = [], [], [], []
+    parity_records = []
     chunk_boundary_actions, chunk_noise_seeds, chunk_start_steps = [], [], []
     training_decisions = [] if config.save_training_data else None
     terminal_generated_chunk = None
@@ -498,6 +499,16 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                         queue_postprocess = postprocess
                 else:
                     batch = preprocess(policy_observation)
+                    if parity_trace:
+                        entry = dict(chunk_index=ci, noise_seed=cns,
+                                     noise=_parity_checksum(noise), active_batch_size=1,
+                                     active_episode_indices=[ep.get('ep_idx', ep.get('episode_idx'))])
+                        if ci == 0:
+                            entry['camera_inputs'] = {k: _parity_checksum(obs[k])
+                                                      for k in ('agentview_image', 'robot0_eye_in_hand_image') if k in obs}
+                            entry['preprocessed_inputs'] = {k: _parity_checksum(v) for k, v in batch.items()
+                                                            if torch.is_tensor(v)}
+                        parity_records.append(entry)
                     if config.q_guidance_ckpt_id is not None:
                         set_remaining = getattr(
                             config.q_guidance_scorer, "set_remaining_fraction", None)
@@ -536,6 +547,8 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
                     queue_postprocess = postprocess
                 chunk_noise_seeds.append(int(executed_chunk_noise_seed))
                 full_arr = chunk.squeeze(0).detach().cpu().numpy()
+                if parity_trace and parity_records:
+                    parity_records[-1]['generated_chunk'] = _parity_checksum(full_arr)
                 if generated_chunks is not None:
                     generated_chunks.append(full_arr.copy())
                 # Do not silently consult policy.config here: historical rollout IDs with an
@@ -745,6 +758,7 @@ def _run_episode_serial(env, ep, policy, preprocess, postprocess, device,
         result["ms_selections"] = ms_selections
     if qplanning_selections is not None:
         result["qplanning_selections"] = qplanning_selections
+    if parity_trace: result['parity_trace'] = parity_records
     return result
 
 
@@ -817,9 +831,21 @@ def _stack_policy_batches(items: list[dict]) -> dict[str, torch.Tensor]:
 
 
 
+def _parity_checksum(value):
+    """Diagnostic only: preserve dtype/shape and hash exact tensor/array bytes."""
+    if torch.is_tensor(value):
+        value = value.detach().contiguous().cpu()
+        payload = value.view(torch.uint8).numpy().tobytes()
+        dtype, shape = str(value.dtype), list(value.shape)
+    else:
+        value = np.ascontiguousarray(value)
+        payload, dtype, shape = value.tobytes(), str(value.dtype), list(value.shape)
+    return dict(dtype=dtype, shape=shape, sha256=hashlib.sha256(payload).hexdigest())
+
+
 def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                       config: RolloutConfig | None = None, *, tap_factory=None,
-                      env_step_executor=None):
+                      env_step_executor=None, parity_trace=False):
     """Run independent environments with one shared, truly batched policy invocation.
 
     Results preserve input order. Multi-sample and learned-PCP selection intentionally use the
@@ -830,7 +856,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
         raise ValueError("envs and episodes must have the same non-zero length")
     if len(episodes) == 1 and tap_factory is None and env_step_executor is None:
         return [_run_episode_serial(envs[0], episodes[0], policy, preprocess,
-                                    postprocess, device, config)]
+                                    postprocess, device, config, parity_trace=parity_trace)]
     if (config.num_samples is not None or config.correction_lambda is not None
             or config.uncertainty_gradient_mode is not None
             or config.q_guidance_ckpt_id is not None):
@@ -855,6 +881,7 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
     recorders = [PnPRecorder() for _ in episodes]
     for recorder, ep in zip(recorders, episodes):
         recorder.new_episode(meta={k: ep.get(k) for k in ("suite", "task_idx", "ep_idx")})
+    parity_records = [[] for _ in episodes]
     batch_started = time.perf_counter()
     batch_profile = dict(initialization_s=0., preprocessing_s=0., inference_s=0., simulator_s=0.)
     states = []
@@ -926,6 +953,19 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                         state["obs"], envs[i], ep["task_desc"], state["step"],
                         policy_observation))
                 batches.append(preprocess(policy_observation))
+                if parity_trace:
+                    entry = dict(chunk_index=state['ci'], noise_seed=cseed,
+                                 noise=_parity_checksum(noises[-1]),
+                                 active_episode_indices=[episodes[j].get('ep_idx', episodes[j].get('episode_idx'))
+                                                         for j in infer_ids],
+                                 active_batch_size=len(infer_ids))
+                    if state['ci'] == 0:
+                        entry['camera_inputs'] = {k: _parity_checksum(state['obs'][k])
+                                                  for k in ('agentview_image', 'robot0_eye_in_hand_image')
+                                                  if k in state['obs']}
+                        entry['preprocessed_inputs'] = {k: _parity_checksum(v) for k, v in batches[-1].items()
+                                                        if torch.is_tensor(v)}
+                    parity_records[i].append(entry)
                 positions.append(min(state["ci"] / max(1, round(ep["max_steps"] / chunk_size)), 1.0))
             batch_profile['preprocessing_s'] += time.perf_counter()-preprocessing_started
             tap = (BatchedRolloutTap(config, [recorders[i] for i in infer_ids],
@@ -959,6 +999,9 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
                 infer_ms = (time.perf_counter() - started) * 1000.0
                 vf_delta = model._pnp.vf_evals - before_vf
                 arrays = chunks.detach().cpu().numpy()
+                if parity_trace:
+                    for lane, i in enumerate(infer_ids):
+                        parity_records[i][-1]['generated_chunk'] = _parity_checksum(arrays[lane])
                 batch_profile['inference_s'] += time.perf_counter()-started
                 for lane, i in enumerate(infer_ids):
                     state = states[i]; arr = arrays[lane]
@@ -1163,7 +1206,9 @@ def run_episode_batch(envs, episodes, policy, preprocess, postprocess, device,
         if config.save_pcp_features: result["pcp_chunks"] = state.get("pcp_chunks", [])
         results.append(result)
     batch_profile['total_s'] = time.perf_counter()-batch_started
-    for result in results: result['batch_performance'] = dict(batch_profile)
+    for i, result in enumerate(results):
+        result['batch_performance'] = dict(batch_profile)
+        if parity_trace: result['parity_trace'] = parity_records[i]
     if tap_factory is not None:
         print('[batch performance]', {key:round(value,2) for key,value in batch_profile.items()}, flush=True)
     return results

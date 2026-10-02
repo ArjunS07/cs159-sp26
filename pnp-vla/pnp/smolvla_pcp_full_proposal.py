@@ -8,7 +8,7 @@ from .smolvla_anchored_critic import AnchoredCritic
 from .qplanning_critic.model import pool_prefix_tokens
 from .pnp import run_probe
 
-EXPERIMENT='smolvla-pcp-full-proposal-jeff-matched-v4'
+EXPERIMENT='smolvla-pcp-full-proposal-jeff-settings-v5'
 PROTOCOL={
  'search_steps':[2,5,8],'candidates':3,'uncertainty_probes':3,
  'uncertainty':'RMS disagreement of one-step clean estimates in common frozen-MC action-standardized coordinates; not calibrated epistemic uncertainty',

@@ -58,7 +58,9 @@ with zipfile.ZipFile(BUNDLE_PATH) as archive:
     archive.extractall(PACKAGE)
 print({'python':sys.version,'executable':sys.executable},flush=True)
 subprocess.run([sys.executable,'-m','pip','--version'],check=True)
-install=subprocess.run([sys.executable,'-m','pip','install','-e',str(PACKAGE)+'[sim]'],
+install=subprocess.run([sys.executable,'-m','pip','install','-e',str(PACKAGE)+'[sim]',
+                        'torch==2.11.0+cu128','torchvision==0.26.0+cu128',
+                        '--extra-index-url','https://download.pytorch.org/whl/cu128'],
                        stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
 install_log=Path('/content/pcp_dependency_install.log')
 install_log.write_text(install.stdout)
@@ -69,6 +71,11 @@ if install.returncode:
 print('Simulation/model dependencies installed.',flush=True)
 subprocess.run([sys.executable,'-m','pip','uninstall','-y','torchao'],check=False,stdout=subprocess.DEVNULL)
 if str(PACKAGE) not in sys.path: sys.path.insert(0,str(PACKAGE))
+subprocess.run([sys.executable,'-m','pip','install',
+                'torch==2.11.0+cu128','torchvision==0.26.0+cu128',
+                '--index-url','https://download.pytorch.org/whl/cu128'],check=True)
+if 'torch' in sys.modules and sys.modules['torch'].__version__ != '2.11.0+cu128':
+    raise RuntimeError('Torch was already imported. Restart the runtime and rerun with the pinned version.')
 from pnp import env_setup
 if env_setup._find_nvidia_egl_library() is None:
     import re
@@ -126,7 +133,7 @@ def main(publish=False):
 WORKER_COUNT = 2
 BATCH_SIZE = 8  # Jeff-matched replication setting; do not enlarge before comparison
 SIMULATOR_PROCESSES = min(8, max(1, (__import__('os').cpu_count() or 2) - 2))
-EXPERIMENT = 'smolvla-pcp-a100-jeff-matched-stock-v5'
+EXPERIMENT = 'smolvla-pcp-a100-jeff-settings-stock-v6'
 BUNDLE_PATH = ''  # empty automatically downloads the exact pinned Supabase bundle
 BUNDLE_BUCKET = 'artifacts'
 BUNDLE_SHA256 = {bundle_sha!r}
@@ -136,7 +143,7 @@ OUTPUT_DIR = f'/content/pcp-search-worker-{{WORKER_INDEX}}'
 '''
   cells=[cell('markdown',f'''# PCP focused evaluation — A100 worker {worker}
 
-The run cell first requires the separately logged 400-episode Jeff stock replication to match every historical outcome. Precision matches Jeff: TF32 off, highest matmul precision; initial seed stream 0; batches grouped by task and historical shard parity. Existing results remain under their old experiment. Open worker 0 and worker 1 in **separate A100 Colab runtimes**. Add `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` to Colab Secrets, enable notebook access, then **Run all**. The code bundle and three frozen checkpoints download automatically from Supabase; there is no file-upload prompt. `HF_TOKEN` is optional for public assets. No GitHub checkout or manual file upload is needed. The notebook pins the bundle and each checkpoint by SHA256, verifies them before loading, and caches the download for reruns in this runtime.
+The run cell first requires the separately logged 400-episode Jeff stock replication to match every historical outcome. Recorded matmul settings match Jeff: matmul TF32 off, highest precision; cuDNN TF32 retains the Torch default because Jeff did not record it; initial seed stream 0; batches grouped by task and historical shard parity. Existing results remain under their old experiment. Open worker 0 and worker 1 in **separate A100 Colab runtimes**. Add `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` to Colab Secrets, enable notebook access, then **Run all**. The code bundle and three frozen checkpoints download automatically from Supabase; there is no file-upload prompt. `HF_TOKEN` is optional for public assets. No GitHub checkout or manual file upload is needed. The notebook pins the bundle and each checkpoint by SHA256, verifies them before loading, and caches the download for reruns in this runtime.
 
 CNN MC is excluded based on weaker previous gradient-direction evidence. These two critics are not established as universally best. The fixed grid has **18 configurations, 9 per worker**, plus each worker's paired **stock SmolVLA baseline: no P&P, no re-noising, no Q correction**. Treatments retain their P&P parent (steps 1/2/3, K 3/1/1) plus Q correction; this measures the whole treatment against stock, not Q's marginal benefit alone. All configurations apply PCP at sampler step 3, every action chunk throughout the full episode. Two modest standardized RMS radii (.02/.06): ascent, descent, and Q<0.5 gated ascent for frozen MC and continued TD (12 arms); matched random controls (2 arms); three-inner-step ascent for frozen MC and TD (4 arms). Most settings are fixed to prioritize depth over breadth. 
 
@@ -144,12 +151,12 @@ No wall-clock budget or cutoff, and no adaptive elimination. Every arm receives 
 
 Leaderboards include successes, rescues/spoils, conditional rescue/spoil rates, paired success change and standard errors clustered by task/starting state across repeated seeds. They also count actual PCP interventions. Chunks and repeated seeds are not counted as independent starting states. Both workers use the same cohort and shared baseline seeds; their baselines must not be pooled as independent replicates.
 
-A100 batching starts at 64, with parallel simulator processes, reused environments, TF32, sparse camera rendering, and four background upload clients. No critic classification/Bellman-validation phase, smoke rollout or video encoding. Actor CPU work and rendering still limit utilization; reported GPU utilization distinguishes that from inference limits.
+Batching starts at eight, grouped by task and historical shard parity, with parallel simulator processes, reused environments, matmul TF32 disabled, sparse camera rendering, and four background upload clients. Torch is pinned to 2.11.0+cu128. This does not reproduce every historical resume boundary; the dedicated replication runner reconstructs those separately. No critic classification/Bellman-validation phase, smoke rollout or video encoding. Actor CPU work and rendering still limit utilization; reported GPU utilization distinguishes that from inference limits.
 
 Completed outcomes go to Supabase `rollouts` under `{{EXPERIMENT_PLACEHOLDER}}`, with configuration/checkpoint identity, errors, success and steps. Storage `artifacts/smolvla_pcp_sweep/...` contains the manifest, per-chunk correction telemetry, executed trajectories and worker leaderboards. Use the companion monitor notebook from any CPU Colab session while these workers run.
 
 This is fixed, equal-exposure exploratory evaluation on released benchmark states, some of which may have been used previously. Many interventions within an episode do not create independent evidence. Standard errors are conditional on these 40 benchmark tasks and group seed repeats by starting state; they do not establish generalization to new tasks or remove multiple-comparison bias. Correction radii use the frozen MC training action standard deviations as a common coordinate system for every critic and random control. CNN's anchor is the live probe clean estimate, held fixed during its inner search.
-'''.replace('{EXPERIMENT_PLACEHOLDER}','smolvla-pcp-a100-jeff-matched-stock-v5')),
+'''.replace('{EXPERIMENT_PLACEHOLDER}','smolvla-pcp-a100-jeff-settings-stock-v6')),
          cell('code',config),cell('code',setup),cell('code', '''from pnp.smolvla_jeff_replication import require_replication
 print(require_replication())
 from pnp.smolvla_pcp_sweep import run_sweep, sweep_grid
@@ -175,7 +182,7 @@ OUTPUT_DIR = '/content/pcp-full-proposal'
 """
  cells=[cell('markdown',"""# Full PCP proposal — third A100 worker
 
-Run this alongside workers 0 and 1 in a **third separate A100 runtime**. Add the same Supabase Secrets and Run all. Code and frozen checkpoints download automatically and are SHA256-verified. This has its own experiment, `smolvla-pcp-full-proposal-jeff-matched-v4`, and does not alter running workers.
+Run this alongside workers 0 and 1 in a **third separate A100 runtime**. Add the same Supabase Secrets and Run all. Code and frozen checkpoints download automatically and are SHA256-verified. This has its own experiment, `smolvla-pcp-full-proposal-jeff-settings-v5`, and does not alter running workers.
 
 **Algorithm at each action chunk:** predict a clean chunk at early/middle/late sampler indices 2/5/8 (80%/50%/20% noise remaining); use three independently re-noised one-step predictions to measure action disagreement; optionally gate on standardized RMS disagreement >= .06; apply one normalized Q-gradient correction inside radius .06 to the first 10 actions; re-noise into three independent branches; complete the remaining flow integration for each branch; rank their fully denoised chunks by Q; execute the best. The exact uncorrected continuation is included as candidate zero and is used when the gate is closed. No backpropagation through the flow and no model fine-tuning.
 
@@ -183,9 +190,9 @@ Run this alongside workers 0 and 1 in a **third separate A100 runtime**. Add the
 
 The .06 uncertainty threshold is a fixed heuristic. Probe disagreement measures local action instability, not calibrated critic uncertainty or failure probability. Regeneration does not guarantee actions remain in distribution; reranking does not guarantee real success. The baseline fallback only enforces nondecreasing **predicted Q** when scores are finite. The correction radius bounds the injected clean-action displacement, not the final regenerated chunk.
 
-Each branch uses the full episode batch on GPU and shares the encoded visual/language prefix; branches are evaluated sequentially to control memory. Parallel simulator processes retain only one environment per active lane. Batch 64 targets the high-RAM A100 runtime; CUDA OOM halves it automatically.
+Each branch uses the full episode batch on GPU and shares the encoded visual/language prefix; branches are evaluated sequentially to control memory. Parallel simulator processes retain only one environment per active lane. Batch eight preserves the task/parity grouping; CUDA OOM halves it automatically. Torch is pinned to 2.11.0+cu128.
 
-Supabase stores every completed/error episode, executed actions, checkpoint/configuration identity, uncertainty, gate decisions, all terminal candidate Q scores, selected branch, correction magnitude and intervention/search counts. Progress uses `artifacts/smolvla_pcp_sweep/smolvla-pcp-full-proposal-jeff-matched-v4/worker_0_latest.json`. Success changes, rescues/spoils and standard errors group repeated seeds by starting state. Benchmark-state evaluation remains exploratory.
+Supabase stores every completed/error episode, executed actions, checkpoint/configuration identity, uncertainty, gate decisions, all terminal candidate Q scores, selected branch, correction magnitude and intervention/search counts. Progress uses `artifacts/smolvla_pcp_sweep/smolvla-pcp-full-proposal-jeff-settings-v5/worker_0_latest.json`. Success changes, rescues/spoils and standard errors group repeated seeds by starting state. Benchmark-state evaluation remains exploratory.
 """),cell('code',config),cell('code',setup),cell('code',"""from pnp.smolvla_jeff_replication import require_replication
 print(require_replication())
 from pnp.smolvla_pcp_full_proposal import run_full_proposal
@@ -195,12 +202,7 @@ report=run_full_proposal(checkpoint_paths=CHECKPOINT_PATHS, worker_index=WORKER_
 """)]
  save(ROOT/'notebooks/workers/125_smolvla_pcp_full_proposal_worker_2.ipynb',cells)
  # Stock-only parity check: two disjoint shards of Jeff's exact 400 identities.
- replication_setup=setup.replace("from pnp import env_setup", """subprocess.run([sys.executable,'-m','pip','install',
-                'torch==2.11.0+cu128','torchvision==0.26.0+cu128',
-                '--index-url','https://download.pytorch.org/whl/cu128'],check=True)
-if 'torch' in sys.modules and sys.modules['torch'].__version__ != '2.11.0+cu128':
-    raise RuntimeError('Torch was already imported. Restart the runtime and rerun with the pinned version.')
-from pnp import env_setup""")
+ replication_setup=setup
  for worker in (0,1):
   cfg=f"""WORKER_INDEX = {worker}
 BATCH_SIZE = 8
@@ -213,11 +215,11 @@ CHECKPOINT_SHA256 = {manifest['checkpoints']!r}
 """
   text=f"""# Jeff stock replication — Colab worker {worker}
 
-Use this notebook and the other worker in your two separate **fresh GPU runtimes**. Each runs 200 disjoint episodes, totaling the same 400 task/initial-state identities as Jeff. Add Supabase Secrets and Run all. Stop any previous sweep in that runtime first.
+Use this notebook and the other worker in your two separate **fresh GPU runtimes**. Each reproduces its historical shard, totaling 400 target identities. The runner reconstructs the seven recorded source runs and their resume boundaries; batches may include companion episodes needed to preserve historical membership. Add Supabase Secrets and Run all. Stop any previous sweep in that runtime first.
 
-This is **stock SmolVLA only: no P&P, no re-noising, no critic and no reranking**. It uses Jeff's stream-0 episode seeds, ten Euler steps, 50 generated actions, ten executed actions, same-task batches (maximum eight; five identities per task in each historical shard), TF32 disabled and highest matmul precision. Torch is pinned to Jeff's 2.11.0+cu128 build. Your Colab GPU may differ from Jeff's L4; outcome agreement is checked rather than assumed.
+This is **stock SmolVLA only: no P&P, no re-noising, no critic and no reranking**. It uses Jeff's stream-0 episode seeds, ten Euler steps, 50 generated actions, ten executed actions, historical same-task batch limits (two or eight), historical rendering settings, matmul TF32 disabled and highest precision. cuDNN TF32 retains its Torch default because its historical value is unknown. Torch is pinned to Jeff's 2.11.0+cu128 build. Your Colab GPU may differ from Jeff's L4; outcome agreement is checked rather than assumed.
 
-Episodes resume from completed Supabase rows. At the end each notebook reads the latest combined results and compares every episode against Jeff's saved 255/400 stock arm. It reports successes, outcome flips, seed mismatches and step-count mismatches. A partial report is expected if the other worker is still running. Equal aggregate totals alone do not establish replication. No PCP sweep starts from this notebook.
+Results use a new v2 experiment; v1 rows are never reused. Resume skips whole reconstructed batches, preserving companion lanes rather than shrinking partially completed batches. At the end each notebook reads the latest combined results and compares every episode against Jeff's saved 255/400 stock arm. It reports successes, outcome flips, seed mismatches and step-count mismatches. A partial report is expected if the other worker is still running. Equal aggregate totals alone do not establish replication. No PCP sweep starts from this notebook.
 """
   run=f"""import torch
 if torch.__version__ != '2.11.0+cu128':
@@ -245,9 +247,9 @@ from google.colab import userdata
 from supabase import create_client
 import pandas as pd
 client=create_client(userdata.get('SUPABASE_URL'),userdata.get('SUPABASE_SERVICE_KEY'))
-EXPERIMENT='smolvla-pcp-a100-jeff-matched-stock-v5'
+EXPERIMENT='smolvla-pcp-a100-jeff-settings-stock-v6'
 '''),cell('code','''reports=[]
-for current_experiment,worker in [(EXPERIMENT,0),(EXPERIMENT,1),('smolvla-pcp-full-proposal-jeff-matched-v4',0)]:
+for current_experiment,worker in [(EXPERIMENT,0),(EXPERIMENT,1),('smolvla-pcp-full-proposal-jeff-settings-v5',0)]:
     key=f'smolvla_pcp_sweep/{current_experiment}/worker_{worker}_latest.json'
     try:
         report=json.loads(client.storage.from_('artifacts').download(key));reports.append(report)
