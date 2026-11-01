@@ -110,10 +110,10 @@ def test_candidate_refinement_only_updates_final_two_candidate_groups():
 def test_candidate_consensus_validation_and_hash_material():
     with pytest.raises(ValueError, match="both count and inference_steps"):
         RolloutConfig(consensus_candidate_count=4)
-    with pytest.raises(ValueError, match="requires projection settings"):
-        RolloutConfig(
-            consensus_candidate_count=4,
-            consensus_candidate_inference_steps=5)
+    raw_average = RolloutConfig(
+        consensus_candidate_count=4,
+        consensus_candidate_inference_steps=5)
+    assert raw_average.consensus_projection_k is None
     config = build_smolvla_blend_ablation_methods()[1][1]
     logical = config.logical_dict()
     assert logical["consensus_candidate_count"] == 4

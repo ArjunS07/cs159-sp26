@@ -109,6 +109,8 @@ class Method:
     SMOLVLA_CONSENSUS_PROJECT_K5 = "smolvla_consensus_project_s05_k5"
     SMOLVLA_STOCK_REFINE_RAW_AVERAGE = "smolvla_stock_refine_raw_average"
     SMOLVLA_FOUR_CANDIDATE_PROJECT_K3 = "smolvla_four_candidate_average_project_s05_k3"
+    SMOLVLA_STOCK_30_STEP = "smolvla_stock_30_integration_steps"
+    SMOLVLA_THREE_STOCK_AVERAGE_10_STEP = "smolvla_three_stock_average_10_steps"
     SMOLVLA_CONSENSUS_PROJECT_K3_A1 = "smolvla_consensus_project_s05_k3_a1"
     SMOLVLA_CONSENSUS_PROJECT_K3_A20 = "smolvla_consensus_project_s05_k3_a20"
     SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3 = (
@@ -162,6 +164,8 @@ ALL_METHODS = (Method.VANILLA, Method.EXTRA_STEPS, Method.UNCERTAINTY, Method.RE
                Method.SMOLVLA_CONSENSUS_PROJECT_K5,
                Method.SMOLVLA_STOCK_REFINE_RAW_AVERAGE,
                Method.SMOLVLA_FOUR_CANDIDATE_PROJECT_K3,
+               Method.SMOLVLA_STOCK_30_STEP,
+               Method.SMOLVLA_THREE_STOCK_AVERAGE_10_STEP,
                Method.SMOLVLA_CONSENSUS_PROJECT_K3_A1,
                Method.SMOLVLA_CONSENSUS_PROJECT_K3_A20,
                Method.SMOLVLA_TWO_STOCK_TWO_REFINE_PROJECT_K3,
@@ -610,8 +614,6 @@ class RolloutConfig:
                     "consensus_candidate_inference_steps must be a positive integer")
             if self.refine:
                 raise ValueError("candidate consensus is separate from stock/refine consensus")
-            if not all(value is not None for value in projection_fields):
-                raise ValueError("candidate consensus requires projection settings")
         if (isinstance(self.consensus_candidate_refine_count, bool)
                 or int(self.consensus_candidate_refine_count)
                 != self.consensus_candidate_refine_count
